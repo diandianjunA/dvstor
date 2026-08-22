@@ -61,6 +61,10 @@ TelemetrySnapshot Telemetry::snapshot() const {
       expanded_parent_count.load(std::memory_order_relaxed),
     .expanded_neighbor_count_sum =
       expanded_neighbor_count_sum.load(std::memory_order_relaxed),
+    .dynamic_expanded_parent_count =
+      dynamic_expanded_parent_count.load(std::memory_order_relaxed),
+    .dynamic_expanded_neighbor_count_sum =
+      dynamic_expanded_neighbor_count_sum.load(std::memory_order_relaxed),
     .dynamic_graph_short_reads =
       dynamic_graph_short_reads.load(std::memory_order_relaxed),
     .dynamic_graph_full_reads =
@@ -243,6 +247,9 @@ TelemetrySnapshot Telemetry::snapshot() const {
   for (u32 bucket = 0; bucket < kGraphDegreeHistogramBuckets; ++bucket) {
     snapshot.expanded_degree_histogram[bucket] =
       expanded_degree_histogram[bucket].load(std::memory_order_relaxed);
+    snapshot.dynamic_expanded_degree_histogram[bucket] =
+      dynamic_expanded_degree_histogram[bucket].load(
+        std::memory_order_relaxed);
   }
   return snapshot;
 }
@@ -314,6 +321,11 @@ void Telemetry::reset() {
   expanded_parent_count.store(0, std::memory_order_relaxed);
   expanded_neighbor_count_sum.store(0, std::memory_order_relaxed);
   for (auto& bucket : expanded_degree_histogram) {
+    bucket.store(0, std::memory_order_relaxed);
+  }
+  dynamic_expanded_parent_count.store(0, std::memory_order_relaxed);
+  dynamic_expanded_neighbor_count_sum.store(0, std::memory_order_relaxed);
+  for (auto& bucket : dynamic_expanded_degree_histogram) {
     bucket.store(0, std::memory_order_relaxed);
   }
   dynamic_graph_short_reads.store(0, std::memory_order_relaxed);

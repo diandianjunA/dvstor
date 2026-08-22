@@ -13,12 +13,12 @@ case "${1:-}" in
   fixed)
     case_name=fixed
     graph_policy=fixed
-    dynamic_extent=false
+    dynamic_extent=true
     ;;
   header)
     case_name=header
     graph_policy=header-neighbor
-    dynamic_extent=false
+    dynamic_extent=true
     ;;
   live|probe)
     case_name="${1}"

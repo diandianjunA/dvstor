@@ -750,6 +750,16 @@ void PersistentSearchEngine::Impl::completion_loop() {
         completion.expanded_degree_histogram[bucket],
         std::memory_order_relaxed);
     }
+    engine.telemetry_.dynamic_expanded_parent_count.fetch_add(
+      completion.dynamic_expanded_parent_count, std::memory_order_relaxed);
+    engine.telemetry_.dynamic_expanded_neighbor_count_sum.fetch_add(
+      completion.dynamic_expanded_neighbor_count_sum,
+      std::memory_order_relaxed);
+    for (u32 bucket = 0; bucket < kGraphDegreeHistogramBuckets; ++bucket) {
+      engine.telemetry_.dynamic_expanded_degree_histogram[bucket].fetch_add(
+        completion.dynamic_expanded_degree_histogram[bucket],
+        std::memory_order_relaxed);
+    }
     engine.telemetry_.dynamic_graph_short_reads.fetch_add(
       completion.dynamic_graph_short_reads, std::memory_order_relaxed);
     engine.telemetry_.dynamic_graph_full_reads.fetch_add(

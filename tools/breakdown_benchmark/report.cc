@@ -61,8 +61,12 @@ nlohmann::json telemetry_to_json(
   const uint64_t dynamic_graph_snapshot_attempts =
     telemetry.dynamic_graph_short_reads + telemetry.dynamic_graph_full_reads;
   nlohmann::json expanded_degree_histogram = nlohmann::json::array();
+  nlohmann::json dynamic_expanded_degree_histogram = nlohmann::json::array();
   for (const auto count : telemetry.expanded_degree_histogram) {
     expanded_degree_histogram.push_back(count);
+  }
+  for (const auto count : telemetry.dynamic_expanded_degree_histogram) {
+    dynamic_expanded_degree_histogram.push_back(count);
   }
   return {
     {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
@@ -210,6 +214,21 @@ nlohmann::json telemetry_to_json(
           static_cast<double>(telemetry.expanded_parent_count)},
     {"expanded_degree_histogram_quantum", 8},
     {"expanded_degree_histogram", expanded_degree_histogram},
+    {"dynamic_expanded_parent_count",
+      telemetry.dynamic_expanded_parent_count},
+    {"dynamic_expanded_neighbor_count_sum",
+      telemetry.dynamic_expanded_neighbor_count_sum},
+    {"dynamic_expanded_degree_histogram_quantum", 8},
+    {"dynamic_expanded_degree_histogram",
+      dynamic_expanded_degree_histogram},
+    {"average_dynamic_expanded_parent_degree",
+      telemetry.dynamic_expanded_parent_count == 0 ? 0.0
+      : static_cast<double>(telemetry.dynamic_expanded_neighbor_count_sum) /
+          static_cast<double>(telemetry.dynamic_expanded_parent_count)},
+    {"dynamic_expanded_parent_ratio",
+      telemetry.expanded_parent_count == 0 ? 0.0
+      : static_cast<double>(telemetry.dynamic_expanded_parent_count) /
+          static_cast<double>(telemetry.expanded_parent_count)},
     {"dynamic_graph_short_reads", telemetry.dynamic_graph_short_reads},
     {"dynamic_graph_full_reads", telemetry.dynamic_graph_full_reads},
     {"dynamic_graph_read_bytes", telemetry.dynamic_graph_read_bytes},
@@ -903,6 +922,17 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  expanded degree histogram (ceil(degree/8), overflow=13): "
            << gpu.value(
                 "expanded_degree_histogram", nlohmann::json::array()).dump()
+           << '\n';
+    output << "  dynamic expanded parents/neighbor sum/average degree/share: "
+           << gpu.value("dynamic_expanded_parent_count", 0ULL) << "/"
+           << gpu.value("dynamic_expanded_neighbor_count_sum", 0ULL) << "/"
+           << gpu.value("average_dynamic_expanded_parent_degree", 0.0) << "/"
+           << gpu.value("dynamic_expanded_parent_ratio", 0.0) << '\n';
+    output << "  dynamic expanded degree histogram "
+              "(ceil(degree/8), overflow=13): "
+           << gpu.value(
+                "dynamic_expanded_degree_histogram",
+                nlohmann::json::array()).dump()
            << '\n';
     output << "  DynaExtent short/full/bytes/fallback/promotions/demotions: "
            << gpu.value("dynamic_graph_short_reads", 0ULL) << "/"

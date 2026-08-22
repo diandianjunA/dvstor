@@ -98,6 +98,9 @@ void test_recall_and_report_formatting() {
   telemetry.dynamic_graph_short_reads = 8;
   telemetry.dynamic_graph_full_reads = 3;
   telemetry.dynamic_graph_read_bytes = 2'000;
+  telemetry.dynamic_expanded_parent_count = 2;
+  telemetry.dynamic_expanded_neighbor_count_sum = 17;
+  telemetry.dynamic_expanded_degree_histogram[1] = 2;
   telemetry.dynamic_graph_fallback_reads = 1;
   telemetry.dynamic_graph_hint_promotions = 2;
   telemetry.dynamic_graph_hint_demotions = 4;
@@ -133,6 +136,10 @@ void test_recall_and_report_formatting() {
   assert(telemetry_json.at("dynamic_graph_short_reads") == 8);
   assert(telemetry_json.at("dynamic_graph_full_reads") == 3);
   assert(telemetry_json.at("dynamic_graph_read_bytes") == 2'000);
+  assert(telemetry_json.at("dynamic_expanded_parent_count") == 2);
+  assert(telemetry_json.at("dynamic_expanded_neighbor_count_sum") == 17);
+  assert(telemetry_json.at("average_dynamic_expanded_parent_degree") == 8.5);
+  assert(telemetry_json.at("dynamic_expanded_degree_histogram").at(1) == 2);
   assert(telemetry_json.at("dynamic_graph_fallback_reads") == 1);
   assert(telemetry_json.at("dynamic_graph_hint_promotions") == 2);
   assert(telemetry_json.at("dynamic_graph_hint_demotions") == 4);
@@ -304,6 +311,11 @@ void test_dynamic_cache_telemetry_reset_preserves_lifetime_gauges() {
   telemetry.dynamic_graph_fallback_reads.store(14, std::memory_order_relaxed);
   telemetry.dynamic_graph_hint_promotions.store(15, std::memory_order_relaxed);
   telemetry.dynamic_graph_hint_demotions.store(16, std::memory_order_relaxed);
+  telemetry.dynamic_expanded_parent_count.store(17, std::memory_order_relaxed);
+  telemetry.dynamic_expanded_neighbor_count_sum.store(
+    18, std::memory_order_relaxed);
+  telemetry.dynamic_expanded_degree_histogram[2].store(
+    19, std::memory_order_relaxed);
   const auto before_reset = telemetry.snapshot();
   assert(before_reset.dynamic_graph_short_reads == 11);
   assert(before_reset.dynamic_graph_full_reads == 12);
@@ -311,6 +323,9 @@ void test_dynamic_cache_telemetry_reset_preserves_lifetime_gauges() {
   assert(before_reset.dynamic_graph_fallback_reads == 14);
   assert(before_reset.dynamic_graph_hint_promotions == 15);
   assert(before_reset.dynamic_graph_hint_demotions == 16);
+  assert(before_reset.dynamic_expanded_parent_count == 17);
+  assert(before_reset.dynamic_expanded_neighbor_count_sum == 18);
+  assert(before_reset.dynamic_expanded_degree_histogram[2] == 19);
   telemetry.reset();
   const auto snapshot = telemetry.snapshot();
   assert(snapshot.dynamic_code_cache_hits == 0);
@@ -323,6 +338,9 @@ void test_dynamic_cache_telemetry_reset_preserves_lifetime_gauges() {
   assert(snapshot.dynamic_graph_fallback_reads == 0);
   assert(snapshot.dynamic_graph_hint_promotions == 0);
   assert(snapshot.dynamic_graph_hint_demotions == 0);
+  assert(snapshot.dynamic_expanded_parent_count == 0);
+  assert(snapshot.dynamic_expanded_neighbor_count_sum == 0);
+  assert(snapshot.dynamic_expanded_degree_histogram[2] == 0);
 }
 
 void test_base_only_recall_filter() {

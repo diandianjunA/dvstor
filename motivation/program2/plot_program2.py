@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render two dependency-free SVG figures for Program 2."""
+"""Render two dependency-free SVG figures for the dynamic Program 2 run."""
 
 import html
 import json
@@ -17,106 +17,88 @@ def esc(value):
     return html.escape(str(value))
 
 
-def write_svg(name, body, width=1000, height=390):
+def write_svg(name, body, width=1050, height=420):
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
 <style>
 text {{ font-family: Arial, "Noto Sans", sans-serif; fill: #222; }}
 .title {{ font-size: 18px; font-weight: 700; }}
 .label {{ font-size: 14px; }}
+.small {{ font-size: 12px; fill: #555; }}
 .value {{ font-size: 14px; font-weight: 700; }}
 .axis {{ stroke: #555; stroke-width: 1; }}
 .grid {{ stroke: #ddd; stroke-width: 1; }}
-</style>
-<rect width="100%" height="100%" fill="white"/>
-{body}
-</svg>'''
-    path = root / name
-    path.write_text(svg, encoding="utf-8")
-    print(path)
+</style><rect width="100%" height="100%" fill="white"/>{body}</svg>'''
+    (root / name).write_text(svg, encoding="utf-8")
+    print(root / name)
 
 
-hist = d["degree_histogram"]
+def vertical_bars(x0, title, labels, values, colors, unit, width=460):
+    maximum = max(values) * 1.15 or 1
+    spacing = width / len(values)
+    pieces = [f'<text class="title" x="{x0}" y="34">{esc(title)}</text>']
+    for index, (label, value, color) in enumerate(zip(labels, values, colors)):
+        x = x0 + 30 + index * spacing
+        height = 235 * value / maximum
+        y = 325 - height
+        pieces += [
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="92" height="{height:.1f}" fill="{color}"/>',
+            f'<text class="value" x="{x + 46:.1f}" y="{y - 8:.1f}" text-anchor="middle">{value:.1f}{esc(unit)}</text>',
+            f'<text class="label" x="{x + 46:.1f}" y="351" text-anchor="middle">{esc(label)}</text>',
+        ]
+    return "".join(pieces)
+
+
+hist = d["dynamic_degree_histogram"]
 total = max(sum(hist), 1)
-points = []
-cumulative = 0
+points, cumulative = [], 0
 for extent_class, count in enumerate(hist):
     cumulative += count
-    x = 70 + min(extent_class * 8, 104) / 104 * 370
-    y = 310 - cumulative / total * 235
+    x = 65 + min(extent_class * 8, 104) / 104 * 390
+    y = 325 - cumulative / total * 240
     points.append(f"{x:.1f},{y:.1f}")
 
-max_qps = max(int(key) for key in d["transport_probe"])
-probe = d["transport_probe"][str(max_qps)]
-methods = [
-    ("Fixed 832 B", "fixed_full", "#7570b3"),
-    ("Header + body", "dependent_header_body", "#d95f02"),
-    ("Hinted one-read", "hinted_one_read", "#1b9e77"),
-]
-values = [probe[key]["logical_reads_per_s_median"] for _, key, _ in methods]
-maximum = max(values)
-bars = []
-for index, ((label, _, color), value) in enumerate(zip(methods, values)):
-    y = 105 + index * 78
-    width = 330 * value / maximum
-    bars.append(
-        f'<text class="label" x="535" y="{y}">{esc(label)}</text>'
-        f'<rect x="535" y="{y + 12}" width="330" height="25" fill="#eee"/>'
-        f'<rect x="535" y="{y + 12}" width="{width:.1f}" height="25" fill="{color}"/>'
-        f'<text class="value" x="875" y="{y + 31}">{value / 1e6:.2f} Mread/s</text>'
-    )
-
+oracle_b = d["oracle"]["average_bytes_per_committed_dynamic_parent"]
 motivation = f'''
-<text class="title" x="40" y="32">(a) Query-weighted live degree CDF</text>
-<line class="axis" x1="70" y1="310" x2="450" y2="310"/>
-<line class="axis" x1="70" y1="310" x2="70" y2="65"/>
-<line class="grid" x1="70" y1="192.5" x2="450" y2="192.5"/>
-<line class="grid" x1="70" y1="75" x2="450" y2="75"/>
+<text class="title" x="30" y="34">(a) Dynamic-node live-degree CDF</text>
+<line class="axis" x1="65" y1="325" x2="455" y2="325"/><line class="axis" x1="65" y1="325" x2="65" y2="75"/>
+<line class="grid" x1="65" y1="205" x2="455" y2="205"/><line class="grid" x1="65" y1="85" x2="455" y2="85"/>
 <polyline points="{' '.join(points)}" fill="none" stroke="#377eb8" stroke-width="4"/>
-<text class="label" x="245" y="345">Live neighbors</text>
-<text class="label" x="18" y="315">0%</text><text class="label" x="12" y="198">50%</text><text class="label" x="5" y="80">100%</text>
-<text class="value" x="90" y="110">Mean degree: {d['average_expanded_parent_degree']:.2f}</text>
-<text class="value" x="90" y="135">Required: {d['average_required_prefix_bytes']:.1f} B</text>
-<text class="value" x="90" y="160">Fixed-read waste: {100*d['average_fixed_read_waste_ratio']:.1f}%</text>
-<text class="title" x="515" y="32">(b) RDMA protocol at {max_qps} active QPs</text>
-{''.join(bars)}
+<text class="label" x="225" y="357">Live neighbors (8-neighbor buckets)</text>
+<text class="small" x="22" y="330">0%</text><text class="small" x="15" y="210">50%</text><text class="small" x="8" y="90">100%</text>
+<text class="value" x="92" y="120">Mean = {d['average_dynamic_degree']:.2f}</text>
+<text class="value" x="92" y="143">P50 ≤ {d['dynamic_degree_p50_upper_bound']}</text>
+<text class="value" x="92" y="166">P95 ≤ {d['dynamic_degree_p95_upper_bound']}</text>
+'''
+motivation += vertical_bars(
+    540, "(b) Traditional reads vs ideal lower bound",
+    ["Fixed", "Header→N", "Oracle"], [832, oracle_b, oracle_b],
+    ["#7570b3", "#d95f02", "#999999"], " B")
+motivation += '''
+<text class="small" x="610" y="383">RDMA reads per node: Fixed 1 · Header→N 2 serial · Oracle 1</text>
+<text class="small" x="610" y="401">Oracle assumes free exact-length knowledge; it is not deployable.</text>
 '''
 write_svg("program2_motivation.svg", motivation)
 
 
-fixed = d["fixed"]
-header = d["header_neighbor"]
-live = d["live"]
-
-
-def paired_bars(x0, title, labels, values, colors, unit):
-    maximum = max(values) * 1.12 or 1
-    pieces = [f'<text class="title" x="{x0}" y="32">{esc(title)}</text>']
-    for index, (label, value, color) in enumerate(zip(labels, values, colors)):
-        x = x0 + 45 + index * 165
-        height = 230 * value / maximum
-        y = 310 - height
-        pieces += [
-            f'<rect x="{x}" y="{y:.1f}" width="95" height="{height:.1f}" fill="{color}"/>',
-            f'<text class="value" x="{x + 47}" y="{y - 8:.1f}" text-anchor="middle">{value:.2f}{esc(unit)}</text>',
-            f'<text class="label" x="{x + 47}" y="338" text-anchor="middle">{esc(label)}</text>',
-        ]
-    return ''.join(pieces)
-
-
-effect = paired_bars(
-    35, f"(a) Query throughput (+{100*d['qps_improvement_ratio']:.1f}%)",
-    ["Fixed", "Header→N", "LiveExtent"],
+cases = d["cases"]
+fixed, header, live = cases["fixed"], cases["header"], cases["live"]
+effect = vertical_bars(
+    20, "(a) Dynamic mixed-workload query throughput",
+    ["Fixed", "Header→N", "ClassExtent"],
     [fixed["query_qps"], header["query_qps"], live["query_qps"]],
-    ["#7570b3", "#d95f02", "#1b9e77"], "")
-effect += paired_bars(
-    520, f"(b) P99 latency (-{100*d['p99_reduction_ratio']:.1f}%)",
-    ["Fixed", "Header→N", "LiveExtent"],
-    [fixed["p99_latency_ms"], header["p99_latency_ms"], live["p99_latency_ms"]],
-    ["#7570b3", "#d95f02", "#1b9e77"], " ms")
-effect += (
-    f'<text class="label" x="500" y="375" text-anchor="middle">'
-    f'Graph bytes/query: -{100*d["graph_bytes_reduction_ratio"]:.1f}% | '
-    f'Physical WQE/query: {100*d["physical_wqe_change_ratio"]:+.2f}% | '
-    f'All recalls equal: {esc(d["all_recall_equal"])}</text>'
-)
+    ["#7570b3", "#d95f02", "#1b9e77"], "", width=470)
+effect += vertical_bars(
+    555, "(b) Dynamic bytes per committed parent",
+    ["Oracle", "Fixed", "Header→N", "ClassExtent"],
+    [
+        oracle_b,
+        fixed["dynamic_bytes_per_committed_parent"],
+        header["dynamic_bytes_per_committed_parent"],
+        live["dynamic_bytes_per_committed_parent"],
+    ],
+    ["#999999", "#7570b3", "#d95f02", "#1b9e77"], " B", width=470)
+effect += f'''
+<text class="small" x="525" y="383" text-anchor="middle">fixed update target: {d['target_write_qps']:.0f} op/s · attained: {fixed['write_rate_attainment_ratio']:.3f}/{header['write_rate_attainment_ratio']:.3f}/{live['write_rate_attainment_ratio']:.3f}</text>
+<text class="small" x="525" y="402" text-anchor="middle">ClassExtent fallback: {100*live['fallback_ratio']:.3f}% · dynamic access share: {100*live['dynamic_expanded_parent_ratio']:.3f}% · Oracle has no QPS bar</text>
+'''
 write_svg("program2_effectiveness.svg", effect)

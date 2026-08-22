@@ -6,10 +6,16 @@ PROJECT_DIR="$(cd "$PROGRAM_DIR/../.." && pwd)"
 EXPERIMENT_DIR="$PROJECT_DIR/experiment"
 
 PROFILE="${PROFILE:-04_gpu_persistent_gpunetio}"
-WARMUP_SECONDS="${WARMUP_SECONDS:-10}"
-MEASURE_SECONDS="${MEASURE_SECONDS:-30}"
-CLIENT_THREADS="${CLIENT_THREADS:-256}"
+WARMUP_SECONDS="${WARMUP_SECONDS:-5}"
+MEASURE_SECONDS="${MEASURE_SECONDS:-20}"
+CLIENT_THREADS="${CLIENT_THREADS:-auto}"
+CLIENT_THREAD_CAP="${CLIENT_THREAD_CAP:-512}"
 RECALL_QUERIES="${RECALL_QUERIES:-1000}"
+TARGET_QUERY_QPS="${TARGET_QUERY_QPS:-100000}"
+TARGET_WRITE_QPS="${TARGET_WRITE_QPS:-500}"
+MIN_DYNAMIC_EXPANDED="${MIN_DYNAMIC_EXPANDED:-100}"
+MIN_DYNAMIC_SHARE="${MIN_DYNAMIC_SHARE:-0.001}"
+MIN_WRITE_ATTAINMENT="${MIN_WRITE_ATTAINMENT:-0.95}"
 RUN_ROOT="${RUN_ROOT:-$PROGRAM_DIR/results/program2_$(date +%Y%m%d_%H%M%S)}"
 ACTION="${1:-all}"
 
@@ -38,7 +44,54 @@ wait_storage() {
   [[ "$answer" != q && "$answer" != Q ]] || exit 130
 }
 
-run_query_case() {
+validate_dynamic_case() {
+  local case_name="$1"
+  local report="$2"
+  python3 - "$case_name" "$report" "$MIN_DYNAMIC_EXPANDED" \
+    "$MIN_DYNAMIC_SHARE" "$MIN_WRITE_ATTAINMENT" <<'PY'
+import json
+import sys
+
+case_name, report_path, min_dynamic, min_share, min_write = sys.argv[1:]
+with open(report_path, encoding="utf-8") as stream:
+    report = json.load(stream)
+meta = report.get("meta", {})
+throughput = report.get("throughput", {})
+gpu = report.get("gpu_persistent", {})
+if meta.get("workload") != "mixed":
+    raise SystemExit(f"{case_name}: expected mixed workload")
+if meta.get("mixed_dispatch_policy") != "rate_limited":
+    raise SystemExit(f"{case_name}: expected rate_limited mixed workload")
+dynamic = int(gpu.get("dynamic_expanded_parent_count", 0))
+dynamic_share = float(gpu.get("dynamic_expanded_parent_ratio", 0))
+write_attainment = float(throughput.get("write_rate_attainment_ratio", 0))
+if dynamic < int(min_dynamic):
+    raise SystemExit(
+        f"{case_name}: only {dynamic} dynamic parents were expanded; "
+        f"need >= {min_dynamic}. This is not a valid dynamic experiment."
+    )
+if dynamic_share < float(min_share):
+    raise SystemExit(
+        f"{case_name}: dynamic expansion share {100*dynamic_share:.4f}% is "
+        f"below {100*float(min_share):.4f}%. Increase WARMUP_SECONDS or "
+        "TARGET_WRITE_QPS; otherwise graph-read performance is still "
+        "dominated by immutable nodes."
+    )
+if write_attainment < float(min_write):
+    raise SystemExit(
+        f"{case_name}: write-rate attainment {write_attainment:.3f} is below "
+        f"{float(min_write):.3f}; lower TARGET_WRITE_QPS and rerun this case."
+    )
+print(
+    f"[program2] valid dynamic case={case_name} "
+    f"dynamic_expanded={dynamic} "
+    f"dynamic_share={100*dynamic_share:.3f}% "
+    f"write_attainment={write_attainment:.3f}"
+)
+PY
+}
+
+run_dynamic_case() {
   local case_name="$1"
   local graph_policy="$2"
   local dynamic_extent="$3"
@@ -46,7 +99,7 @@ run_query_case() {
 
   wait_storage "$case_name"
   mkdir -p "$report_dir"
-  echo "[$(date --iso-8601=seconds)] query case=$case_name policy=$graph_policy"
+  echo "[$(date --iso-8601=seconds)] dynamic mixed case=$case_name policy=$graph_policy"
   REPORT_DIR="$report_dir" \
   STORAGE_OWNER_UPDATE_COMPLETION_MODE=decoupled \
   GPU_DYNAMIC_GRAPH_ACCESS_MODE=manual \
@@ -54,11 +107,18 @@ run_query_case() {
   GPU_DYNAMIC_GRAPH_EXTENT="$dynamic_extent" \
   GPU_RDMA_SEARCH_PROGRESSION_MODE=decoupled \
   ENABLE_BREAKDOWN=false \
-  WORKLOAD=query \
+  WORKLOAD=mixed \
+  MIXED_MODE=rate_limited \
+  TARGET_QUERY_QPS="$TARGET_QUERY_QPS" \
+  TARGET_WRITE_QPS="$TARGET_WRITE_QPS" \
+  WRITE_INSERT_RATIO=1 \
+  WRITE_UPSERT_RATIO=0 \
+  WRITE_DELETE_RATIO=0 \
   BENCHMARK_MODE=time \
   WARMUP_SECONDS="$WARMUP_SECONDS" \
   MEASURE_SECONDS="$MEASURE_SECONDS" \
   BENCHMARK_CLIENT_THREADS="$CLIENT_THREADS" \
+  BENCHMARK_CLIENT_THREAD_CAP="$CLIENT_THREAD_CAP" \
   RECALL_QUERIES="$RECALL_QUERIES" \
     "$EXPERIMENT_DIR/run_breakdown.sh" "$PROFILE" 2>&1 | \
       tee "$report_dir/driver.log"
@@ -69,6 +129,7 @@ run_query_case() {
     echo "missing JSON report for $case_name" >&2
     exit 1
   }
+  validate_dynamic_case "$case_name" "$report"
   record_case "$case_name" "$report"
 }
 
@@ -125,20 +186,22 @@ summarize() {
 
 case "$ACTION" in
   all)
-    run_query_case fixed fixed false
-    run_query_case header header-neighbor false
-    run_query_case live live-extent true
-    run_probe
+    # All three storage runs publish the same dynamic extent tag. Fixed and
+    # Header→Neighbor ignore it; keeping publication identical avoids changing
+    # update-path work between policies.
+    run_dynamic_case fixed fixed true
+    run_dynamic_case header header-neighbor true
+    run_dynamic_case live live-extent true
     summarize
     ;;
   fixed)
-    run_query_case fixed fixed false
+    run_dynamic_case fixed fixed true
     ;;
   header)
-    run_query_case header header-neighbor false
+    run_dynamic_case header header-neighbor true
     ;;
   live)
-    run_query_case live live-extent true
+    run_dynamic_case live live-extent true
     ;;
   probe)
     run_probe
