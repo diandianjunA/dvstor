@@ -243,12 +243,20 @@ struct CompletionDescriptor {
   u32 expanded_parent_count{};
   u32 expanded_neighbor_count_sum{};
   u32 expanded_degree_histogram[kGraphDegreeHistogramBuckets]{};
+  // Oracle-only accounting for authoritative dynamic parents.  These values
+  // do not steer an RDMA read: they are filled only after a version has been
+  // fetched, validated, and committed for expansion.  The benchmark can
+  // therefore reconstruct the impossible zero-cost exact-length lower bound
+  // without turning it into a deployable query policy.
+  u32 dynamic_expanded_parent_count{};
+  u32 dynamic_expanded_neighbor_count_sum{};
+  u32 dynamic_expanded_degree_histogram[kGraphDegreeHistogramBuckets]{};
 };
 
 // CompletionDescriptor is embedded once in persistent-kernel shared memory
 // and is also the mapped device-to-host ring ABI. Keep the explicit size check
 // synchronized with both sides whenever production telemetry extends it.
-static_assert(sizeof(CompletionDescriptor) == 648);
+static_assert(sizeof(CompletionDescriptor) == 712);
 static_assert(alignof(CompletionDescriptor) == alignof(u64));
 
 struct CentroidRoutePublishDescriptor {
@@ -310,6 +318,10 @@ struct TelemetrySnapshot {
   u64 expanded_neighbor_count_sum{};
   std::array<u64, kGraphDegreeHistogramBuckets>
     expanded_degree_histogram{};
+  u64 dynamic_expanded_parent_count{};
+  u64 dynamic_expanded_neighbor_count_sum{};
+  std::array<u64, kGraphDegreeHistogramBuckets>
+    dynamic_expanded_degree_histogram{};
   u64 dynamic_graph_short_reads{};
   u64 dynamic_graph_full_reads{};
   u64 dynamic_graph_read_bytes{};
@@ -472,6 +484,10 @@ public:
   std::atomic<u64> expanded_neighbor_count_sum{0};
   std::array<std::atomic<u64>, kGraphDegreeHistogramBuckets>
     expanded_degree_histogram{};
+  std::atomic<u64> dynamic_expanded_parent_count{0};
+  std::atomic<u64> dynamic_expanded_neighbor_count_sum{0};
+  std::array<std::atomic<u64>, kGraphDegreeHistogramBuckets>
+    dynamic_expanded_degree_histogram{};
   std::atomic<u64> dynamic_graph_short_reads{0};
   std::atomic<u64> dynamic_graph_full_reads{0};
   std::atomic<u64> dynamic_graph_read_bytes{0};

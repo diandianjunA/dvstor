@@ -3293,6 +3293,16 @@ __device__ __forceinline__ void process_query(
           ++completion.expanded_parent_count;
           completion.expanded_neighbor_count_sum += count;
           ++completion.expanded_degree_histogram[extent_class];
+          // selected_handles names the exact, already validated version that
+          // is about to be expanded.  Record its true degree after the read;
+          // this is observational Oracle telemetry and is never consulted by
+          // request preparation.
+          if (dynamic_graph_telemetry_handle(
+                selected_handles[chunk_begin + local])) {
+            ++completion.dynamic_expanded_parent_count;
+            completion.dynamic_expanded_neighbor_count_sum += count;
+            ++completion.dynamic_expanded_degree_histogram[extent_class];
+          }
           neighbor_offsets[local + 1] =
             neighbor_offsets[local] + count;
         }
