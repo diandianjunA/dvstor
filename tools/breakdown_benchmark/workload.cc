@@ -71,15 +71,18 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   using service::breakdown::report_to_json;
 
   const bool use_insert_file = !args.insert_file.empty();
+  const bool shared_rate_limited = args.mixed_mode == "rate_limited";
+  const bool write_rate_limited =
+    args.mixed_mode == "write_rate_limited";
   const bool workload_has_queries =
     !args.recall_only &&
     (args.workload == "query" || args.workload == "both" ||
      (args.workload == "mixed" &&
-      (args.mixed_mode == "rate_limited" ? args.target_query_qps > 0.0
-                                         : args.read_ratio > 0.0)));
+      (shared_rate_limited ? args.target_query_qps > 0.0 :
+       write_rate_limited ? true : args.read_ratio > 0.0)));
   const bool mixed_has_writes = args.workload == "mixed" &&
-    (args.mixed_mode == "rate_limited" ? args.target_write_qps > 0.0
-                                       : args.read_ratio < 1.0);
+    ((shared_rate_limited || write_rate_limited)
+       ? args.target_write_qps > 0.0 : args.read_ratio < 1.0);
   if (service.config().synchronous_exact_updates_enabled() &&
       mixed_has_writes &&
       (args.write_upsert_ratio > 0.0 || args.write_delete_ratio > 0.0)) {
@@ -130,8 +133,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"time_completion_policy", "drain"},
     {"time_issue_policy", args.mixed_mode == "fixed_threads"
        ? "fixed_read_write_threads_until_deadline"
-       : (args.mixed_mode == "rate_limited"
+       : (shared_rate_limited
             ? "shared_two_stream_pacer_until_deadline"
+          : write_rate_limited
+            ? "closed_loop_query_threads_plus_paced_write_threads"
             : "probabilistic_read_write_per_thread_until_deadline")},
     {"mixed_dispatch_policy", args.mixed_mode},
     {"vector_data_type", VamanaNode::vector_dtype_name()},
@@ -143,6 +148,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"operation_granularity", "single_vector"},
     {"insert_vector_source", use_insert_file ? args.insert_file : "deterministic_synthetic_from_insert_id"},
     {"client_threads", args.client_threads},
+    {"write_threads", args.write_threads},
     {"read_ratio", args.read_ratio},
     {"target_query_qps", args.target_query_qps},
     {"target_write_qps", args.target_write_qps},
@@ -211,21 +217,33 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   };
   size_t fixed_read_threads = 0;
   size_t fixed_write_threads = 0;
-  if (args.workload == "mixed" && args.mixed_mode == "fixed_threads") {
-    if (args.read_ratio <= 0.0) {
-      fixed_read_threads = 0;
-    } else if (args.read_ratio >= 1.0) {
-      fixed_read_threads = args.client_threads;
+  if (args.workload == "mixed" &&
+      (args.mixed_mode == "fixed_threads" || write_rate_limited)) {
+    if (write_rate_limited) {
+      fixed_write_threads = args.write_threads;
+      fixed_read_threads = args.client_threads - fixed_write_threads;
     } else {
-      fixed_read_threads = static_cast<size_t>(std::llround(static_cast<double>(args.client_threads) * args.read_ratio));
-      fixed_read_threads = std::clamp<size_t>(fixed_read_threads, 1, args.client_threads - 1);
+      if (args.read_ratio <= 0.0) {
+        fixed_read_threads = 0;
+      } else if (args.read_ratio >= 1.0) {
+        fixed_read_threads = args.client_threads;
+      } else {
+        fixed_read_threads = static_cast<size_t>(std::llround(
+          static_cast<double>(args.client_threads) * args.read_ratio));
+        fixed_read_threads = std::clamp<size_t>(
+          fixed_read_threads, 1, args.client_threads - 1);
+      }
     }
-    fixed_write_threads = args.client_threads - fixed_read_threads;
+    if (!write_rate_limited) {
+      fixed_write_threads = args.client_threads - fixed_read_threads;
+    }
     root["meta"]["mixed_fixed_threads"] = {
       {"read_threads", fixed_read_threads},
       {"write_threads", fixed_write_threads},
     };
-    std::cerr << "[breakdown] mixed fixed thread split: reads=" << fixed_read_threads
+    std::cerr << "[breakdown] mixed "
+              << (write_rate_limited ? "write-rate-limited" : "fixed")
+              << " thread split: reads=" << fixed_read_threads
               << ", writes=" << fixed_write_threads << std::endl;
   }
   const size_t bootstrap_work = args.measure_seconds > 0
@@ -871,8 +889,11 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     threads.reserve(args.client_threads);
     std::chrono::steady_clock::time_point deadline;
     std::optional<PacedOperationDispatcher> pacer;
-    if (args.mixed_mode == "rate_limited") {
+    std::optional<PacedOperationDispatcher> write_pacer;
+    if (shared_rate_limited) {
       pacer.emplace(args.target_query_qps, args.target_write_qps);
+    } else if (write_rate_limited) {
+      write_pacer.emplace(0.0, args.target_write_qps);
     }
 
     for (size_t tid = 0; tid < args.client_threads; ++tid) {
@@ -888,6 +909,17 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
               const auto claim = pacer->claim();
               if (!claim.has_value()) break;
               read_op = claim->kind == PacedOperationKind::query;
+            } else if (write_rate_limited) {
+              read_op = tid < fixed_read_threads;
+              if (read_op) {
+                if (std::chrono::steady_clock::now() >= deadline) break;
+              } else {
+                const auto claim = write_pacer->claim();
+                if (!claim.has_value()) break;
+                lib_assert(
+                  claim->kind == PacedOperationKind::write,
+                  "write-only pacer returned a query claim");
+              }
             } else {
               if (std::chrono::steady_clock::now() >= deadline) break;
               read_op = args.mixed_mode == "fixed_threads"
@@ -933,6 +965,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     const auto phase_start = std::chrono::steady_clock::now();
     deadline = phase_start + std::chrono::seconds(seconds);
     if (pacer.has_value()) pacer->start(phase_start, deadline);
+    if (write_pacer.has_value()) write_pacer->start(phase_start, deadline);
     start_barrier.arrive_and_wait();
     for (auto& thread : threads) {
       thread.join();
@@ -956,10 +989,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       .completed_inserts = completed_inserts.load(std::memory_order_relaxed),
       .completed_upserts = completed_upserts.load(std::memory_order_relaxed),
       .completed_deletes = completed_deletes.load(std::memory_order_relaxed),
-      .scheduled_reads = args.mixed_mode == "rate_limited"
+      .scheduled_reads = shared_rate_limited
         ? PacedOperationDispatcher::scheduled_count(args.target_query_qps, seconds)
         : 0,
-      .scheduled_writes = args.mixed_mode == "rate_limited"
+      .scheduled_writes = (shared_rate_limited || write_rate_limited)
         ? PacedOperationDispatcher::scheduled_count(args.target_write_qps, seconds)
         : 0,
       .drain_seconds = drain_seconds,
@@ -981,7 +1014,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   const bool workload_has_writes = !args.recall_only &&
     (args.workload == "insert" || args.workload == "both" ||
      (args.workload == "mixed" &&
-      (args.mixed_mode == "rate_limited"
+      ((shared_rate_limited || write_rate_limited)
          ? args.target_write_qps > 0.0 : args.read_ratio < 1.0)));
   MixedPhaseStats warmup_mixed_stats{};
   MixedPhaseStats measure_mixed_stats{};
@@ -1254,9 +1287,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
               << " (insert=" << measure_mixed_stats.completed_inserts
               << ", upsert=" << measure_mixed_stats.completed_upserts
               << ", delete=" << measure_mixed_stats.completed_deletes << ")" << std::endl;
-    const bool reads_expected = args.mixed_mode == "rate_limited"
-      ? args.target_query_qps > 0.0 : args.read_ratio > 0.0;
-    const bool writes_expected = args.mixed_mode == "rate_limited"
+    const bool reads_expected = shared_rate_limited
+      ? args.target_query_qps > 0.0
+      : write_rate_limited ? true : args.read_ratio > 0.0;
+    const bool writes_expected = shared_rate_limited || write_rate_limited
       ? args.target_write_qps > 0.0 : args.read_ratio < 1.0;
     if (reads_expected) {
       lib_assert(measure_mixed_stats.completed_reads > 0, "mixed benchmark completed zero reads");
@@ -1346,7 +1380,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     ? static_cast<double>(throughput_insert_ops) / write_throughput_duration
     : 0.0;
   const bool rate_limited_measurement = args.workload == "mixed" &&
-    args.mixed_mode == "rate_limited" && has_throughput_duration;
+    (shared_rate_limited || write_rate_limited) && has_throughput_duration;
   const double configured_measure_duration = configured_phase_duration;
   const double query_throughput = rate_limited_measurement
     ? static_cast<double>(throughput_query_ops) / configured_measure_duration
@@ -1437,13 +1471,13 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   const bool query_windows_expected = args.workload == "query" ||
     args.workload == "both" ||
     (args.workload == "mixed" &&
-     (args.mixed_mode == "rate_limited" ? args.target_query_qps > 0.0
-                                        : args.read_ratio > 0.0));
+     (shared_rate_limited ? args.target_query_qps > 0.0
+      : write_rate_limited ? true : args.read_ratio > 0.0));
   const bool write_windows_expected = args.workload == "insert" ||
     args.workload == "both" ||
     (args.workload == "mixed" &&
-     (args.mixed_mode == "rate_limited" ? args.target_write_qps > 0.0
-                                        : args.read_ratio < 1.0));
+     ((shared_rate_limited || write_rate_limited)
+       ? args.target_write_qps > 0.0 : args.read_ratio < 1.0));
   // The reporter is stopped only after synchronous calls already issued at
   // the deadline return. Keep those completions in throughput/drain counters,
   // but do not let a long final drain interval masquerade as the load tail or

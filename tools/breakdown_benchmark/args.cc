@@ -147,6 +147,8 @@ Args parse_args(int argc, char** argv) {
       args.read_ratio = std::stod(require_value("--read-ratio"));
     } else if (flag == "--mixed-mode") {
       args.mixed_mode = require_value("--mixed-mode");
+    } else if (flag == "--write-threads") {
+      args.write_threads = std::stoull(require_value("--write-threads"));
     } else if (flag == "--target-query-qps") {
       args.target_query_qps = std::stod(require_value("--target-query-qps"));
     } else if (flag == "--target-write-qps" || flag == "--target-insert-qps") {
@@ -239,9 +241,11 @@ Args parse_args(int argc, char** argv) {
     throw std::runtime_error("--read-ratio must be in [0, 1]");
   }
   if (args.mixed_mode != "probability" && args.mixed_mode != "fixed_threads" &&
-      args.mixed_mode != "rate_limited") {
+      args.mixed_mode != "rate_limited" &&
+      args.mixed_mode != "write_rate_limited") {
     throw std::runtime_error(
-      "--mixed-mode must be probability, fixed_threads, or rate_limited");
+      "--mixed-mode must be probability, fixed_threads, rate_limited, or "
+      "write_rate_limited");
   }
   if (args.write_insert_ratio < 0.0 || args.write_upsert_ratio < 0.0 || args.write_delete_ratio < 0.0) {
     throw std::runtime_error("write mutation ratios must be >= 0");
@@ -276,7 +280,8 @@ Args parse_args(int argc, char** argv) {
     (args.workload == "query" || args.workload == "both" ||
      (args.workload == "mixed" &&
       (args.mixed_mode == "rate_limited" ? args.target_query_qps > 0.0
-                                         : args.read_ratio > 0.0)));
+       : args.mixed_mode == "write_rate_limited" ? true
+       : args.read_ratio > 0.0)));
   if (workload_has_queries && args.performance_query_file.empty()) {
     throw std::runtime_error(
       "--performance-query-file is required for query performance phases; "
@@ -323,9 +328,31 @@ Args parse_args(int argc, char** argv) {
       throw std::runtime_error(
         "rate_limited mode requires a positive query or write target");
     }
+    if (args.write_threads != 0) {
+      throw std::runtime_error(
+        "--write-threads is only valid with write_rate_limited mode");
+    }
+  } else if (args.mixed_mode == "write_rate_limited") {
+    if (args.workload != "mixed" || !use_time_mode) {
+      throw std::runtime_error(
+        "--mixed-mode write_rate_limited requires --workload mixed and "
+        "time-based mode");
+    }
+    if (args.target_query_qps != 0.0 || args.target_write_qps <= 0.0) {
+      throw std::runtime_error(
+        "write_rate_limited requires zero target query QPS and a positive "
+        "target write QPS");
+    }
+    if (args.write_threads == 0 || args.write_threads >= args.client_threads) {
+      throw std::runtime_error(
+        "write_rate_limited requires --write-threads in [1, client_threads)");
+    }
   } else if (args.target_query_qps != 0.0 || args.target_write_qps != 0.0) {
     throw std::runtime_error(
-      "target query/write rates are only valid with --mixed-mode rate_limited");
+      "target rates require rate_limited or write_rate_limited mode");
+  } else if (args.write_threads != 0) {
+    throw std::runtime_error(
+      "--write-threads is only valid with write_rate_limited mode");
   }
   return args;
 }

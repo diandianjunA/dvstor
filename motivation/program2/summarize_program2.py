@@ -172,8 +172,9 @@ def main() -> None:
     contracts = set()
     for name, report in loaded.items():
         meta = report.get("meta", {})
-        if meta.get("workload") != "mixed" or meta.get("mixed_dispatch_policy") != "rate_limited":
-            raise SystemExit(f"{name} is not a rate-limited mixed run")
+        if (meta.get("workload") != "mixed" or
+                meta.get("mixed_dispatch_policy") != "write_rate_limited"):
+            raise SystemExit(f"{name} is not a write-rate-limited mixed run")
         if meta.get("gpu_query_graph_read_policy") != expected[name]:
             raise SystemExit(f"{name} has the wrong graph-read policy")
         contracts.add((
@@ -185,6 +186,7 @@ def main() -> None:
             float(meta.get("write_insert_ratio", 0)),
             float(meta.get("write_upsert_ratio", 0)),
             float(meta.get("write_delete_ratio", 0)),
+            int(meta.get("write_threads", 0)),
         ))
     if len(contracts) != 1:
         raise SystemExit(
@@ -220,12 +222,13 @@ def main() -> None:
     fixed, header, live = cases["fixed"], cases["header"], cases["live"]
 
     summary = {
-        "experiment_kind": "dynamic_rate_limited_mixed",
+        "experiment_kind": "dynamic_saturated_query_fixed_write_rate",
         "target_query_qps": contract[0],
         "target_write_qps": contract[1],
         "warmup_seconds": contract[2],
         "measure_seconds": contract[3],
         "insert_start_id": contract[4],
+        "write_threads": contract[8],
         "record_bytes": RECORD_BYTES,
         "dynamic_degree_histogram_quantum": EXTENT_QUANTUM,
         "dynamic_degree_histogram": histogram,

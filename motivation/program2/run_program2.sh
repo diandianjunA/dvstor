@@ -11,8 +11,9 @@ MEASURE_SECONDS="${MEASURE_SECONDS:-20}"
 CLIENT_THREADS="${CLIENT_THREADS:-auto}"
 CLIENT_THREAD_CAP="${CLIENT_THREAD_CAP:-512}"
 RECALL_QUERIES="${RECALL_QUERIES:-1000}"
-TARGET_QUERY_QPS="${TARGET_QUERY_QPS:-100000}"
+TARGET_QUERY_QPS=0
 TARGET_WRITE_QPS="${TARGET_WRITE_QPS:-500}"
+WRITE_THREADS="${WRITE_THREADS:-16}"
 MIN_DYNAMIC_EXPANDED="${MIN_DYNAMIC_EXPANDED:-100}"
 MIN_DYNAMIC_SHARE="${MIN_DYNAMIC_SHARE:-0.001}"
 MIN_WRITE_ATTAINMENT="${MIN_WRITE_ATTAINMENT:-0.95}"
@@ -60,8 +61,8 @@ throughput = report.get("throughput", {})
 gpu = report.get("gpu_persistent", {})
 if meta.get("workload") != "mixed":
     raise SystemExit(f"{case_name}: expected mixed workload")
-if meta.get("mixed_dispatch_policy") != "rate_limited":
-    raise SystemExit(f"{case_name}: expected rate_limited mixed workload")
+if meta.get("mixed_dispatch_policy") != "write_rate_limited":
+    raise SystemExit(f"{case_name}: expected write_rate_limited mixed workload")
 dynamic = int(gpu.get("dynamic_expanded_parent_count", 0))
 dynamic_share = float(gpu.get("dynamic_expanded_parent_ratio", 0))
 write_attainment = float(throughput.get("write_rate_attainment_ratio", 0))
@@ -108,7 +109,8 @@ run_dynamic_case() {
   GPU_RDMA_SEARCH_PROGRESSION_MODE=decoupled \
   ENABLE_BREAKDOWN=false \
   WORKLOAD=mixed \
-  MIXED_MODE=rate_limited \
+  MIXED_MODE=write_rate_limited \
+  MIXED_WRITE_THREADS="$WRITE_THREADS" \
   TARGET_QUERY_QPS="$TARGET_QUERY_QPS" \
   TARGET_WRITE_QPS="$TARGET_WRITE_QPS" \
   WRITE_INSERT_RATIO=1 \
@@ -124,7 +126,8 @@ run_dynamic_case() {
       tee "$report_dir/driver.log"
 
   local report
-  report="$(find "$report_dir" -type f -name 'sift100m_*.json' -print -quit)"
+  report="$(find "$report_dir" -type f -name 'sift100m_*.json' \
+    -printf '%T@\t%p\n' | sort -nr | awk -F '\t' 'NR == 1 { print $2 }')"
   [[ -n "$report" ]] || {
     echo "missing JSON report for $case_name" >&2
     exit 1

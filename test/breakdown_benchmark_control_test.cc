@@ -60,6 +60,26 @@ void test_write_only_mixed_args(const std::string& config_path) {
   assert(args.performance_query_file.empty());
 }
 
+void test_write_rate_limited_args(const std::string& config_path) {
+  const auto args = parse({
+    "benchmark",
+    "--service-config", config_path,
+    "--workload", "mixed",
+    "--warmup-seconds", "5",
+    "--measure-seconds", "20",
+    "--client-threads", "272",
+    "--mixed-mode", "write_rate_limited",
+    "--write-threads", "16",
+    "--target-write-qps", "500",
+    "--performance-query-file", "queries.u8bin",
+    "--report-json", "report.json",
+  });
+  assert(args.mixed_mode == "write_rate_limited");
+  assert(args.write_threads == 16);
+  assert(args.target_query_qps == 0.0);
+  assert(args.target_write_qps == 500.0);
+}
+
 void test_removed_threshold_args_are_rejected(const std::string& config_path) {
   bool threw = false;
   try {
@@ -148,6 +168,16 @@ void test_paced_dispatcher() {
   }
   assert(queries == 3);
   assert(writes == 2);
+
+  PacedOperationDispatcher write_only(0.0, 20.0);
+  const auto write_start = std::chrono::steady_clock::now() + 5ms;
+  write_only.start(write_start, write_start + 90ms);
+  writes = 0;
+  while (const auto claim = write_only.claim()) {
+    assert(claim->kind == PacedOperationKind::write);
+    ++writes;
+  }
+  assert(writes == 2);
 }
 
 void test_progress_deadline_records_zero_tail_and_excludes_drain() {
@@ -192,6 +222,7 @@ int main() {
   }
   test_rate_limited_args(config_path.string());
   test_write_only_mixed_args(config_path.string());
+  test_write_rate_limited_args(config_path.string());
   test_removed_threshold_args_are_rejected(config_path.string());
   test_base_only_recall_args(config_path.string());
   test_paced_dispatcher();

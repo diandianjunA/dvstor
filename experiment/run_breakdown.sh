@@ -19,6 +19,8 @@ Usage: ./experiment/run_breakdown.sh [PROFILE]
   MIXED_MODE=fixed_threads                默认；READ_RATIO 划分专用读/写 caller
   MIXED_MODE=probability                  READ_RATIO 控制闭环操作选择比例
   MIXED_MODE=rate_limited                 使用显式 query/write QPS 调度和达成率
+  MIXED_MODE=write_rate_limited           写线程独立限速，查询线程闭环饱和
+  MIXED_WRITE_THREADS=N                   write_rate_limited 专用写线程数
 
 数据文件与声明范围（在 sift100m_common.sh 集中配置，也可用环境变量覆盖）：
   PERFORMANCE_QUERY_FILE                 默认 sift100m_to_110m_query.u8bin
@@ -68,6 +70,7 @@ RECALL_QUERIES="${RECALL_QUERIES:-1000}"
 RECALL_K="${RECALL_K:-$K}"
 TARGET_QUERY_QPS="${TARGET_QUERY_QPS:-0}"
 TARGET_WRITE_QPS="${TARGET_WRITE_QPS:-0}"
+MIXED_WRITE_THREADS="${MIXED_WRITE_THREADS:-0}"
 RECALL_MODE="${RECALL_MODE:-all}"
 RECALL_BASE_ID_LIMIT="${RECALL_BASE_ID_LIMIT:-0}"
 
@@ -162,9 +165,9 @@ if ! number_is_nonnegative "$TARGET_QUERY_QPS" ||
   exit 1
 fi
 case "$MIXED_MODE" in
-  fixed_threads|probability|rate_limited) ;;
+  fixed_threads|probability|rate_limited|write_rate_limited) ;;
   *)
-    echo "unsupported MIXED_MODE=$MIXED_MODE; expected fixed_threads, probability, or rate_limited" >&2
+    echo "unsupported MIXED_MODE=$MIXED_MODE; expected fixed_threads, probability, rate_limited, or write_rate_limited" >&2
     exit 1
     ;;
 esac
@@ -187,6 +190,9 @@ case "$WORKLOAD" in
     if [[ "$MIXED_MODE" == "rate_limited" ]]; then
       if number_is_positive "$TARGET_QUERY_QPS"; then needs_performance_query=1; fi
       if number_is_positive "$TARGET_WRITE_QPS"; then needs_insert_data=1; fi
+    elif [[ "$MIXED_MODE" == "write_rate_limited" ]]; then
+      needs_performance_query=1
+      needs_insert_data=1
     else
       if number_is_positive "$READ_RATIO"; then needs_performance_query=1; fi
       if number_is_less_than_one "$READ_RATIO"; then needs_insert_data=1; fi
@@ -205,9 +211,17 @@ if [[ "$MIXED_MODE" == "rate_limited" ]]; then
     echo "MIXED_MODE=rate_limited requires WORKLOAD=mixed and at least one positive target rate" >&2
     exit 1
   fi
+elif [[ "$MIXED_MODE" == "write_rate_limited" ]]; then
+  if [[ "$WORKLOAD" != "mixed" ]] ||
+     number_is_positive "$TARGET_QUERY_QPS" ||
+     ! number_is_positive "$TARGET_WRITE_QPS" ||
+     [[ ! "$MIXED_WRITE_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MIXED_MODE=write_rate_limited requires WORKLOAD=mixed, TARGET_QUERY_QPS=0, positive TARGET_WRITE_QPS, and positive MIXED_WRITE_THREADS" >&2
+    exit 1
+  fi
 elif number_is_positive "$TARGET_QUERY_QPS" ||
      number_is_positive "$TARGET_WRITE_QPS"; then
-  echo "target query/write rates require MIXED_MODE=rate_limited" >&2
+  echo "target query/write rates require a rate-limited MIXED_MODE" >&2
   exit 1
 fi
 
@@ -263,6 +277,9 @@ case "$WORKLOAD" in
         auto_client_threads=$((auto_client_threads + write_concurrency_capacity))
       fi
       concurrency_derivation="sum(active_bounded_path_capacities);shared_rate_pacer"
+    elif [[ "$MIXED_MODE" == "write_rate_limited" ]]; then
+      auto_client_threads=$((query_concurrency_capacity + MIXED_WRITE_THREADS))
+      concurrency_derivation="gpu_query_slots+dedicated_paced_write_threads"
     else
       query_required_threads=0
       write_required_threads=0
@@ -309,6 +326,15 @@ if [[ "$WORKLOAD" == "mixed" && "$MIXED_MODE" == "fixed_threads" ]]; then
   read -r projected_read_threads projected_write_threads < <(
     fixed_thread_split "$BENCHMARK_CLIENT_THREADS" "$READ_RATIO")
   echo "[breakdown] fixed-thread offered split reads=$projected_read_threads writes=$projected_write_threads (READ_RATIO controls concurrent callers, not guaranteed completed-op ratio)"
+fi
+if [[ "$WORKLOAD" == "mixed" && "$MIXED_MODE" == "write_rate_limited" ]]; then
+  if (( MIXED_WRITE_THREADS >= BENCHMARK_CLIENT_THREADS )); then
+    echo "MIXED_WRITE_THREADS must be smaller than BENCHMARK_CLIENT_THREADS" >&2
+    exit 1
+  fi
+  projected_write_threads="$MIXED_WRITE_THREADS"
+  projected_read_threads=$((BENCHMARK_CLIENT_THREADS - MIXED_WRITE_THREADS))
+  echo "[breakdown] write-rate-limited split reads=$projected_read_threads writes=$projected_write_threads target_write_qps=$TARGET_WRITE_QPS"
 fi
 
 # Pure-query clients do not initialize update ownership state. Any workload
@@ -477,6 +503,7 @@ cmd=("$BUILD_DIR/dvstor_breakdown_benchmark"
   --client-threads "$BENCHMARK_CLIENT_THREADS"
   --read-ratio "$READ_RATIO"
   --mixed-mode "$MIXED_MODE"
+  --write-threads "$MIXED_WRITE_THREADS"
   --target-query-qps "$TARGET_QUERY_QPS"
   --target-write-qps "$TARGET_WRITE_QPS"
   --write-insert-ratio "${WRITE_INSERT_RATIO:-1}"
