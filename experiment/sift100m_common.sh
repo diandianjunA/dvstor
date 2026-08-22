@@ -679,6 +679,7 @@ write_service_config() {
     echo "storage-owner-batch-max = ${STORAGE_OWNER_BATCH_MAX:-32}"
     echo "storage-owner-batch-max-wait-us = ${STORAGE_OWNER_BATCH_MAX_WAIT_US:-10000}"
     echo "storage-owner-stage2-batch-max-wait-us = ${STORAGE_OWNER_STAGE2_BATCH_MAX_WAIT_US:-25000}"
+    echo "storage-owner-stage2-initial-delay-ms = ${STORAGE_OWNER_STAGE2_INITIAL_DELAY_MS:-0}"
     echo "storage-owner-stage2-score-many = ${STORAGE_OWNER_STAGE2_SCORE_MANY:-true}"
     echo "storage-owner-stage2-home-rpc-combining = ${STORAGE_OWNER_STAGE2_HOME_RPC_COMBINING:-true}"
     echo "storage-owner-stage2-graph-issue-width = ${STORAGE_OWNER_STAGE2_GRAPH_ISSUE_WIDTH:-16}"

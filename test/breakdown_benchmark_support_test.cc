@@ -643,6 +643,15 @@ void test_in_band_maintenance_snapshot_window() {
     begin[shard]->stage2_home_score_rpc_response_bytes = 1'000;
     begin[shard]->active_stage2_contexts = 30 + shard;
     begin[shard]->active_stage2_context_limit = 32;
+    begin[shard]->stage2_finalize_latency_ns = 1'000;
+    begin[shard]->exact_insert_items = 10;
+    begin[shard]->exact_insert_total_ns = 100'000;
+    begin[shard]->exact_insert_remote_read_ns = 30'000;
+    begin[shard]->exact_insert_remote_reverse_ns = 20'000;
+    begin[shard]->exact_insert_search_ns = 50'000;
+    begin[shard]->exact_insert_prune_ns = 20'000;
+    begin[shard]->exact_insert_allocate_write_ns = 10'000;
+    begin[shard]->exact_insert_local_reverse_ns = 5'000;
     end[shard] = *begin[shard];
     auto& latest = *end[shard];
     latest.sequence = 4;
@@ -718,6 +727,15 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_delay_histogram[8] = 20;
     latest.active_stage2_contexts = 30 + shard;
     latest.active_stage2_context_limit = 32;
+    latest.stage2_finalize_latency_ns += 200'000;
+    latest.exact_insert_items += 20;
+    latest.exact_insert_total_ns += 200'000;
+    latest.exact_insert_remote_read_ns += 60'000;
+    latest.exact_insert_remote_reverse_ns += 40'000;
+    latest.exact_insert_search_ns += 100'000;
+    latest.exact_insert_prune_ns += 40'000;
+    latest.exact_insert_allocate_write_ns += 20'000;
+    latest.exact_insert_local_reverse_ns += 10'000;
   }
   const auto summary = tools::breakdown_benchmark::
     summarize_maintenance_snapshot_window(begin, end);
@@ -744,6 +762,13 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.completion_physical_full_failures == 4);
   assert(summary.locality_delta_available);
   assert(summary.stage2_finalized_live == 40);
+  assert(summary.stage2_latency_sum_delta_available);
+  assert(summary.stage2_finalize_latency_ns == 400'000);
+  assert(summary.exact_insert_counter_delta_available);
+  assert(summary.exact_insert_items == 40);
+  assert(summary.exact_insert_total_ns == 400'000);
+  assert(summary.exact_insert_remote_read_ns == 120'000);
+  assert(summary.exact_insert_remote_reverse_ns == 80'000);
   assert(summary.stage2_remote_expansions == 120);
   assert(summary.stage2_scored_candidates == 4000);
   assert(summary.stage2_migrations == 4);

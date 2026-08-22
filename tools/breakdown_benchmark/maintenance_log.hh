@@ -188,6 +188,15 @@ struct MaintenanceLogSummary {
   uint64_t physical_stage1_candidates{};
   uint64_t physical_stage1_remote_frontier_items{};
   uint64_t physical_stage1_neighbors{};
+  uint64_t stage2_finalize_latency_ns{};
+  uint64_t exact_insert_items{};
+  uint64_t exact_insert_total_ns{};
+  uint64_t exact_insert_remote_read_ns{};
+  uint64_t exact_insert_remote_reverse_ns{};
+  uint64_t exact_insert_search_ns{};
+  uint64_t exact_insert_prune_ns{};
+  uint64_t exact_insert_allocate_write_ns{};
+  uint64_t exact_insert_local_reverse_ns{};
   double p99_stage2_delay_upper_ms{};
   bool p99_stage2_delay_over_30s{};
   uint64_t p99_stage2_delay_samples{};
@@ -219,6 +228,8 @@ struct MaintenanceLogSummary {
   bool score_rpc_wire_counter_delta_available{};
   bool timing_counter_delta_available{};
   bool wake_counter_delta_available{};
+  bool stage2_latency_sum_delta_available{};
+  bool exact_insert_counter_delta_available{};
   double backlog_slope_per_sec{};
   bool backlog_slope_available{};
   std::vector<std::string> unreadable_logs;

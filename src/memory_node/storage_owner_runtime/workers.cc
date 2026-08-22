@@ -1,4 +1,5 @@
 #include "memory_node/storage_owner_runtime/detail.hh"
+#include "gpu_search/maintenance_telemetry.hh"
 #include "service/storage_owner_client_helpers.hh"
 
 using namespace memory_node_storage_owner_runtime_detail;
@@ -128,6 +129,63 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
         &scratch.statuses,
         &scratch.results,
         emit_completion);
+
+  if (synchronous_exact) {
+    const u64 remote_read_ns =
+      breakdown.storage_owner_search_neighbor_read_ns +
+      breakdown.storage_owner_search_snapshot_read_ns +
+      breakdown.storage_owner_prune_snapshot_read_ns;
+    exact_insert_items_.fetch_add(request->item_count,
+                                  std::memory_order_relaxed);
+    exact_insert_total_ns_.fetch_add(breakdown.total(),
+                                     std::memory_order_relaxed);
+    exact_insert_remote_read_ns_.fetch_add(remote_read_ns,
+                                           std::memory_order_relaxed);
+    exact_insert_remote_reverse_ns_.fetch_add(
+      breakdown.storage_owner_remote_reverse_ns,
+      std::memory_order_relaxed);
+    exact_insert_search_ns_.fetch_add(breakdown.storage_owner_search_ns,
+                                      std::memory_order_relaxed);
+    exact_insert_prune_ns_.fetch_add(breakdown.storage_owner_prune_ns,
+                                     std::memory_order_relaxed);
+    exact_insert_allocate_write_ns_.fetch_add(
+      breakdown.storage_owner_allocate_node_ns +
+        breakdown.storage_owner_write_node_ns,
+      std::memory_order_relaxed);
+    exact_insert_local_reverse_ns_.fetch_add(
+      breakdown.storage_owner_local_reverse_ns,
+      std::memory_order_relaxed);
+
+    // The completion callback above has already emitted client-visible ACKs.
+    // Serializing this cold publication cannot inflate the measured path.
+    std::lock_guard<std::mutex> telemetry_lock(exact_insert_telemetry_mutex_);
+    auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+      index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+    gpu_search::maintenance_telemetry::publish(
+      reinterpret_cast<byte_t*>(control),
+      gpu_search::maintenance_telemetry::Snapshot{
+        .shard_id = storage_id_,
+        .published_steady_ns = static_cast<u64>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()),
+        .exact_insert_items = exact_insert_items_.load(
+          std::memory_order_relaxed),
+        .exact_insert_total_ns = exact_insert_total_ns_.load(
+          std::memory_order_relaxed),
+        .exact_insert_remote_read_ns = exact_insert_remote_read_ns_.load(
+          std::memory_order_relaxed),
+        .exact_insert_remote_reverse_ns =
+          exact_insert_remote_reverse_ns_.load(std::memory_order_relaxed),
+        .exact_insert_search_ns = exact_insert_search_ns_.load(
+          std::memory_order_relaxed),
+        .exact_insert_prune_ns = exact_insert_prune_ns_.load(
+          std::memory_order_relaxed),
+        .exact_insert_allocate_write_ns =
+          exact_insert_allocate_write_ns_.load(std::memory_order_relaxed),
+        .exact_insert_local_reverse_ns =
+          exact_insert_local_reverse_ns_.load(std::memory_order_relaxed),
+      });
+  }
 
   // Non-committing terminal paths are emitted here. Successful fresh inserts
   // normally complete earlier, directly from authority commit_plan().

@@ -1556,6 +1556,42 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       static_cast<double>(count) /
       static_cast<double>(maintenance_summary.physical_stage1_items);
   };
+  const uint64_t exact_remote_dependency_ns =
+    maintenance_summary.exact_insert_remote_read_ns +
+    maintenance_summary.exact_insert_remote_reverse_ns;
+  const uint64_t exact_local_ns =
+    maintenance_summary.exact_insert_total_ns >= exact_remote_dependency_ns
+      ? maintenance_summary.exact_insert_total_ns - exact_remote_dependency_ns
+      : 0;
+  root["coupled_insert_critical_path"] = {
+    {"counter_delta_available",
+     maintenance_summary.exact_insert_counter_delta_available},
+    {"items", maintenance_summary.exact_insert_items},
+    {"total_ns", maintenance_summary.exact_insert_total_ns},
+    {"remote_read_ns", maintenance_summary.exact_insert_remote_read_ns},
+    {"remote_reverse_ns",
+     maintenance_summary.exact_insert_remote_reverse_ns},
+    {"remote_dependency_ns", exact_remote_dependency_ns},
+    {"local_and_protocol_ns", exact_local_ns},
+    {"remote_dependency_ratio",
+     maintenance_summary.exact_insert_total_ns == 0 ? 0.0 :
+       static_cast<double>(exact_remote_dependency_ns) /
+       static_cast<double>(maintenance_summary.exact_insert_total_ns)},
+    {"avg_total_us",
+     maintenance_summary.exact_insert_items == 0 ? 0.0 :
+       static_cast<double>(maintenance_summary.exact_insert_total_ns) /
+       static_cast<double>(maintenance_summary.exact_insert_items) / 1e3},
+    {"avg_remote_dependency_us",
+     maintenance_summary.exact_insert_items == 0 ? 0.0 :
+       static_cast<double>(exact_remote_dependency_ns) /
+       static_cast<double>(maintenance_summary.exact_insert_items) / 1e3},
+    {"search_ns", maintenance_summary.exact_insert_search_ns},
+    {"prune_ns", maintenance_summary.exact_insert_prune_ns},
+    {"allocate_write_ns",
+     maintenance_summary.exact_insert_allocate_write_ns},
+    {"local_reverse_ns",
+     maintenance_summary.exact_insert_local_reverse_ns},
+  };
   root["stage2"] = {
     {"source", in_band_maintenance_telemetry
       ? "in_band_control_page" : "storage_logs"},
@@ -1577,6 +1613,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"p99_stage2_delay_samples", maintenance_summary.p99_stage2_delay_samples},
     {"p99_stage2_delay_available",
      maintenance_summary.p99_stage2_delay_available},
+    {"latency_sum_delta_available",
+     maintenance_summary.stage2_latency_sum_delta_available},
+    {"finalize_latency_ns",
+     maintenance_summary.stage2_finalize_latency_ns},
+    {"avg_stage2_delay_ms",
+     maintenance_summary.stage2_finalized_live == 0 ? 0.0 :
+       static_cast<double>(maintenance_summary.stage2_finalize_latency_ns) /
+       static_cast<double>(maintenance_summary.stage2_finalized_live) / 1e6},
     {"failures", maintenance_summary.failures},
     {"failure_delta_available", maintenance_summary.failure_delta_available},
     {"peer_reverse_retry_attempts",
