@@ -1,6 +1,0 @@
-[2026-08-22T20:54:20+08:00] start repeat=1 scenario=ack order=1 case=coupled_one_stage
-[ 18%] Built target rdma_library
-[ 25%] Building CXX object CMakeFiles/dvstor_memory_node.dir/src/memory_node/storage_owner_maintenance/runtime.cc.o
-[ 25%] Linking CXX executable dvstor_memory_node
-[100%] Built target dvstor_memory_node
-missing storage artifact: /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16_node1_of5.dat
