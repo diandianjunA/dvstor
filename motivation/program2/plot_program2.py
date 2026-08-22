@@ -84,6 +84,7 @@ write_svg("program2_motivation.svg", motivation)
 
 
 fixed = d["fixed"]
+header = d["header_neighbor"]
 live = d["live"]
 
 
@@ -104,16 +105,18 @@ def paired_bars(x0, title, labels, values, colors, unit):
 
 effect = paired_bars(
     35, f"(a) Query throughput (+{100*d['qps_improvement_ratio']:.1f}%)",
-    ["Fixed", "LiveExtent"], [fixed["query_qps"], live["query_qps"]],
-    ["#7570b3", "#1b9e77"], "")
+    ["Fixed", "Header→N", "LiveExtent"],
+    [fixed["query_qps"], header["query_qps"], live["query_qps"]],
+    ["#7570b3", "#d95f02", "#1b9e77"], "")
 effect += paired_bars(
     520, f"(b) P99 latency (-{100*d['p99_reduction_ratio']:.1f}%)",
-    ["Fixed", "LiveExtent"], [fixed["p99_latency_ms"], live["p99_latency_ms"]],
-    ["#7570b3", "#1b9e77"], " ms")
+    ["Fixed", "Header→N", "LiveExtent"],
+    [fixed["p99_latency_ms"], header["p99_latency_ms"], live["p99_latency_ms"]],
+    ["#7570b3", "#d95f02", "#1b9e77"], " ms")
 effect += (
     f'<text class="label" x="500" y="375" text-anchor="middle">'
     f'Graph bytes/query: -{100*d["graph_bytes_reduction_ratio"]:.1f}% | '
     f'Physical WQE/query: {100*d["physical_wqe_change_ratio"]:+.2f}% | '
-    f'Recall equal: {esc(d["recall_equal"])}</text>'
+    f'All recalls equal: {esc(d["all_recall_equal"])}</text>'
 )
 write_svg("program2_effectiveness.svg", effect)

@@ -127,14 +127,29 @@ def main() -> None:
         raise SystemExit("usage: summarize_program2.py <run-root>")
     root = Path(sys.argv[1]).resolve()
     reports = manifest(root)
-    missing = {"fixed", "live", "probe"} - reports.keys()
+    missing = {"fixed", "header", "live", "probe"} - reports.keys()
     if missing:
         raise SystemExit(f"missing cases in manifest: {', '.join(sorted(missing))}")
 
     fixed = load_json(reports["fixed"])
+    header = load_json(reports["header"])
     live = load_json(reports["live"])
     fixed_gpu = fixed.get("gpu_persistent", {})
+    header_gpu = header.get("gpu_persistent", {})
     live_gpu = live.get("gpu_persistent", {})
+    for case_name, report, expected_policy in (
+        ("fixed", fixed, "fixed"),
+        ("header", header, "header-neighbor"),
+        ("live", live, "live-extent"),
+    ):
+        observed_policy = nested(
+            report, "meta", "gpu_query_graph_read_policy", default=""
+        )
+        if observed_policy != expected_policy:
+            raise SystemExit(
+                f"{case_name} report policy is {observed_policy!r}, "
+                f"expected {expected_policy!r}"
+            )
     histogram = [int(value) for value in live_gpu.get("expanded_degree_histogram", [])]
     parents = int(live_gpu.get("expanded_parent_count", 0))
     if not histogram or sum(histogram) != parents or parents == 0:
@@ -151,12 +166,16 @@ def main() -> None:
     p95_class = histogram_percentile(histogram, 0.95)
 
     fixed_qps = float(nested(fixed, "throughput", "query_ops_per_sec"))
+    header_qps = float(nested(header, "throughput", "query_ops_per_sec"))
     live_qps = float(nested(live, "throughput", "query_ops_per_sec"))
     fixed_p99_ms = float(
         nested(fixed, "query_breakdown", "latency", "p99_end_to_end_ns")
     ) / 1e6
     live_p99_ms = float(
         nested(live, "query_breakdown", "latency", "p99_end_to_end_ns")
+    ) / 1e6
+    header_p99_ms = float(
+        nested(header, "query_breakdown", "latency", "p99_end_to_end_ns")
     ) / 1e6
     fixed_graph_bpq = float(
         fixed_gpu.get("average_graph_read_bytes_per_query", 0)
@@ -165,6 +184,7 @@ def main() -> None:
         live_gpu.get("average_graph_read_bytes_per_query", 0)
     )
     fixed_queries = int(fixed_gpu.get("queries_completed", 0))
+    header_queries = int(header_gpu.get("queries_completed", 0))
     live_queries = int(live_gpu.get("queries_completed", 0))
     fixed_wqes_per_query = (
         (int(fixed_gpu.get("graph_live_extent_reads", 0)) +
@@ -175,6 +195,11 @@ def main() -> None:
         (int(live_gpu.get("graph_live_extent_reads", 0)) +
          int(live_gpu.get("graph_full_record_reads", 0))) / live_queries
         if live_queries else 0
+    )
+    header_wqes_per_query = (
+        (int(header_gpu.get("graph_live_extent_reads", 0)) +
+         int(header_gpu.get("graph_full_record_reads", 0))) / header_queries
+        if header_queries else 0
     )
 
     summary = {
@@ -199,6 +224,18 @@ def main() -> None:
             ),
             "recall_at_10": float(nested(fixed, "recall", "recall")),
         },
+        "header_neighbor": {
+            "query_qps": header_qps,
+            "p99_latency_ms": header_p99_ms,
+            "graph_bytes_per_query": float(
+                header_gpu.get("average_graph_read_bytes_per_query", 0)
+            ),
+            "physical_graph_wqes_per_query": header_wqes_per_query,
+            "gpu_rdma_wait_us_per_query": float(
+                header_gpu.get("average_gpu_rdma_wait_us", 0)
+            ),
+            "recall_at_10": float(nested(header, "recall", "recall")),
+        },
         "live": {
             "query_qps": live_qps,
             "p99_latency_ms": live_p99_ms,
@@ -211,6 +248,9 @@ def main() -> None:
             "fallback_reads": int(live_gpu.get("graph_extent_fallback_reads", 0)),
         },
         "qps_improvement_ratio": live_qps / fixed_qps - 1 if fixed_qps else 0,
+        "live_vs_header_qps_improvement_ratio": (
+            live_qps / header_qps - 1 if header_qps else 0
+        ),
         "p99_reduction_ratio": 1 - live_p99_ms / fixed_p99_ms if fixed_p99_ms else 0,
         "graph_bytes_reduction_ratio": (
             1 - live_graph_bpq / fixed_graph_bpq if fixed_graph_bpq else 0
@@ -222,6 +262,15 @@ def main() -> None:
         "recall_equal": abs(
             float(nested(fixed, "recall", "recall")) -
             float(nested(live, "recall", "recall"))
+        ) < 1e-12,
+        "all_recall_equal": max(
+            float(nested(fixed, "recall", "recall")),
+            float(nested(header, "recall", "recall")),
+            float(nested(live, "recall", "recall")),
+        ) - min(
+            float(nested(fixed, "recall", "recall")),
+            float(nested(header, "recall", "recall")),
+            float(nested(live, "recall", "recall")),
         ) < 1e-12,
     }
 

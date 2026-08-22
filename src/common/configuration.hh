@@ -551,8 +551,10 @@ private:
       fail("--gpu-dynamic-graph-access-mode must be fixed, adaptive, or manual");
     }
     if (gpu_query_graph_read_policy != "fixed" &&
+        gpu_query_graph_read_policy != "header-neighbor" &&
         gpu_query_graph_read_policy != "live-extent") {
-      fail("--gpu-query-graph-read-policy must be fixed or live-extent");
+      fail("--gpu-query-graph-read-policy must be fixed, header-neighbor, "
+           "or live-extent");
     }
     if (gpu_rdma_search_progression_mode != "manual" &&
         gpu_rdma_search_progression_mode != "coupled" &&

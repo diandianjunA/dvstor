@@ -125,6 +125,10 @@ int main() {
   const auto live_extent_config =
     make_config(false, false, {}, "LIVE-EXTENT");
   assert(live_extent_config.gpu_query_graph_read_policy == "live-extent");
+  const auto header_neighbor_config =
+    make_config(false, false, {}, "HEADER-NEIGHBOR");
+  assert(header_neighbor_config.gpu_query_graph_read_policy ==
+         "header-neighbor");
   const auto static_only_extent_config =
     make_config(false, false, {}, "LIVE-EXTENT", "false");
   assert(static_only_extent_config.gpu_query_graph_read_policy ==

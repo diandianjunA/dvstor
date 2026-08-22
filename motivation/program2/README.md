@@ -5,11 +5,17 @@ runs and one short transport probe:
 
 1. query-weighted live-neighbor degree/required-prefix distribution;
 2. one-shot 832 B, dependent 16+384 B, and hinted one-shot 400 B RDMA;
-3. end-to-end Fixed versus LiveExtent query performance.
+3. end-to-end Fixed, dependent Header→Neighbor, and LiveExtent query
+   performance.
 
-The fixed and live cases use the same full-system profile and only change the
-graph-read policy. Storage must be restarted for every prompt so the startup
-contract and remote session are fresh.
+The `header-neighbor` baseline performs a 16-byte header RDMA followed by an
+exact-size neighbor-body RDMA. The assembled prefix is accepted only after the
+same checksum/incarnation validation used by the other policies; a concurrent
+mutation restarts the two-stage snapshot.
+
+The fixed, header-neighbor, and live cases use the same full-system profile and
+only change the graph-read policy. Storage must be restarted for every prompt
+so the startup contract and remote session are fresh.
 
 Compute node:
 
@@ -19,10 +25,11 @@ cd /home/xjs/experiment/dvstor
 ```
 
 Storage node, execute the command printed by the compute runner at each of the
-three prompts:
+four prompts:
 
 ```bash
 ./motivation/program2/start_storage_case.sh fixed
+./motivation/program2/start_storage_case.sh header
 ./motivation/program2/start_storage_case.sh live
 ./motivation/program2/start_storage_case.sh probe
 ```

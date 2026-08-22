@@ -86,9 +86,21 @@ run_probe() {
     exit 1
   }
 
-  wait_storage probe
   report_dir="$RUN_ROOT/probe"
   mkdir -p "$report_dir"
+  local probe_log="$report_dir/probe.log"
+  local expected_rows=$(( ${PROBE_REPEATS:-3} * 9 ))
+  local observed_rows=0
+  if [[ -f "$probe_log" ]]; then
+    observed_rows="$(grep -c '^LIVE_EXTENT_RDMA_CSV,' "$probe_log" || true)"
+  fi
+  if (( observed_rows == expected_rows )); then
+    echo "复用已完整采集的 RDMA probe：$probe_log ($observed_rows rows)"
+    record_case probe "$probe_log"
+    return
+  fi
+
+  wait_storage probe
   cmake --build "$PROJECT_DIR/build" -j --target dvstor_gpunetio_loopback_probe
 
   echo "[$(date --iso-8601=seconds)] RDMA protocol probe"
@@ -101,8 +113,8 @@ run_probe() {
   DVSTOR_GPUNETIO_PAYLOAD_ITERATIONS="${PROBE_ITERATIONS:-512}" \
   DVSTOR_GPUNETIO_PAYLOAD_BATCH_READS="${PROBE_BATCH_READS:-16}" \
     "$PROJECT_DIR/build/dvstor_gpunetio_loopback_probe" \
-      --service-config "$live_ini" 2>&1 | tee "$report_dir/probe.log"
-  record_case probe "$report_dir/probe.log"
+      --service-config "$live_ini" 2>&1 | tee "$probe_log"
+  record_case probe "$probe_log"
 }
 
 summarize() {
@@ -114,6 +126,7 @@ summarize() {
 case "$ACTION" in
   all)
     run_query_case fixed fixed false
+    run_query_case header header-neighbor false
     run_query_case live live-extent true
     run_probe
     summarize
@@ -121,17 +134,21 @@ case "$ACTION" in
   fixed)
     run_query_case fixed fixed false
     ;;
+  header)
+    run_query_case header header-neighbor false
+    ;;
   live)
     run_query_case live live-extent true
     ;;
   probe)
     run_probe
+    summarize
     ;;
   summarize)
     summarize
     ;;
   *)
-    echo "usage: $0 [all|fixed|live|probe|summarize]" >&2
+    echo "usage: $0 [all|fixed|header|live|probe|summarize]" >&2
     exit 2
     ;;
 esac
