@@ -23,6 +23,7 @@ struct Args {
   size_t client_threads{4};
   double read_ratio{0.5};
   std::string mixed_mode{"probability"};
+  size_t write_threads{};
   double target_query_qps{};
   double target_write_qps{};
   std::string recall_query_file;

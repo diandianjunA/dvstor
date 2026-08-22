@@ -8,8 +8,9 @@
 
 三个 case 使用同样的查询/插入文件、目标查询速率、目标更新速率和动态
 extent 发布逻辑。每个 case 都必须从重新启动的干净存储节点开始。默认测量
-为 5 秒预热、20 秒正式阶段、500 update/s，并向查询路径提供 100000 query/s
-的饱和压力。脚本要求更新速率达成率至少为 95%，并要求查询真正展开至少
+为 5 秒预热、20 秒正式阶段、500 update/s。16 个专用写线程通过独立 pacer
+维持更新到达率，其余查询线程闭环饱和。脚本要求更新速率达成率至少为
+95%，并要求查询真正展开至少
 100 个动态版本，而且动态版本占权威展开节点至少 0.1%，否则拒绝汇总，避免
 出现“名义 mixed，实际几乎没访问动态节点”。
 
@@ -60,7 +61,7 @@ MIN_DYNAMIC_SHARE=0 \
 参数：
 
 ```bash
-TARGET_WRITE_QPS=500 TARGET_QUERY_QPS=100000 \
+TARGET_WRITE_QPS=500 WRITE_THREADS=16 \
 WARMUP_SECONDS=10 MEASURE_SECONDS=30 \
   ./motivation/program2/run_program2.sh
 ```
