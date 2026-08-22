@@ -6,7 +6,7 @@ PROJECT_DIR="$(cd "$PROGRAM_DIR/../.." && pwd)"
 EXPERIMENT_DIR="$PROJECT_DIR/experiment"
 
 PROFILE="${PROFILE:-04_gpu_persistent_gpunetio}"
-STORAGE_BUILD_DIR="${STORAGE_BUILD_DIR:-$PROJECT_DIR/build-storage}"
+STORAGE_BUILD_DIR="${STORAGE_BUILD_DIR:-$PROJECT_DIR/build}"
 STORAGE_PID_DIR="${STORAGE_PID_DIR:-$EXPERIMENT_DIR/pids}"
 
 case "${1:-}" in
