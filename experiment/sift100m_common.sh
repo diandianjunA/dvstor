@@ -648,6 +648,7 @@ write_service_config() {
     echo "storage-owner-update-completion-mode = $STORAGE_OWNER_UPDATE_COMPLETION_MODE"
     echo "gpu-dynamic-graph-access-mode = $GPU_DYNAMIC_GRAPH_ACCESS_MODE"
     echo "gpu-rdma-search-progression-mode = $GPU_RDMA_SEARCH_PROGRESSION_MODE"
+    echo "gpu-exact-frontier-early-issue = ${GPU_EXACT_FRONTIER_EARLY_ISSUE:-false}"
     echo "gpu-query-slots = ${GPU_QUERY_SLOTS:-256}"
     echo "gpu-memory-limit-gb = ${GPU_MEMORY_LIMIT_GB:-40}"
     echo "gpu-memory-reserve-gb = ${GPU_MEMORY_RESERVE_GB:-4}"

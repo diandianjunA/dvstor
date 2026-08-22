@@ -175,10 +175,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"gpu_graph_prefetch_depth", service.config().gpu_graph_prefetch_depth},
     {"gpu_graph_commit_width", service.config().gpu_graph_commit_width},
     {"gpu_graph_issue_width", service.config().gpu_graph_issue_width},
+    {"gpu_exact_frontier_early_issue",
+      service.config().gpu_exact_frontier_early_issue},
     {"gpu_frontier_execution_mode",
-      service.config().gpu_graph_issue_width >
-          service.config().gpu_graph_commit_width
-        ? "adaptive_decoupled" : "coupled_baseline"},
+      service.config().decoupled_gpu_rdma_search_progression_enabled()
+        ? (service.config().gpu_graph_issue_width >
+              service.config().gpu_graph_commit_width
+            ? "adaptive_decoupled" : "exact_core_early_issue")
+        : "persistent_late_issue"},
     {"gpu_query_graph_read_policy",
       service.config().gpu_query_graph_read_policy},
     {"gpu_dynamic_graph_extent",

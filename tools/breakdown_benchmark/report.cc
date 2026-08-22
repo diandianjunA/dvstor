@@ -122,6 +122,16 @@ nlohmann::json telemetry_to_json(
       telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.gpu_frontier_enqueue_ns) /
           static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_frontier_prefix_to_beam_publish_us",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.gpu_frontier_prefix_to_beam_publish_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_frontier_issue_to_beam_publish_us",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.gpu_frontier_issue_to_beam_publish_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
     {"average_gpu_rdma_wait_us", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.gpu_rdma_wait_ns) /
           static_cast<double>(telemetry.queries_completed) / 1000.0},

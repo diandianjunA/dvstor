@@ -27,6 +27,10 @@ TelemetrySnapshot Telemetry::snapshot() const {
       gpu_frontier_prepare_ns.load(std::memory_order_relaxed),
     .gpu_frontier_enqueue_ns =
       gpu_frontier_enqueue_ns.load(std::memory_order_relaxed),
+    .gpu_frontier_prefix_to_beam_publish_ns =
+      gpu_frontier_prefix_to_beam_publish_ns.load(std::memory_order_relaxed),
+    .gpu_frontier_issue_to_beam_publish_ns =
+      gpu_frontier_issue_to_beam_publish_ns.load(std::memory_order_relaxed),
     .gpu_rdma_wait_ns = gpu_rdma_wait_ns.load(std::memory_order_relaxed),
     .gpu_graph_validation_ns = gpu_graph_validation_ns.load(std::memory_order_relaxed),
     .gpu_neighbor_decode_ns = gpu_neighbor_decode_ns.load(std::memory_order_relaxed),
@@ -296,6 +300,8 @@ void Telemetry::reset() {
   gpu_frontier_preview_ns.store(0, std::memory_order_relaxed);
   gpu_frontier_prepare_ns.store(0, std::memory_order_relaxed);
   gpu_frontier_enqueue_ns.store(0, std::memory_order_relaxed);
+  gpu_frontier_prefix_to_beam_publish_ns.store(0, std::memory_order_relaxed);
+  gpu_frontier_issue_to_beam_publish_ns.store(0, std::memory_order_relaxed);
   gpu_rdma_wait_ns.store(0, std::memory_order_relaxed);
   gpu_graph_validation_ns.store(0, std::memory_order_relaxed);
   gpu_neighbor_decode_ns.store(0, std::memory_order_relaxed);

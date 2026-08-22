@@ -824,10 +824,10 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
              "cudaGetDeviceProperties(GPU navigation)");
   const bool decoupled_search_progression =
     config.decoupled_gpu_rdma_search_progression_enabled();
-  if (decoupled_search_progression !=
-      (config.gpu_graph_issue_width > config.gpu_graph_commit_width)) {
+  if (decoupled_search_progression &&
+      config.gpu_graph_issue_width < config.gpu_graph_commit_width) {
     throw std::logic_error(
-      "resolved GPU-RDMA search progression mode disagrees with graph widths");
+      "exact-frontier progression requires issue width >= commit width");
   }
   gpu_clock_khz = static_cast<u64>(std::max(1, properties.clockRate));
   std::array<PersistentKernelOccupancy, 2> occupancies{};

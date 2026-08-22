@@ -65,6 +65,11 @@ public:
   // both the frontier widths and Beam merge implementation so an experiment
   // cannot accidentally retain a half-enabled ASFE path.
   str gpu_rdma_search_progression_mode{"manual"};
+  // Motivation/causal-ablation switch: enable exact mandatory-frontier
+  // issue-before-commit without requiring issue_width > commit_width.  This
+  // permits a strict persistent+Stable-Run A/B in which both variants read
+  // exactly commit_width graph records and speculative tail reads are absent.
+  bool gpu_exact_frontier_early_issue{false};
   str gpu_query_beam_merge_policy{"legacy"};
   str query_rdma_trace_mode{"off"};
   u32 query_rdma_trace_sample_rate{1000};
@@ -180,7 +185,8 @@ public:
   bool decoupled_gpu_rdma_search_progression_enabled() const {
     return gpu_rdma_search_progression_mode == "decoupled" ||
       (gpu_rdma_search_progression_mode == "manual" &&
-       gpu_graph_issue_width > gpu_graph_commit_width);
+       (gpu_exact_frontier_early_issue ||
+        gpu_graph_issue_width > gpu_graph_commit_width));
   }
 
   bool synchronous_exact_updates_enabled() const {
@@ -384,6 +390,12 @@ private:
        po::value<str>(&gpu_rdma_search_progression_mode)
          ->default_value(gpu_rdma_search_progression_mode),
        "Contribution mode: coupled, decoupled, or manual for lower-level ablations.")
+      ("gpu-exact-frontier-early-issue",
+       po::value<bool>(&gpu_exact_frontier_early_issue)
+         ->default_value(gpu_exact_frontier_early_issue),
+       "Issue the exact mandatory next frontier before full Beam publication; "
+       "manual mode may use issue-width equal to commit-width to disable the "
+       "speculative tail.")
       ("gpu-query-beam-merge-policy",
        po::value<str>(&gpu_query_beam_merge_policy)
          ->default_value(gpu_query_beam_merge_policy),
@@ -645,15 +657,15 @@ public:
              << config.vector_data_type << '\n';
       output << std::setfill('-') << std::setw(line_width) << "" << '\n';
       output << std::setfill(' ');
-      const bool gpu_owned_progression =
-        config.decoupled_gpu_rdma_search_progression_enabled();
+      const bool persistent_gpu_engine =
+        config.gpu_rdma_search_progression_mode != "coupled";
       output << std::setw(width) << "query engine: "
-             << (gpu_owned_progression
+             << (persistent_gpu_engine
                    ? "persistent_gpu_opq_pq"
                    : "host_orchestrated_cpu_rdma_finite_cuda")
              << '\n';
       output << std::setw(width) << "remote transport: "
-             << (gpu_owned_progression
+             << (persistent_gpu_engine
                    ? "GPU-initiated GPUNetIO"
                    : "CPU-posted one-sided RDMA")
              << '\n';

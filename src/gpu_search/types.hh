@@ -84,6 +84,10 @@ struct CompletionDescriptor {
   u64 frontier_preview_cycles{};
   u64 frontier_prepare_cycles{};
   u64 frontier_enqueue_cycles{};
+  // Direct motivation telemetry for exact-frontier issue/commit decoupling.
+  // Both are accumulated only for rounds that produced an exact certificate.
+  u64 frontier_prefix_to_beam_publish_cycles{};
+  u64 frontier_issue_to_beam_publish_cycles{};
   u64 rdma_wait_cycles{};
   u64 graph_validation_cycles{};
   u64 neighbor_decode_cycles{};
@@ -256,7 +260,7 @@ struct CompletionDescriptor {
 // CompletionDescriptor is embedded once in persistent-kernel shared memory
 // and is also the mapped device-to-host ring ABI. Keep the explicit size check
 // synchronized with both sides whenever production telemetry extends it.
-static_assert(sizeof(CompletionDescriptor) == 712);
+static_assert(sizeof(CompletionDescriptor) == 728);
 static_assert(alignof(CompletionDescriptor) == alignof(u64));
 
 struct CentroidRoutePublishDescriptor {
@@ -292,6 +296,8 @@ struct TelemetrySnapshot {
   u64 gpu_frontier_preview_ns{};
   u64 gpu_frontier_prepare_ns{};
   u64 gpu_frontier_enqueue_ns{};
+  u64 gpu_frontier_prefix_to_beam_publish_ns{};
+  u64 gpu_frontier_issue_to_beam_publish_ns{};
   u64 gpu_rdma_wait_ns{};
   u64 gpu_graph_validation_ns{};
   u64 gpu_neighbor_decode_ns{};
@@ -458,6 +464,8 @@ public:
   std::atomic<u64> gpu_frontier_preview_ns{0};
   std::atomic<u64> gpu_frontier_prepare_ns{0};
   std::atomic<u64> gpu_frontier_enqueue_ns{0};
+  std::atomic<u64> gpu_frontier_prefix_to_beam_publish_ns{0};
+  std::atomic<u64> gpu_frontier_issue_to_beam_publish_ns{0};
   std::atomic<u64> gpu_rdma_wait_ns{0};
   std::atomic<u64> gpu_graph_validation_ns{0};
   std::atomic<u64> gpu_neighbor_decode_ns{0};
