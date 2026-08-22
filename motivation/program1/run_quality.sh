@@ -9,7 +9,7 @@ RUN_ROOT="${RUN_ROOT:-$PROGRAM_DIR/results/program1_quality_$(date +%Y%m%d_%H%M%
 QUALITY_STAGE2_DELAY_MS="${QUALITY_STAGE2_DELAY_MS:-15000}"
 QUALITY_SETTLE_SECONDS="${QUALITY_SETTLE_SECONDS:-30}"
 QUALITY_INSERT_COUNT="${QUALITY_INSERT_COUNT:-1000}"
-QUALITY_RECALL_QUERIES="${QUALITY_RECALL_QUERIES:-100}"
+QUALITY_RECALL_QUERIES="${QUALITY_RECALL_QUERIES:-1000}"
 
 echo "请先在存储节点运行："
 echo "  QUALITY_STAGE2_DELAY_MS=$QUALITY_STAGE2_DELAY_MS ./motivation/program1/start_storage_case.sh quality"
@@ -51,4 +51,3 @@ if [[ -f "$RUN_ROOT/manifest.tsv" ]]; then
 fi
 echo "quality report: $report"
 echo "汇总与画图：python3 $PROGRAM_DIR/summarize_program1.py $RUN_ROOT"
-

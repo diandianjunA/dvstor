@@ -93,6 +93,11 @@ struct RecallResult {
   u32 k{};
 };
 
+struct SelfRecallSnapshot {
+  RecallResult summary;
+  std::vector<std::vector<node_t>> result_ids;
+};
+
 struct InsertStats {
   size_t attempted{};
   size_t inserted{};
@@ -490,7 +495,7 @@ RecallResult run_recall(ComputeService& service,
   return result;
 }
 
-RecallResult run_inserted_self_recall(
+SelfRecallSnapshot run_inserted_self_recall(
     ComputeService& service, const std::string& label,
     const VectorRows& insert_rows, size_t row_offset,
     uint64_t insert_start_id, size_t inserted_count,
@@ -499,6 +504,8 @@ RecallResult run_inserted_self_recall(
   std::atomic<size_t> completed{0};
   ProgressReporter reporter(label, completed, query_count, 0);
   size_t hits = 0;
+  std::vector<std::vector<node_t>> captured_results;
+  captured_results.reserve(query_count);
   for (size_t sample = 0; sample < query_count; ++sample) {
     const size_t logical_row = query_count == inserted_count
       ? sample
@@ -510,6 +517,7 @@ RecallResult run_inserted_self_recall(
     if (std::find(results.begin(), results.end(), expected) != results.end()) {
       ++hits;
     }
+    captured_results.emplace_back(results.begin(), results.end());
     completed.fetch_add(1, std::memory_order_relaxed);
   }
   reporter.finish();
@@ -522,7 +530,32 @@ RecallResult run_inserted_self_recall(
   std::cerr << "[sift101m-long-insert][self-hit] " << label
             << " hit@" << requested_k << "=" << result.recall
             << " queries=" << result.queries << std::endl;
-  return result;
+  return SelfRecallSnapshot{
+    .summary = result,
+    .result_ids = std::move(captured_results),
+  };
+}
+
+double result_overlap_at_k(const SelfRecallSnapshot& first,
+                           const SelfRecallSnapshot& second) {
+  if (first.result_ids.size() != second.result_ids.size()) {
+    fail("self-recall result snapshots have different query counts");
+  }
+  if (first.result_ids.empty()) return 0.0;
+  double total = 0.0;
+  for (size_t query = 0; query < first.result_ids.size(); ++query) {
+    const auto& lhs = first.result_ids[query];
+    const auto& rhs = second.result_ids[query];
+    const size_t denominator = std::min(lhs.size(), rhs.size());
+    if (denominator == 0) continue;
+    size_t matches = 0;
+    for (const node_t id : lhs) {
+      matches += std::find(rhs.begin(), rhs.end(), id) != rhs.end();
+    }
+    total += static_cast<double>(matches) /
+      static_cast<double>(denominator);
+  }
+  return total / static_cast<double>(first.result_ids.size());
 }
 
 InsertStats run_insert_phase(ComputeService& service,
@@ -757,7 +790,7 @@ int run_with_service(ComputeService& service, const Args& args) {
     return EXIT_FAILURE;
   }
 
-  std::optional<RecallResult> stage1_self_recall;
+  std::optional<SelfRecallSnapshot> stage1_self_recall;
   const auto stage1_recall_finished_before = std::chrono::steady_clock::now();
   if (args.self_recall_queries != 0) {
     stage1_self_recall = run_inserted_self_recall(
@@ -765,9 +798,9 @@ int run_with_service(ComputeService& service, const Args& args) {
       args.insert_start_id, effective_insert_count,
       args.self_recall_queries, args.self_recall_k);
     root["stage1_only_self_recall"] = {
-      {"queries", stage1_self_recall->queries},
-      {"k", stage1_self_recall->k},
-      {"hit_rate", stage1_self_recall->recall},
+      {"queries", stage1_self_recall->summary.queries},
+      {"k", stage1_self_recall->summary.k},
+      {"hit_rate", stage1_self_recall->summary.recall},
     };
   }
   const double stage1_window_elapsed_seconds = insert_stats.duration_seconds +
@@ -785,22 +818,44 @@ int run_with_service(ComputeService& service, const Args& args) {
 
   wait_for_settle(args.settle_seconds);
 
-  std::optional<RecallResult> final_self_recall;
+  const auto maintenance_drain_started = std::chrono::steady_clock::now();
+  vec<u64> maintenance_targets;
+  vec<u64> maintenance_durable;
+  const bool maintenance_complete = service.wait_for_storage_maintenance(
+    std::chrono::milliseconds(
+      std::max<u32>(1000, service.config().storage_owner_rpc_timeout_ms)),
+    &maintenance_targets, &maintenance_durable);
+  const double maintenance_drain_seconds = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - maintenance_drain_started).count();
+  root["stage2_finalization"] = {
+    {"complete", maintenance_complete},
+    {"drain_seconds_after_settle", maintenance_drain_seconds},
+    {"target_sequences", maintenance_targets},
+    {"durable_sequences", maintenance_durable},
+  };
+  if (!maintenance_complete) {
+    fail("Stage2 did not reach its durable watermark before final recall");
+  }
+
+  std::optional<SelfRecallSnapshot> final_self_recall;
   if (args.self_recall_queries != 0) {
     final_self_recall = run_inserted_self_recall(
       service, "stage2-finalized", insert_rows, args.insert_row_offset,
       args.insert_start_id, effective_insert_count,
       args.self_recall_queries, args.self_recall_k);
     root["finalized_self_recall"] = {
-      {"queries", final_self_recall->queries},
-      {"k", final_self_recall->k},
-      {"hit_rate", final_self_recall->recall},
+      {"queries", final_self_recall->summary.queries},
+      {"k", final_self_recall->summary.k},
+      {"hit_rate", final_self_recall->summary.recall},
     };
+    const double overlap = result_overlap_at_k(
+      *stage1_self_recall, *final_self_recall);
     root["self_recall_delta"] = {
-      {"final_minus_stage1", final_self_recall->recall -
-        stage1_self_recall->recall},
-      {"stage1_minus_final", stage1_self_recall->recall -
-        final_self_recall->recall},
+      {"final_minus_stage1", final_self_recall->summary.recall -
+        stage1_self_recall->summary.recall},
+      {"stage1_minus_final", stage1_self_recall->summary.recall -
+        final_self_recall->summary.recall},
+      {"stage1_final_result_overlap_at_k", overlap},
     };
   }
 
@@ -834,10 +889,14 @@ int run_with_service(ComputeService& service, const Args& args) {
          << baseline_recall->recall << " (" << baseline_recall->queries << " queries)\n";
   }
   if (stage1_self_recall.has_value() && final_self_recall.has_value()) {
-    text << "  stage1-only self-hit@" << stage1_self_recall->k << ": "
-         << stage1_self_recall->recall << '\n';
-    text << "  finalized self-hit@" << final_self_recall->k << ": "
-         << final_self_recall->recall << '\n';
+    text << "  stage1-only self-hit@" << stage1_self_recall->summary.k << ": "
+         << stage1_self_recall->summary.recall << '\n';
+    text << "  finalized self-hit@" << final_self_recall->summary.k << ": "
+         << final_self_recall->summary.recall << '\n';
+    text << "  Stage1/final result overlap@"
+         << stage1_self_recall->summary.k << ": "
+         << result_overlap_at_k(*stage1_self_recall, *final_self_recall)
+         << '\n';
   }
   if (post_recall.has_value()) {
     text << "  post recall@" << post_recall->k << ": "

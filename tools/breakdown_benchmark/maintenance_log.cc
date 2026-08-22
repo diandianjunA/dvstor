@@ -1061,6 +1061,9 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     uint64_t exact_prune_ns = 0;
     uint64_t exact_allocate_write_ns = 0;
     uint64_t exact_local_reverse_ns = 0;
+    uint64_t exact_stage1_local_search_ns = 0;
+    uint64_t exact_stage2_global_continuation_ns = 0;
+    uint64_t exact_final_candidate_snapshot_ns = 0;
     if (counter_delta(first.exact_insert_items,
                       latest.exact_insert_items, &exact_items) &&
         counter_delta(first.exact_insert_total_ns,
@@ -1080,7 +1083,16 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
                       &exact_allocate_write_ns) &&
         counter_delta(first.exact_insert_local_reverse_ns,
                       latest.exact_insert_local_reverse_ns,
-                      &exact_local_reverse_ns)) {
+                      &exact_local_reverse_ns) &&
+        counter_delta(first.exact_insert_stage1_local_search_ns,
+                      latest.exact_insert_stage1_local_search_ns,
+                      &exact_stage1_local_search_ns) &&
+        counter_delta(first.exact_insert_stage2_global_continuation_ns,
+                      latest.exact_insert_stage2_global_continuation_ns,
+                      &exact_stage2_global_continuation_ns) &&
+        counter_delta(first.exact_insert_final_candidate_snapshot_ns,
+                      latest.exact_insert_final_candidate_snapshot_ns,
+                      &exact_final_candidate_snapshot_ns)) {
       summary.exact_insert_items += exact_items;
       summary.exact_insert_total_ns += exact_total_ns;
       summary.exact_insert_remote_read_ns += exact_remote_read_ns;
@@ -1089,6 +1101,12 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
       summary.exact_insert_prune_ns += exact_prune_ns;
       summary.exact_insert_allocate_write_ns += exact_allocate_write_ns;
       summary.exact_insert_local_reverse_ns += exact_local_reverse_ns;
+      summary.exact_insert_stage1_local_search_ns +=
+        exact_stage1_local_search_ns;
+      summary.exact_insert_stage2_global_continuation_ns +=
+        exact_stage2_global_continuation_ns;
+      summary.exact_insert_final_candidate_snapshot_ns +=
+        exact_final_candidate_snapshot_ns;
       summary.exact_insert_counter_delta_available = true;
     }
 

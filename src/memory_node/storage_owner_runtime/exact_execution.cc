@@ -14,6 +14,7 @@ bool MemoryNode::execute_storage_owner_batch_items_exact(
     u32 source_client,
     size_t item_count,
     InsertBreakdownCounters& breakdown,
+    ExactInsertPhaseCounters& exact_phases,
     const Configuration& config,
     vec<vec<u64>>* invalidated_neighbors,
     vec<u32>* statuses,
@@ -178,25 +179,34 @@ bool MemoryNode::execute_storage_owner_batch_items_exact(
         vec<BeamEntry> local_beam;
         vec<RemotePtr> remote_frontier;
         const auto search_started = std::chrono::steady_clock::now();
+        const auto stage1_search_started = std::chrono::steady_clock::now();
         (void)partition_local_search_candidates(
           span<const element_t>{decoded}, entries, config, &breakdown,
           vector_bytes, &local_beam, &remote_frontier, false);
+        exact_phases.stage1_local_search_ns +=
+          elapsed_ns_since(stage1_search_started);
         StorageOwnerMaintenanceTask continuation;
         continuation.stage1_beam = std::move(local_beam);
         continuation.stage1_remote_frontier = std::move(remote_frontier);
         NodeSnapshot target;
         target.vector_data.assign(
           vector_bytes, vector_bytes + VamanaNode::vector_bytes());
+        const auto continuation_started = std::chrono::steady_clock::now();
         const vec<RemotePtr> candidates =
           continue_stage2_search_candidates(
             continuation, target, config, false);
+        exact_phases.stage2_global_continuation_ns +=
+          elapsed_ns_since(continuation_started);
         breakdown.storage_owner_search_ns +=
           elapsed_ns_since(search_started);
 
         vec<NodeSnapshot> snapshots;
         vec<SnapshotState> states;
+        const auto snapshot_started = std::chrono::steady_clock::now();
         snapshots = read_node_snapshots_batched(
           candidates, config, "synchronous_exact_prune", &states);
+        exact_phases.final_candidate_snapshot_ns +=
+          elapsed_ns_since(snapshot_started);
         if (std::find(states.begin(), states.end(),
                       SnapshotState::retryable) != states.end()) {
           if (cancellable_shutdown()) return vec<RemotePtr>{};

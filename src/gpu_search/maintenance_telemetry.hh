@@ -26,8 +26,9 @@ inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
 // exposed only the fixed C32 context bound and deterministic B8 packing.
 // Version 13 removes retired speculative score counters. Version 14 adds
 // motivation-study counters for exact-update remote dependencies and the
-// exact Stage2 completion-latency sum.
-inline constexpr u32 kVersion = 14;
+// exact Stage2 completion-latency sum. Version 15 separates the local Stage1
+// search from the global continuation and final candidate materialization.
+inline constexpr u32 kVersion = 15;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -142,6 +143,9 @@ struct alignas(64) Snapshot {
   u64 exact_insert_prune_ns{};
   u64 exact_insert_allocate_write_ns{};
   u64 exact_insert_local_reverse_ns{};
+  u64 exact_insert_stage1_local_search_ns{};
+  u64 exact_insert_stage2_global_continuation_ns{};
+  u64 exact_insert_final_candidate_snapshot_ns{};
 
   // Sum of queued-at to finalized-live latency for the same samples counted
   // by stage2_finalized_live and stage2_delay_histogram.

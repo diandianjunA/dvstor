@@ -894,6 +894,11 @@ private:
                                          vec<service::storage_owner::MutationResult>* results = nullptr,
                                          const std::function<void(size_t)>&
                                            on_terminal = {});
+  struct ExactInsertPhaseCounters {
+    u64 stage1_local_search_ns{};
+    u64 stage2_global_continuation_ns{};
+    u64 final_candidate_snapshot_ns{};
+  };
   bool execute_storage_owner_batch_items_exact(
       const node_t* ids,
       const service::storage_owner::MutationKind* kinds,
@@ -902,6 +907,7 @@ private:
       u32 source_client,
       size_t item_count,
       InsertBreakdownCounters& breakdown,
+      ExactInsertPhaseCounters& exact_phases,
       const Configuration& config,
       vec<vec<u64>>* invalidated_neighbors = nullptr,
       vec<u32>* statuses = nullptr,
@@ -1511,6 +1517,9 @@ private:
   std::atomic<u64> exact_insert_prune_ns_{0};
   std::atomic<u64> exact_insert_allocate_write_ns_{0};
   std::atomic<u64> exact_insert_local_reverse_ns_{0};
+  std::atomic<u64> exact_insert_stage1_local_search_ns_{0};
+  std::atomic<u64> exact_insert_stage2_global_continuation_ns_{0};
+  std::atomic<u64> exact_insert_final_candidate_snapshot_ns_{0};
   std::mutex exact_insert_telemetry_mutex_;
   std::unique_ptr<bounded::SlidingCompletionRing>
     storage_owner_maintenance_completion_ring_;

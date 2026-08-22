@@ -24,7 +24,9 @@ wait_storage() {
 }
 
 run_case() {
-  local case_name="$1" mode="$2" report_dir="$RUN_ROOT/$case_name"
+  local case_name="$1"
+  local mode="$2"
+  local report_dir="$RUN_ROOT/$case_name"
   wait_storage "$case_name"
   mkdir -p "$report_dir"
   echo "[$(date --iso-8601=seconds)] compute case=$case_name mode=$mode"
@@ -53,4 +55,3 @@ echo
 echo "基线和方案一已完成。结果：$RUN_ROOT"
 echo "接着运行精度实验："
 echo "  RUN_ROOT=$RUN_ROOT ./motivation/program1/run_quality.sh"
-

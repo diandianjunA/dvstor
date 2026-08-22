@@ -197,6 +197,9 @@ struct MaintenanceLogSummary {
   uint64_t exact_insert_prune_ns{};
   uint64_t exact_insert_allocate_write_ns{};
   uint64_t exact_insert_local_reverse_ns{};
+  uint64_t exact_insert_stage1_local_search_ns{};
+  uint64_t exact_insert_stage2_global_continuation_ns{};
+  uint64_t exact_insert_final_candidate_snapshot_ns{};
   double p99_stage2_delay_upper_ms{};
   bool p99_stage2_delay_over_30s{};
   uint64_t p99_stage2_delay_samples{};

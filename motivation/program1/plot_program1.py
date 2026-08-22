@@ -43,10 +43,45 @@ def panel(index, title, labels, values, colors, unit, maximum=None):
     panels.append("\n".join(pieces))
 
 
-remote_pct = 100 * d["rdma_remote_dependency_ratio"]
-panel(0, "(a) Coupled critical path",
-      ["Remote RDMA", "Other work"], [remote_pct, 100 - remote_pct],
-      ["#d95f02", "#bdbdbd"], "%", 100)
+def stack_panel(index, title, labels, values, colors):
+    x0 = 20 + index * 325
+    total = max(sum(values), 1)
+    pieces = [
+        f'<g transform="translate({x0},25)">',
+        f'<text class="title" x="0" y="18">{esc(title)}</text>',
+    ]
+    left = 0.0
+    for label, value, color in zip(labels, values, colors):
+        segment = 285 * value / total
+        pieces.append(
+            f'<rect x="{left:.2f}" y="52" width="{segment:.2f}" '
+            f'height="34" fill="{color}"/>')
+        left += segment
+    for row, (label, value, color) in enumerate(zip(labels, values, colors)):
+        y = 116 + row * 31
+        pieces += [
+            f'<rect x="0" y="{y-13}" width="13" height="13" fill="{color}"/>',
+            f'<text class="label" x="20" y="{y}">{esc(label)}</text>',
+            f'<text class="value" x="230" y="{y}">{100*value/total:.1f}%</text>',
+        ]
+    pieces.append('</g>')
+    panels.append("\n".join(pieces))
+
+
+stack = d.get("coupled_stack", {})
+stack_panel(
+    0, "(a) Coupled critical path",
+    ["Stage1 local search", "Global continuation", "Remote reverse",
+     "Final prune", "Write + metadata"],
+    [stack.get("stage1_local_search_ns", 0),
+     stack.get("global_continuation_ns", 0) +
+       stack.get("final_candidate_snapshot_ns", 0),
+     stack.get("remote_reverse_ns", 0),
+     stack.get("final_prune_ns", 0),
+     stack.get("allocate_write_ns", 0) +
+       stack.get("local_reverse_ns", 0) +
+       stack.get("metadata_and_other_ns", 0)],
+    ["#4daf4a", "#377eb8", "#e41a1c", "#984ea3", "#999999"])
 
 qps_max = 1.12 * max(d["baseline_insert_qps"], d["solution_insert_qps"], 1)
 panel(1, f"(b) Update throughput ({d['insert_speedup']:.2f}x)",

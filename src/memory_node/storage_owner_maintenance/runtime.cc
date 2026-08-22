@@ -53,6 +53,11 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     exact_insert_prune_ns_.store(0, std::memory_order_relaxed);
     exact_insert_allocate_write_ns_.store(0, std::memory_order_relaxed);
     exact_insert_local_reverse_ns_.store(0, std::memory_order_relaxed);
+    exact_insert_stage1_local_search_ns_.store(0, std::memory_order_relaxed);
+    exact_insert_stage2_global_continuation_ns_.store(
+      0, std::memory_order_relaxed);
+    exact_insert_final_candidate_snapshot_ns_.store(
+      0, std::memory_order_relaxed);
     gpu_search::maintenance_telemetry::publish(
       reinterpret_cast<byte_t*>(control),
       gpu_search::maintenance_telemetry::Snapshot{

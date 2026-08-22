@@ -1,0 +1,4 @@
+sift101m long insert recall
+  inserted: 1000/1000 in 0.246703s (4053.458749 inserts/s)
+  stage1-only self-hit@10: 0.800000
+  finalized self-hit@10: 1.000000

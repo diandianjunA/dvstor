@@ -1,0 +1,62 @@
+{
+  "finalized_self_recall": {
+    "hit_rate": 1.0,
+    "k": 10,
+    "queries": 100
+  },
+  "input": {
+    "insert_dim": 128,
+    "insert_dtype": "uint8",
+    "insert_rows": 10000000,
+    "query_dim": 0,
+    "query_dtype": "none",
+    "query_rows": 0
+  },
+  "insert": {
+    "attempted": 1000,
+    "duration_seconds": 0.246702893,
+    "failed": 0,
+    "inserted": 1000,
+    "inserts_per_second": 4053.4587488603142
+  },
+  "meta": {
+    "baseline_groundtruth_file": "",
+    "dim": 128,
+    "fine_grained_breakdown_enabled": true,
+    "insert_batch_size": 16,
+    "insert_count_effective": 1000,
+    "insert_count_requested": 1000,
+    "insert_file": "/data/xjs/datasets/sift1b/sift110m_to_120m_insert.u8bin",
+    "insert_row_offset": 0,
+    "insert_start_id": 101000000,
+    "insert_threads": 16,
+    "max_vectors_config": 100000000,
+    "navigation_quantizer": "opq_pq",
+    "post_groundtruth_file": "",
+    "query_file": "",
+    "recall_k": 10,
+    "recall_queries": 10000,
+    "reset_breakdown_every": 50000,
+    "search": "gpu_persistent_opq_pq",
+    "self_recall_k": 10,
+    "self_recall_queries": 100,
+    "service_config": "/home/xjs/experiment/dvstor/motivation/program1/results/program1_20260822_215459/quality/service.ini",
+    "settle_seconds": 30,
+    "storage_owner_maintenance_workers": 8,
+    "storage_owner_update_protocol": "centroid_home_two_stage"
+  },
+  "self_recall_delta": {
+    "final_minus_stage1": 0.19999999999999996,
+    "stage1_minus_final": -0.19999999999999996
+  },
+  "stage1_only_self_recall": {
+    "hit_rate": 0.8,
+    "k": 10,
+    "queries": 100
+  },
+  "stage1_only_window": {
+    "configured_stage2_delay_seconds": 15.0,
+    "insert_plus_recall_seconds": 0.495551004,
+    "valid": true
+  }
+}

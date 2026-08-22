@@ -65,6 +65,7 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
   }
 
   InsertBreakdownCounters breakdown{};
+  ExactInsertPhaseCounters exact_phases{};
   const auto process_started = std::chrono::steady_clock::now();
   breakdown.storage_owner_queue_wait_ns = static_cast<u64>(
     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -110,6 +111,7 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
         request->source_client,
         request->item_count,
         breakdown,
+        exact_phases,
         config,
         &scratch.invalidated_neighbors,
         &scratch.statuses,
@@ -131,13 +133,16 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
         emit_completion);
 
   if (synchronous_exact) {
+    const u64 exact_total_ns = static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - task.received_at).count());
     const u64 remote_read_ns =
       breakdown.storage_owner_search_neighbor_read_ns +
       breakdown.storage_owner_search_snapshot_read_ns +
       breakdown.storage_owner_prune_snapshot_read_ns;
     exact_insert_items_.fetch_add(request->item_count,
                                   std::memory_order_relaxed);
-    exact_insert_total_ns_.fetch_add(breakdown.total(),
+    exact_insert_total_ns_.fetch_add(exact_total_ns,
                                      std::memory_order_relaxed);
     exact_insert_remote_read_ns_.fetch_add(remote_read_ns,
                                            std::memory_order_relaxed);
@@ -154,6 +159,14 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
       std::memory_order_relaxed);
     exact_insert_local_reverse_ns_.fetch_add(
       breakdown.storage_owner_local_reverse_ns,
+      std::memory_order_relaxed);
+    exact_insert_stage1_local_search_ns_.fetch_add(
+      exact_phases.stage1_local_search_ns, std::memory_order_relaxed);
+    exact_insert_stage2_global_continuation_ns_.fetch_add(
+      exact_phases.stage2_global_continuation_ns,
+      std::memory_order_relaxed);
+    exact_insert_final_candidate_snapshot_ns_.fetch_add(
+      exact_phases.final_candidate_snapshot_ns,
       std::memory_order_relaxed);
 
     // The completion callback above has already emitted client-visible ACKs.
@@ -184,6 +197,15 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
           exact_insert_allocate_write_ns_.load(std::memory_order_relaxed),
         .exact_insert_local_reverse_ns =
           exact_insert_local_reverse_ns_.load(std::memory_order_relaxed),
+        .exact_insert_stage1_local_search_ns =
+          exact_insert_stage1_local_search_ns_.load(
+            std::memory_order_relaxed),
+        .exact_insert_stage2_global_continuation_ns =
+          exact_insert_stage2_global_continuation_ns_.load(
+            std::memory_order_relaxed),
+        .exact_insert_final_candidate_snapshot_ns =
+          exact_insert_final_candidate_snapshot_ns_.load(
+            std::memory_order_relaxed),
       });
   }
 

@@ -1128,8 +1128,58 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   bool in_band_maintenance_telemetry = false;
   if (!maintenance_snapshot_begin.empty()) {
     try {
-      const auto maintenance_snapshot_end =
+      auto maintenance_snapshot_end =
         service.storage_maintenance_telemetry();
+      // The durable watermark can advance just before the storage node's
+      // periodic control-page telemetry publication. For short fixed-work
+      // runs this used to produce a fully drained run with zero Stage2 and
+      // locality deltas. Poll only the diagnostic snapshot (not the measured
+      // workload/drain interval) until it accounts for the measured writes or
+      // one publication period has elapsed.
+      const uint64_t expected_stage2_completions =
+        static_cast<uint64_t>(measured_insert_operations) +
+        static_cast<uint64_t>(measure_mixed_stats.completed_writes);
+      const auto observed_stage2_completions = [&]() {
+        uint64_t completed = 0;
+        const size_t shards = std::min(
+          maintenance_snapshot_begin.size(),
+          maintenance_snapshot_end.size());
+        for (size_t shard = 0; shard < shards; ++shard) {
+          if (!maintenance_snapshot_begin[shard].has_value() ||
+              !maintenance_snapshot_end[shard].has_value()) {
+            continue;
+          }
+          const auto& first = *maintenance_snapshot_begin[shard];
+          const auto& latest = *maintenance_snapshot_end[shard];
+          const uint64_t first_done =
+            first.stage2_finalized_live + first.stale;
+          const uint64_t latest_done =
+            latest.stage2_finalized_live + latest.stale;
+          if (latest_done >= first_done) completed += latest_done - first_done;
+        }
+        return completed;
+      };
+      if (!service.config().synchronous_exact_updates_enabled() &&
+          expected_stage2_completions != 0) {
+        const auto telemetry_deadline = std::chrono::steady_clock::now() +
+          std::chrono::seconds(7);
+        while (observed_stage2_completions() <
+                 expected_stage2_completions &&
+               std::chrono::steady_clock::now() < telemetry_deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          maintenance_snapshot_end =
+            service.storage_maintenance_telemetry();
+        }
+        std::cerr << "[breakdown] Stage2 telemetry publication observed="
+                  << observed_stage2_completions()
+                  << " expected=" << expected_stage2_completions
+                  << std::endl;
+        if (observed_stage2_completions() < expected_stage2_completions) {
+          throw std::runtime_error(
+            "Stage2 control-page telemetry did not publish all measured "
+            "completions after maintenance drain");
+        }
+      }
       MaintenanceLogSummary in_band_summary =
         summarize_maintenance_snapshot_window(
           maintenance_snapshot_begin, maintenance_snapshot_end);
@@ -1563,6 +1613,19 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     maintenance_summary.exact_insert_total_ns >= exact_remote_dependency_ns
       ? maintenance_summary.exact_insert_total_ns - exact_remote_dependency_ns
       : 0;
+  const uint64_t exact_deferred_stage2_ns =
+    maintenance_summary.exact_insert_stage2_global_continuation_ns +
+    maintenance_summary.exact_insert_final_candidate_snapshot_ns +
+    maintenance_summary.exact_insert_remote_reverse_ns;
+  const uint64_t exact_known_stack_ns =
+    maintenance_summary.exact_insert_stage1_local_search_ns +
+    exact_deferred_stage2_ns + maintenance_summary.exact_insert_prune_ns +
+    maintenance_summary.exact_insert_allocate_write_ns +
+    maintenance_summary.exact_insert_local_reverse_ns;
+  const uint64_t exact_metadata_other_ns =
+    maintenance_summary.exact_insert_total_ns >= exact_known_stack_ns
+      ? maintenance_summary.exact_insert_total_ns - exact_known_stack_ns
+      : 0;
   root["coupled_insert_critical_path"] = {
     {"counter_delta_available",
      maintenance_summary.exact_insert_counter_delta_available},
@@ -1591,6 +1654,33 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.exact_insert_allocate_write_ns},
     {"local_reverse_ns",
      maintenance_summary.exact_insert_local_reverse_ns},
+    {"stage1_local_search_ns",
+     maintenance_summary.exact_insert_stage1_local_search_ns},
+    {"stage2_global_continuation_ns",
+     maintenance_summary.exact_insert_stage2_global_continuation_ns},
+    {"final_candidate_snapshot_ns",
+     maintenance_summary.exact_insert_final_candidate_snapshot_ns},
+    {"deferred_stage2_ns", exact_deferred_stage2_ns},
+    {"deferred_stage2_ratio",
+     maintenance_summary.exact_insert_total_ns == 0 ? 0.0 :
+       static_cast<double>(exact_deferred_stage2_ns) /
+       static_cast<double>(maintenance_summary.exact_insert_total_ns)},
+    {"stack", {
+      {"stage1_local_search_ns",
+       maintenance_summary.exact_insert_stage1_local_search_ns},
+      {"global_continuation_ns",
+       maintenance_summary.exact_insert_stage2_global_continuation_ns},
+      {"final_candidate_snapshot_ns",
+       maintenance_summary.exact_insert_final_candidate_snapshot_ns},
+      {"remote_reverse_ns",
+       maintenance_summary.exact_insert_remote_reverse_ns},
+      {"final_prune_ns", maintenance_summary.exact_insert_prune_ns},
+      {"allocate_write_ns",
+       maintenance_summary.exact_insert_allocate_write_ns},
+      {"local_reverse_ns",
+       maintenance_summary.exact_insert_local_reverse_ns},
+      {"metadata_and_other_ns", exact_metadata_other_ns},
+    }},
   };
   root["stage2"] = {
     {"source", in_band_maintenance_telemetry

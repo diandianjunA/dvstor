@@ -49,12 +49,17 @@ def main():
     summary = {
         "rdma_remote_dependency_ratio": float(critical.get("remote_dependency_ratio", 0)),
         "rdma_avg_remote_dependency_us": float(critical.get("avg_remote_dependency_us", 0)),
+        "deferred_stage2_ratio": float(critical.get("deferred_stage2_ratio", 0)),
+        "coupled_stack": critical.get("stack", {}),
         "baseline_insert_qps": base_qps,
         "solution_insert_qps": solution_qps,
         "insert_speedup": solution_qps / base_qps if base_qps else 0,
         "stage1_only_self_hit_rate": stage1_hit,
         "finalized_self_hit_rate": final_hit,
         "temporary_self_hit_drop": final_hit - stage1_hit,
+        "stage1_final_result_overlap_at_k": float(
+            get(quality, "self_recall_delta", "stage1_final_result_overlap_at_k")
+        ),
         "stage1_window_valid": bool(get(quality, "stage1_only_window", "valid", default=False)),
         "avg_stage2_delay_ms": float(stage2.get("avg_stage2_delay_ms", 0)),
         "p99_stage2_delay_upper_ms": float(stage2.get("p99_stage2_delay_upper_ms", 0)),
@@ -62,6 +67,11 @@ def main():
         "cross_edge_ratio_final_home": cross_after / final_edges if final_edges else 0,
         "cross_edge_reduction_ratio": float(stage2.get("cross_edge_reduction_ratio", 0)),
         "stage2_failures": int(stage2.get("failures", 0)),
+        "stage2_telemetry_valid": bool(
+            stage2.get("stage2_finalized_live_delta", 0)
+            and stage2.get("stage2_final_edges", 0)
+            and stage2.get("p99_stage2_delay_samples", 0)
+        ),
     }
     (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     with (root / "summary.csv").open("w", encoding="utf-8", newline="") as stream:
@@ -74,4 +84,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
