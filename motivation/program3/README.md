@@ -1,5 +1,42 @@
 # Program 3：精确前沿驱动的 GPU–RDMA 推进解耦
 
+## 推荐：按论文故事运行精简实验
+
+新的 story runner 先扫描扩展批量 `C=1/4/8/16`，采集每轮候选槽位、完整
+Merge pipeline 时间、exact-prefix 时间及其占比；随后只运行一次 C=16 的
+Late/Early 性能对照。总共 6 个 case：
+
+```bash
+cd /home/xjs/experiment/dvstor
+./motivation/program3/run_story.sh
+```
+
+计算节点会逐个提示存储节点命令，例如：
+
+```bash
+GPU_COMMIT_WIDTH=4 ./motivation/program3/start_storage_case.sh early
+```
+
+默认动机点测量 10 秒，最终性能点测量 20 秒。若只想快速检查：
+
+```bash
+MOTIVATION_SECONDS=3 PERFORMANCE_SECONDS=5 RECALL_QUERIES=100 \
+  ./motivation/program3/run_story.sh
+```
+
+可分阶段运行或在失败后复用结果目录：
+
+```bash
+RUN_ROOT=/path/to/program3_story_TIMESTAMP ./motivation/program3/run_story.sh motivation
+RUN_ROOT=/path/to/program3_story_TIMESTAMP ./motivation/program3/run_story.sh performance
+RUN_ROOT=/path/to/program3_story_TIMESTAMP ./motivation/program3/run_story.sh summarize
+```
+
+输出的主报告是 `方案三_动机与性能实验报告.md`，主图是
+`program3_story_motivation.svg` 和 `program3_story_effectiveness.svg`。
+
+下面的 `run_program3.sh` 保留为多次稳定性验证脚本，不再是论文故事的首选入口。
+
 该实验只比较一个变量：相同的 mandatory graph reads 是在完整 Beam 发布后发出，
 还是在 exact frontier certificate 生成后提前发出。
 

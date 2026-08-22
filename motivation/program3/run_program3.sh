@@ -58,12 +58,13 @@ workload, mode, path, min_write = sys.argv[1:]
 with open(path, encoding="utf-8") as stream:
     report = json.load(stream)
 meta = report.get("meta", {})
+resolved = meta.get("system_variant", {}).get("resolved_modes", {})
 gpu = report.get("gpu_persistent", {})
 throughput = report.get("throughput", {})
 expected_early = mode == "early"
 if meta.get("workload") != workload:
     raise SystemExit(f"{mode}: expected workload={workload}")
-if meta.get("gpu_rdma_search_progression_mode") != "manual":
+if resolved.get("gpu_rdma_search_progression_mode") != "manual":
     raise SystemExit(f"{mode}: experiment did not use persistent manual mode")
 if meta.get("gpu_query_beam_merge_policy") != "stable-run":
     raise SystemExit(f"{mode}: experiment did not use Stable-Run")
@@ -101,6 +102,18 @@ run_case() {
     "$RUN_ROOT/manifest.tsv")"
   if [[ -n "$existing" && -f "$existing" ]]; then
     echo "复用已完成 case: workload=$workload mode=$mode repeat=$repeat"
+    return
+  fi
+  local recovered
+  recovered=""
+  if [[ -d "$report_dir" ]]; then
+    recovered="$(find "$report_dir" -type f -name 'sift100m_*.json' \
+      -printf '%T@\t%p\n' | sort -nr | awk -F '\t' 'NR == 1 { print $2 }')"
+  fi
+  if [[ -n "$recovered" && -f "$recovered" ]]; then
+    validate_case "$workload" "$mode" "$recovered"
+    record_case "$workload" "$mode" "$repeat" "$recovered"
+    echo "恢复校验失败前已经完成的 case: workload=$workload mode=$mode repeat=$repeat"
     return
   fi
 

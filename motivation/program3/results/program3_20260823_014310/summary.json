@@ -1,0 +1,184 @@
+{
+  "experiment": "persistent_stable_run_exact_core_issue_timing_ab",
+  "contracts": [
+    [
+      "mixed",
+      16,
+      16,
+      5,
+      20,
+      500.0
+    ],
+    [
+      "query",
+      16,
+      16,
+      5,
+      20,
+      0.0
+    ]
+  ],
+  "cases": {
+    "mixed": {
+      "late": {
+        "qps": 62569.15,
+        "write_qps": 500.0,
+        "write_attainment": 1.0,
+        "p50_ms": 4.06942,
+        "p99_ms": 5.297448,
+        "recall": 0.9387999999999945,
+        "pre_performance_recall": 0.9389999999999945,
+        "graph_reads_per_query": 191.48480601062985,
+        "graph_bytes_per_query": 80597.96307437436,
+        "rdma_wait_us_per_query": 1067.8734193344485,
+        "beam_merge_us_per_query": 972.2659178117638,
+        "gpu_query_us": 4011.2960092681456,
+        "rdma_completion_latency_us": 81.75378898565339,
+        "certificates_per_query": 0.0,
+        "issued_certificates_per_query": 0.0,
+        "certificate_coverage": 0.0,
+        "certificate_reject_ratio": 0.0,
+        "critical_rob_hit_ratio": 0.0,
+        "speculative_graph_reads": 0.0,
+        "prefix_to_publish_us_per_certificate": 0.0,
+        "issue_to_publish_us_per_certificate": 0.0,
+        "samples": 3,
+        "execution_mode": "persistent_late_issue"
+      },
+      "early": {
+        "qps": 70865.75,
+        "write_qps": 500.0,
+        "write_attainment": 1.0,
+        "p50_ms": 3.57692,
+        "p99_ms": 4.903256,
+        "recall": 0.9387999999999945,
+        "pre_performance_recall": 0.9400999999999946,
+        "graph_reads_per_query": 191.53917548466663,
+        "graph_bytes_per_query": 80168.84147278481,
+        "rdma_wait_us_per_query": 909.2895965445764,
+        "beam_merge_us_per_query": 480.35362165996975,
+        "gpu_query_us": 3513.2607216999704,
+        "rdma_completion_latency_us": 84.51479077414817,
+        "certificates_per_query": 14.379747828927552,
+        "issued_certificates_per_query": 13.267960428005187,
+        "certificate_coverage": 0.9226855534303962,
+        "certificate_reject_ratio": 0.0,
+        "critical_rob_hit_ratio": 0.9672306823082513,
+        "speculative_graph_reads": 0.0,
+        "prefix_to_publish_us_per_certificate": 29.92395857034891,
+        "issue_to_publish_us_per_certificate": 13.98234304918445,
+        "samples": 3,
+        "execution_mode": "exact_core_early_issue"
+      }
+    },
+    "query": {
+      "late": {
+        "qps": 62027.61675380896,
+        "write_qps": 0.0,
+        "write_attainment": 1.0,
+        "p50_ms": 4.098334,
+        "p99_ms": 5.24289,
+        "recall": 0.9400999999999946,
+        "pre_performance_recall": 0.9389999999999945,
+        "graph_reads_per_query": 195.1366912095781,
+        "graph_bytes_per_query": 83245.83428420394,
+        "rdma_wait_us_per_query": 1065.7124160538738,
+        "beam_merge_us_per_query": 998.40991125542,
+        "gpu_query_us": 4047.332739184428,
+        "rdma_completion_latency_us": 80.5666159987393,
+        "certificates_per_query": 0.0,
+        "issued_certificates_per_query": 0.0,
+        "certificate_coverage": 0.0,
+        "certificate_reject_ratio": 0.0,
+        "critical_rob_hit_ratio": 0.0,
+        "speculative_graph_reads": 0.0,
+        "prefix_to_publish_us_per_certificate": 0.0,
+        "issue_to_publish_us_per_certificate": 0.0,
+        "samples": 3,
+        "execution_mode": "persistent_late_issue"
+      },
+      "early": {
+        "qps": 70578.09168116697,
+        "write_qps": 0.0,
+        "write_attainment": 1.0,
+        "p50_ms": 3.589525,
+        "p99_ms": 4.85246,
+        "recall": 0.9400999999999946,
+        "pre_performance_recall": 0.9400999999999946,
+        "graph_reads_per_query": 195.19190773142392,
+        "graph_bytes_per_query": 82471.24419089708,
+        "rdma_wait_us_per_query": 899.1761623942521,
+        "beam_merge_us_per_query": 494.737467954234,
+        "gpu_query_us": 3528.090678429706,
+        "rdma_completion_latency_us": 83.28924947112871,
+        "certificates_per_query": 14.616302812038542,
+        "issued_certificates_per_query": 13.500742582146158,
+        "certificate_coverage": 0.9236769897122297,
+        "certificate_reject_ratio": 0.0,
+        "critical_rob_hit_ratio": 0.9676998323196463,
+        "speculative_graph_reads": 0.0,
+        "prefix_to_publish_us_per_certificate": 29.88939542338733,
+        "issue_to_publish_us_per_certificate": 14.084790791996811,
+        "samples": 3,
+        "execution_mode": "exact_core_early_issue"
+      }
+    }
+  },
+  "paired": {
+    "mixed": {
+      "repeats": [
+        1,
+        2,
+        3
+      ],
+      "qps_geomean_ratio": 1.1325469079729578,
+      "p99_geomean_ratio": 0.9316575616362023,
+      "p50_geomean_ratio": 0.8791242751719854,
+      "recall_delta_median": 0.0,
+      "graph_reads_per_query_geomean_ratio": 1.0002846031766062,
+      "qps_ratios": [
+        1.1320316930375955,
+        1.1354433614544022,
+        1.1301719777238461
+      ],
+      "p99_ratios": [
+        0.9242909038465313,
+        0.9227610474776516,
+        0.9481368087033972
+      ],
+      "p50_ratios": [
+        0.8801047586756353,
+        0.8779178681778952,
+        0.8793516029311302
+      ]
+    },
+    "query": {
+      "repeats": [
+        1,
+        2,
+        3
+      ],
+      "qps_geomean_ratio": 1.1385145053707413,
+      "p99_geomean_ratio": 0.9246623080200842,
+      "p50_geomean_ratio": 0.8752285710014207,
+      "recall_delta_median": 0.0,
+      "graph_reads_per_query_geomean_ratio": 1.000284498592614,
+      "qps_ratios": [
+        1.138672684713969,
+        1.1390399152501933,
+        1.1378312534336608
+      ],
+      "p99_ratios": [
+        0.9237732751378342,
+        0.9237360827621093,
+        0.9264802427668709
+      ],
+      "p50_ratios": [
+        0.8756332515332637,
+        0.8742035794953438,
+        0.8758497965270765
+      ]
+    }
+  },
+  "identity_tests_passed": true
+}

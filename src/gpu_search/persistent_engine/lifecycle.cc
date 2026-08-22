@@ -115,10 +115,10 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
   bind_cuda_device("cudaSetDevice(GPU navigation kernel start)");
   const bool decoupled_search_progression =
     config.decoupled_gpu_rdma_search_progression_enabled();
-  if (decoupled_search_progression !=
-      (kernel_params.issue_width > kernel_params.commit_width)) {
+  if (decoupled_search_progression &&
+      kernel_params.issue_width < kernel_params.commit_width) {
     throw std::logic_error(
-      "GPU-RDMA search progression mode changed before kernel launch");
+      "exact-frontier progression requires issue width >= commit width");
   }
   if (decoupled_search_progression) {
     // The ASFE specialization has an out-of-line Stable-Run/CUB call chain.

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1050" height="430" viewBox="0 0 1050 430">
+<style>text { font-family: Arial, "Noto Sans", sans-serif; fill:#222 } .title {font-size:19px;font-weight:700} .label {font-size:14px} .small {font-size:12px;fill:#555} .value {font-size:14px;font-weight:700} .axis {stroke:#555} .grid {stroke:#ddd}</style>
+<rect width="100%" height="100%" fill="white"/>
+<text class="title" x="25" y="38">Software barrier leaves a safe RDMA-overlap window (query)</text>
+<text class="small" x="25" y="65">Exact next-C parents are known at Prefix ready; traditional execution waits for full Beam publication.</text>
+<text class="label" x="25" y="128">Prefix→Beam publish</text><rect x="245" y="105" width="212.9" height="34" fill="#7570b3"/><text class="value" x="467.9" y="128">29.889 μs</text><text class="label" x="25" y="210">RDMA issue→Beam publish</text><rect x="245" y="187" width="100.3" height="34" fill="#1b9e77"/><text class="value" x="355.3" y="210">14.085 μs</text><text class="label" x="25" y="292">RDMA completion latency</text><rect x="245" y="269" width="593.2" height="34" fill="#d95f02"/><text class="value" x="848.2" y="292">83.289 μs</text>
+<text class="small" x="25" y="390">Measured per exact certificate; issue width = commit width, so the window contains mandatory reads only.</text>
+</svg>
