@@ -24,8 +24,10 @@ inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
 // the context-slot scans they induce. Version 10/11 carried superseded active-
 // task, adaptive C32/C40/C48, and 1 ms fallback experiments. Version 12
 // exposed only the fixed C32 context bound and deterministic B8 packing.
-// Version 13 removes retired speculative score counters.
-inline constexpr u32 kVersion = 13;
+// Version 13 removes retired speculative score counters. Version 14 adds
+// motivation-study counters for exact-update remote dependencies and the
+// exact Stage2 completion-latency sum.
+inline constexpr u32 kVersion = 14;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -129,6 +131,21 @@ struct alignas(64) Snapshot {
   u64 maintenance_context_slots_scanned{};
   u64 active_stage2_contexts{};
   u64 active_stage2_context_limit{};
+
+  // Exact-update baseline counters. They are cumulative and published after
+  // each synchronous batch, outside the client-visible completion path.
+  u64 exact_insert_items{};
+  u64 exact_insert_total_ns{};
+  u64 exact_insert_remote_read_ns{};
+  u64 exact_insert_remote_reverse_ns{};
+  u64 exact_insert_search_ns{};
+  u64 exact_insert_prune_ns{};
+  u64 exact_insert_allocate_write_ns{};
+  u64 exact_insert_local_reverse_ns{};
+
+  // Sum of queued-at to finalized-live latency for the same samples counted
+  // by stage2_finalized_live and stage2_delay_histogram.
+  u64 stage2_finalize_latency_ns{};
 };
 
 static_assert(kSnapshotOffset == 192);

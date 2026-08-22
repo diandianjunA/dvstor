@@ -1501,6 +1501,17 @@ private:
   std::atomic<u64> storage_owner_maintenance_finalize_latency_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_max_latency_ns_{0};
   std::array<std::atomic<u64>, 18> storage_owner_maintenance_finalize_latency_buckets_{};
+  // Synchronous-exact motivation telemetry. The atomics aggregate concurrent
+  // foreground workers; the mutex serializes control-page publication only.
+  std::atomic<u64> exact_insert_items_{0};
+  std::atomic<u64> exact_insert_total_ns_{0};
+  std::atomic<u64> exact_insert_remote_read_ns_{0};
+  std::atomic<u64> exact_insert_remote_reverse_ns_{0};
+  std::atomic<u64> exact_insert_search_ns_{0};
+  std::atomic<u64> exact_insert_prune_ns_{0};
+  std::atomic<u64> exact_insert_allocate_write_ns_{0};
+  std::atomic<u64> exact_insert_local_reverse_ns_{0};
+  std::mutex exact_insert_telemetry_mutex_;
   std::unique_ptr<bounded::SlidingCompletionRing>
     storage_owner_maintenance_completion_ring_;
   // Maximum accepted-but-not-yet-complete Stage2 descriptors. This is the

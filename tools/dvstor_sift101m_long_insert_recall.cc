@@ -50,6 +50,8 @@ struct Args {
   size_t recall_queries{10000};
   u32 recall_k{10};
   size_t settle_seconds{300};
+  size_t self_recall_queries{100};
+  u32 self_recall_k{10};
 
   std::filesystem::path report_json_path;
   std::filesystem::path report_text_path;
@@ -352,7 +354,7 @@ double recall_at_k(const std::vector<u32>& results, const u32* truth, u32 k) {
 void usage(const char* argv0) {
   std::cerr
       << "Usage: " << argv0 << " --service-config <ini> --insert-file <path> "
-      << "--query-file <path> --groundtruth-file <path> --report-json <path> [options]\n"
+      << "--report-json <path> [options]\n"
       << "  --insert-start-id <id>          First inserted ID, default 100000000\n"
       << "  --insert-count <n>              Number of rows to insert, default 1000000; 0 means all rows\n"
       << "  --insert-row-offset <n>         First row in insert file, default 0\n"
@@ -362,6 +364,8 @@ void usage(const char* argv0) {
       << "  --recall-queries <n>            Queries for recall, default 10000; 0 means all\n"
       << "  --recall-k <k>                  Recall K, default 10\n"
       << "  --settle-seconds <n>            Sleep after insertion before post recall, default 300\n"
+      << "  --self-recall-queries <n>       Inserted vectors sampled for self-hit, default 100; 0 disables\n"
+      << "  --self-recall-k <k>             Search K for inserted-vector self-hit, default 10\n"
       << "  --reset-breakdown-every <n>     Clear samples every n attempted inserts, default 50000; 0 disables\n"
       << "  --report-text <path>            Optional text summary\n";
 }
@@ -403,6 +407,12 @@ Args parse_args(int argc, char** argv) {
       args.recall_k = static_cast<u32>(std::stoul(require_value("--recall-k")));
     } else if (flag == "--settle-seconds") {
       args.settle_seconds = std::stoull(require_value("--settle-seconds"));
+    } else if (flag == "--self-recall-queries") {
+      args.self_recall_queries =
+        std::stoull(require_value("--self-recall-queries"));
+    } else if (flag == "--self-recall-k") {
+      args.self_recall_k = static_cast<u32>(
+        std::stoul(require_value("--self-recall-k")));
     } else if (flag == "--reset-breakdown-every") {
       args.reset_breakdown_every = std::stoull(require_value("--reset-breakdown-every"));
     } else if (flag == "--report-json") {
@@ -419,12 +429,15 @@ Args parse_args(int argc, char** argv) {
 
   if (args.service_config_path.empty()) fail("--service-config is required");
   if (args.insert_file.empty()) fail("--insert-file is required");
-  if (args.query_file.empty()) fail("--query-file is required");
-  if (args.groundtruth_file.empty()) fail("--groundtruth-file is required");
+  if ((!args.groundtruth_file.empty() ||
+       !args.baseline_groundtruth_file.empty()) && args.query_file.empty()) {
+    fail("--query-file is required when a groundtruth file is used");
+  }
   if (args.report_json_path.empty()) fail("--report-json is required");
   if (args.insert_threads == 0) fail("--insert-threads must be > 0");
   if (args.insert_batch_size == 0) fail("--insert-batch-size must be > 0");
   if (args.recall_k == 0) fail("--recall-k must be > 0");
+  if (args.self_recall_k == 0) fail("--self-recall-k must be > 0");
   if (args.insert_start_id > std::numeric_limits<node_t>::max()) {
     fail("--insert-start-id exceeds node_t range");
   }
@@ -474,6 +487,41 @@ RecallResult run_recall(ComputeService& service,
   result.recall = recall_queries == 0 ? 0.0 : total_recall / static_cast<double>(recall_queries);
   std::cerr << "[sift101m-long-insert][recall] " << label << " recall@" << requested_k
             << "=" << result.recall << " queries=" << result.queries << std::endl;
+  return result;
+}
+
+RecallResult run_inserted_self_recall(
+    ComputeService& service, const std::string& label,
+    const VectorRows& insert_rows, size_t row_offset,
+    uint64_t insert_start_id, size_t inserted_count,
+    size_t requested_queries, u32 requested_k) {
+  const size_t query_count = std::min(requested_queries, inserted_count);
+  std::atomic<size_t> completed{0};
+  ProgressReporter reporter(label, completed, query_count, 0);
+  size_t hits = 0;
+  for (size_t sample = 0; sample < query_count; ++sample) {
+    const size_t logical_row = query_count == inserted_count
+      ? sample
+      : sample * inserted_count / query_count;
+    const node_t expected = static_cast<node_t>(insert_start_id + logical_row);
+    const auto results = service.search_raw(
+      insert_rows.dtype, insert_rows.row_payload(row_offset + logical_row),
+      insert_rows.dim, requested_k);
+    if (std::find(results.begin(), results.end(), expected) != results.end()) {
+      ++hits;
+    }
+    completed.fetch_add(1, std::memory_order_relaxed);
+  }
+  reporter.finish();
+  const RecallResult result{
+    .recall = query_count == 0 ? 0.0 :
+      static_cast<double>(hits) / static_cast<double>(query_count),
+    .queries = query_count,
+    .k = requested_k,
+  };
+  std::cerr << "[sift101m-long-insert][self-hit] " << label
+            << " hit@" << requested_k << "=" << result.recall
+            << " queries=" << result.queries << std::endl;
   return result;
 }
 
@@ -618,11 +666,15 @@ int run_with_service(ComputeService& service, const Args& args) {
             << " dtype=" << vector_dtype_name(insert_rows.dtype)
             << " vector_bytes=" << insert_rows.vector_bytes << std::endl;
 
-  std::cerr << "[sift101m-long-insert] loading queries: " << args.query_file << std::endl;
-  const VectorRows queries = read_vector_rows(args.query_file);
-  std::cerr << "[sift101m-long-insert] query rows=" << queries.count
-            << " dim=" << queries.dim
-            << " dtype=" << vector_dtype_name(queries.dtype) << std::endl;
+  std::optional<VectorRows> queries;
+  if (!args.query_file.empty()) {
+    std::cerr << "[sift101m-long-insert] loading queries: "
+              << args.query_file << std::endl;
+    queries = read_vector_rows(args.query_file);
+    std::cerr << "[sift101m-long-insert] query rows=" << queries->count
+              << " dim=" << queries->dim
+              << " dtype=" << vector_dtype_name(queries->dtype) << std::endl;
+  }
 
   if (args.insert_row_offset > insert_rows.count) {
     fail("--insert-row-offset exceeds insert-file row count");
@@ -651,6 +703,8 @@ int run_with_service(ComputeService& service, const Args& args) {
     {"recall_queries", args.recall_queries},
     {"recall_k", args.recall_k},
     {"settle_seconds", args.settle_seconds},
+    {"self_recall_queries", args.self_recall_queries},
+    {"self_recall_k", args.self_recall_k},
     {"reset_breakdown_every", args.reset_breakdown_every},
     {"dim", service.config().dim},
     {"max_vectors_config", service.config().max_vectors},
@@ -664,9 +718,10 @@ int run_with_service(ComputeService& service, const Args& args) {
     {"insert_rows", insert_rows.count},
     {"insert_dim", insert_rows.dim},
     {"insert_dtype", vector_dtype_name(insert_rows.dtype)},
-    {"query_rows", queries.count},
-    {"query_dim", queries.dim},
-    {"query_dtype", vector_dtype_name(queries.dtype)},
+    {"query_rows", queries.has_value() ? queries->count : 0},
+    {"query_dim", queries.has_value() ? queries->dim : 0},
+    {"query_dtype", queries.has_value()
+      ? vector_dtype_name(queries->dtype) : "none"},
   };
 
   std::optional<RecallResult> baseline_recall;
@@ -674,7 +729,7 @@ int run_with_service(ComputeService& service, const Args& args) {
     std::cerr << "[sift101m-long-insert] loading baseline groundtruth: "
               << args.baseline_groundtruth_file << std::endl;
     const GroundTruth baseline_gt = read_groundtruth(args.baseline_groundtruth_file);
-    baseline_recall = run_recall(service, "baseline-100m", queries, baseline_gt,
+    baseline_recall = run_recall(service, "baseline-100m", *queries, baseline_gt,
                                  args.recall_queries, args.recall_k);
     root["baseline_recall"] = recall_json(*baseline_recall, args.query_file,
                                           args.baseline_groundtruth_file);
@@ -702,20 +757,69 @@ int run_with_service(ComputeService& service, const Args& args) {
     return EXIT_FAILURE;
   }
 
+  std::optional<RecallResult> stage1_self_recall;
+  const auto stage1_recall_finished_before = std::chrono::steady_clock::now();
+  if (args.self_recall_queries != 0) {
+    stage1_self_recall = run_inserted_self_recall(
+      service, "stage1-only", insert_rows, args.insert_row_offset,
+      args.insert_start_id, effective_insert_count,
+      args.self_recall_queries, args.self_recall_k);
+    root["stage1_only_self_recall"] = {
+      {"queries", stage1_self_recall->queries},
+      {"k", stage1_self_recall->k},
+      {"hit_rate", stage1_self_recall->recall},
+    };
+  }
+  const double stage1_window_elapsed_seconds = insert_stats.duration_seconds +
+    std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                  stage1_recall_finished_before).count();
+  const double configured_stage2_delay_seconds =
+    static_cast<double>(
+      service.config().storage_owner_stage2_initial_delay_ms) / 1000.0;
+  root["stage1_only_window"] = {
+    {"configured_stage2_delay_seconds", configured_stage2_delay_seconds},
+    {"insert_plus_recall_seconds", stage1_window_elapsed_seconds},
+    {"valid", configured_stage2_delay_seconds >
+              stage1_window_elapsed_seconds},
+  };
+
   wait_for_settle(args.settle_seconds);
 
-  std::cerr << "[sift101m-long-insert] loading post-insert groundtruth: "
-            << args.groundtruth_file << std::endl;
-  const GroundTruth post_gt = read_groundtruth(args.groundtruth_file);
-  const RecallResult post_recall = run_recall(service, "post-101m", queries, post_gt,
-                                              args.recall_queries, args.recall_k);
-  root["post_insert_recall"] = recall_json(post_recall, args.query_file, args.groundtruth_file);
+  std::optional<RecallResult> final_self_recall;
+  if (args.self_recall_queries != 0) {
+    final_self_recall = run_inserted_self_recall(
+      service, "stage2-finalized", insert_rows, args.insert_row_offset,
+      args.insert_start_id, effective_insert_count,
+      args.self_recall_queries, args.self_recall_k);
+    root["finalized_self_recall"] = {
+      {"queries", final_self_recall->queries},
+      {"k", final_self_recall->k},
+      {"hit_rate", final_self_recall->recall},
+    };
+    root["self_recall_delta"] = {
+      {"final_minus_stage1", final_self_recall->recall -
+        stage1_self_recall->recall},
+      {"stage1_minus_final", stage1_self_recall->recall -
+        final_self_recall->recall},
+    };
+  }
 
-  if (baseline_recall.has_value()) {
-    const double drop = baseline_recall->recall - post_recall.recall;
+  std::optional<RecallResult> post_recall;
+  if (!args.groundtruth_file.empty()) {
+    std::cerr << "[sift101m-long-insert] loading post-insert groundtruth: "
+              << args.groundtruth_file << std::endl;
+    const GroundTruth post_gt = read_groundtruth(args.groundtruth_file);
+    post_recall = run_recall(service, "post-101m", *queries, post_gt,
+                             args.recall_queries, args.recall_k);
+    root["post_insert_recall"] = recall_json(
+      *post_recall, args.query_file, args.groundtruth_file);
+  }
+
+  if (baseline_recall.has_value() && post_recall.has_value()) {
+    const double drop = baseline_recall->recall - post_recall->recall;
     root["recall_delta"] = {
       {"baseline_minus_post", drop},
-      {"post_minus_baseline", post_recall.recall - baseline_recall->recall},
+      {"post_minus_baseline", post_recall->recall - baseline_recall->recall},
     };
   }
 
@@ -729,10 +833,20 @@ int run_with_service(ComputeService& service, const Args& args) {
     text << "  baseline recall@" << baseline_recall->k << ": "
          << baseline_recall->recall << " (" << baseline_recall->queries << " queries)\n";
   }
-  text << "  post recall@" << post_recall.k << ": "
-       << post_recall.recall << " (" << post_recall.queries << " queries)\n";
-  if (baseline_recall.has_value()) {
-    text << "  recall drop: " << (baseline_recall->recall - post_recall.recall) << '\n';
+  if (stage1_self_recall.has_value() && final_self_recall.has_value()) {
+    text << "  stage1-only self-hit@" << stage1_self_recall->k << ": "
+         << stage1_self_recall->recall << '\n';
+    text << "  finalized self-hit@" << final_self_recall->k << ": "
+         << final_self_recall->recall << '\n';
+  }
+  if (post_recall.has_value()) {
+    text << "  post recall@" << post_recall->k << ": "
+         << post_recall->recall << " (" << post_recall->queries
+         << " queries)\n";
+  }
+  if (baseline_recall.has_value() && post_recall.has_value()) {
+    text << "  recall drop: "
+         << (baseline_recall->recall - post_recall->recall) << '\n';
   }
 
   write_json_file(args.report_json_path, root);

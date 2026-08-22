@@ -3312,7 +3312,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         config.storage_owner_stage2_batch_max_wait_us,
         packing_parameters.estimated_arrival_interval_us);
     }
-    const bool stage2_ready = packing_decision.ready;
+    const auto stage2_not_before = storage_owner_stage2_tasks_.empty()
+      ? admission_now
+      : storage_owner_stage2_tasks_.front().queued_at +
+          std::chrono::milliseconds(
+            config.storage_owner_stage2_initial_delay_ms);
+    const bool stage2_ready = packing_decision.ready &&
+      admission_now >= stage2_not_before;
     const bool choose_stage2 =
       stage2_ready &&
       (!cleanup_ready || storage_owner_stage2_tasks_.front().queued_at <=
@@ -3606,8 +3612,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
             idle_started,
             config.storage_owner_stage2_batch_max_wait_us,
             parameters.estimated_arrival_interval_us);
-          if (decision.deadline.has_value() &&
-              *decision.deadline < wake_at) {
+          const auto not_before =
+            storage_owner_stage2_tasks_.front().queued_at +
+            std::chrono::milliseconds(
+              config.storage_owner_stage2_initial_delay_ms);
+          if (not_before > idle_started && not_before < wake_at) {
+            wake_at = not_before;
+          } else if (not_before <= idle_started &&
+                     decision.deadline.has_value() &&
+                     *decision.deadline < wake_at) {
             wake_at = *decision.deadline;
           }
         }

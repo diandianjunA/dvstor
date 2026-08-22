@@ -1045,6 +1045,53 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
       summary.stage2_cross_edges_final_home += cross_after;
     }
 
+    uint64_t stage2_latency_ns = 0;
+    if (counter_delta(first.stage2_finalize_latency_ns,
+                      latest.stage2_finalize_latency_ns,
+                      &stage2_latency_ns)) {
+      summary.stage2_finalize_latency_ns += stage2_latency_ns;
+      summary.stage2_latency_sum_delta_available = true;
+    }
+
+    uint64_t exact_items = 0;
+    uint64_t exact_total_ns = 0;
+    uint64_t exact_remote_read_ns = 0;
+    uint64_t exact_remote_reverse_ns = 0;
+    uint64_t exact_search_ns = 0;
+    uint64_t exact_prune_ns = 0;
+    uint64_t exact_allocate_write_ns = 0;
+    uint64_t exact_local_reverse_ns = 0;
+    if (counter_delta(first.exact_insert_items,
+                      latest.exact_insert_items, &exact_items) &&
+        counter_delta(first.exact_insert_total_ns,
+                      latest.exact_insert_total_ns, &exact_total_ns) &&
+        counter_delta(first.exact_insert_remote_read_ns,
+                      latest.exact_insert_remote_read_ns,
+                      &exact_remote_read_ns) &&
+        counter_delta(first.exact_insert_remote_reverse_ns,
+                      latest.exact_insert_remote_reverse_ns,
+                      &exact_remote_reverse_ns) &&
+        counter_delta(first.exact_insert_search_ns,
+                      latest.exact_insert_search_ns, &exact_search_ns) &&
+        counter_delta(first.exact_insert_prune_ns,
+                      latest.exact_insert_prune_ns, &exact_prune_ns) &&
+        counter_delta(first.exact_insert_allocate_write_ns,
+                      latest.exact_insert_allocate_write_ns,
+                      &exact_allocate_write_ns) &&
+        counter_delta(first.exact_insert_local_reverse_ns,
+                      latest.exact_insert_local_reverse_ns,
+                      &exact_local_reverse_ns)) {
+      summary.exact_insert_items += exact_items;
+      summary.exact_insert_total_ns += exact_total_ns;
+      summary.exact_insert_remote_read_ns += exact_remote_read_ns;
+      summary.exact_insert_remote_reverse_ns += exact_remote_reverse_ns;
+      summary.exact_insert_search_ns += exact_search_ns;
+      summary.exact_insert_prune_ns += exact_prune_ns;
+      summary.exact_insert_allocate_write_ns += exact_allocate_write_ns;
+      summary.exact_insert_local_reverse_ns += exact_local_reverse_ns;
+      summary.exact_insert_counter_delta_available = true;
+    }
+
     uint64_t stage1_exhausted = 0;
     uint64_t stage2_exhausted = 0;
     if (counter_delta(first.stage1_search_budget_exhausted,

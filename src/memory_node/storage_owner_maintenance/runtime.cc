@@ -45,6 +45,14 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     storage_owner_search_lane_lease_limit_.store(
       0, std::memory_order_release);
     storage_owner_maintenance_started_ns_.store(0, std::memory_order_release);
+    exact_insert_items_.store(0, std::memory_order_relaxed);
+    exact_insert_total_ns_.store(0, std::memory_order_relaxed);
+    exact_insert_remote_read_ns_.store(0, std::memory_order_relaxed);
+    exact_insert_remote_reverse_ns_.store(0, std::memory_order_relaxed);
+    exact_insert_search_ns_.store(0, std::memory_order_relaxed);
+    exact_insert_prune_ns_.store(0, std::memory_order_relaxed);
+    exact_insert_allocate_write_ns_.store(0, std::memory_order_relaxed);
+    exact_insert_local_reverse_ns_.store(0, std::memory_order_relaxed);
     gpu_search::maintenance_telemetry::publish(
       reinterpret_cast<byte_t*>(control),
       gpu_search::maintenance_telemetry::Snapshot{
@@ -1022,6 +1030,9 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     context_slots_scanned;
   telemetry_snapshot.active_stage2_contexts = active_contexts;
   telemetry_snapshot.active_stage2_context_limit = active_context_limit;
+  telemetry_snapshot.stage2_finalize_latency_ns =
+    storage_owner_maintenance_finalize_latency_ns_.load(
+      std::memory_order_relaxed);
   telemetry_snapshot.packing_target_batch = stage2_packing.target_batch;
   telemetry_snapshot.packing_arrival_interval_us =
     stage2_packing.estimated_arrival_interval_us;

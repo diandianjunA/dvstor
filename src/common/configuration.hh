@@ -101,6 +101,9 @@ public:
   // Stage2 batching is coordinated across already-pending work. This bound
   // caps the arrival-aware tail deadline; a complete B8 runs immediately.
   u32 storage_owner_stage2_batch_max_wait_us{25'000};
+  // Motivation/diagnostic gate: do not admit a Stage2 descriptor until it
+  // has aged this long. Zero is the production behavior.
+  u32 storage_owner_stage2_initial_delay_ms{0};
   bool storage_owner_stage2_score_many{true};
   // Combine ready logical Stage2 home requests that share a peer and wire
   // class. False preserves the same protocol and retry semantics but sends
@@ -443,6 +446,11 @@ private:
          ->default_value(storage_owner_stage2_batch_max_wait_us),
        "Maximum background Stage2 compaction wait for a partial batch; zero "
        "runs partial Stage2 batches immediately.")
+      ("storage-owner-stage2-initial-delay-ms",
+       po::value<u32>(&storage_owner_stage2_initial_delay_ms)
+         ->default_value(storage_owner_stage2_initial_delay_ms),
+       "Diagnostic minimum descriptor age before Stage2 admission; zero "
+       "disables the gate.")
       ("storage-owner-stage2-score-many",
        po::value<bool>(&storage_owner_stage2_score_many)
          ->default_value(storage_owner_stage2_score_many),
@@ -697,6 +705,8 @@ public:
              << config.storage_owner_batch_max_wait_us << '\n';
       output << std::setw(width) << "storage Stage2 batch max wait us: "
              << config.storage_owner_stage2_batch_max_wait_us << '\n';
+      output << std::setw(width) << "storage Stage2 initial delay ms: "
+             << config.storage_owner_stage2_initial_delay_ms << '\n';
       output << std::setw(width) << "Stage2 exact score-many: "
              << config.storage_owner_stage2_score_many << '\n';
       output << std::setw(width) << "Stage2 home RPC combining: "
