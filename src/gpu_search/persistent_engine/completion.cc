@@ -741,6 +741,15 @@ void PersistentSearchEngine::Impl::completion_loop() {
       completion.graph_extent_underhint_reads, std::memory_order_relaxed);
     engine.telemetry_.graph_extent_hint_promotions.fetch_add(
       completion.graph_extent_hint_promotions, std::memory_order_relaxed);
+    engine.telemetry_.expanded_parent_count.fetch_add(
+      completion.expanded_parent_count, std::memory_order_relaxed);
+    engine.telemetry_.expanded_neighbor_count_sum.fetch_add(
+      completion.expanded_neighbor_count_sum, std::memory_order_relaxed);
+    for (u32 bucket = 0; bucket < kGraphDegreeHistogramBuckets; ++bucket) {
+      engine.telemetry_.expanded_degree_histogram[bucket].fetch_add(
+        completion.expanded_degree_histogram[bucket],
+        std::memory_order_relaxed);
+    }
     engine.telemetry_.dynamic_graph_short_reads.fetch_add(
       completion.dynamic_graph_short_reads, std::memory_order_relaxed);
     engine.telemetry_.dynamic_graph_full_reads.fetch_add(

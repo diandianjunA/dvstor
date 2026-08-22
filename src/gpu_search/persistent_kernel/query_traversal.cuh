@@ -3287,8 +3287,14 @@ __device__ __forceinline__ void process_query(
       if (threadIdx.x == 0) {
         neighbor_offsets[0] = 0;
         for (u32 local = 0; local < chunk_count; ++local) {
+          const u32 count = neighbor_counts[local];
+          const u32 extent_class = min(
+            (count + 7u) / 8u, kGraphDegreeHistogramBuckets - 1u);
+          ++completion.expanded_parent_count;
+          completion.expanded_neighbor_count_sum += count;
+          ++completion.expanded_degree_histogram[extent_class];
           neighbor_offsets[local + 1] =
-            neighbor_offsets[local] + neighbor_counts[local];
+            neighbor_offsets[local] + count;
         }
         flattened_neighbors = neighbor_offsets[chunk_count];
         phase_started_cycles = clock64();

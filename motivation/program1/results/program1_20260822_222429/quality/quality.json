@@ -2,7 +2,7 @@
   "finalized_self_recall": {
     "hit_rate": 1.0,
     "k": 10,
-    "queries": 100
+    "queries": 1000
   },
   "input": {
     "insert_dim": 128,
@@ -14,10 +14,10 @@
   },
   "insert": {
     "attempted": 1000,
-    "duration_seconds": 0.246702893,
+    "duration_seconds": 0.242857579,
     "failed": 0,
     "inserted": 1000,
-    "inserts_per_second": 4053.4587488603142
+    "inserts_per_second": 4117.639664027121
   },
   "meta": {
     "baseline_groundtruth_file": "",
@@ -39,24 +39,43 @@
     "reset_breakdown_every": 50000,
     "search": "gpu_persistent_opq_pq",
     "self_recall_k": 10,
-    "self_recall_queries": 100,
-    "service_config": "/home/xjs/experiment/dvstor/motivation/program1/results/program1_20260822_215459/quality/service.ini",
+    "self_recall_queries": 1000,
+    "service_config": "/home/xjs/experiment/dvstor/motivation/program1/results/program1_20260822_222429/quality/service.ini",
     "settle_seconds": 30,
     "storage_owner_maintenance_workers": 8,
     "storage_owner_update_protocol": "centroid_home_two_stage"
   },
   "self_recall_delta": {
-    "final_minus_stage1": 0.19999999999999996,
-    "stage1_minus_final": -0.19999999999999996
+    "final_minus_stage1": 0.14100000000000001,
+    "stage1_final_result_overlap_at_k": 0.9701999999999966,
+    "stage1_minus_final": -0.14100000000000001
   },
   "stage1_only_self_recall": {
-    "hit_rate": 0.8,
+    "hit_rate": 0.859,
     "k": 10,
-    "queries": 100
+    "queries": 1000
   },
   "stage1_only_window": {
     "configured_stage2_delay_seconds": 15.0,
-    "insert_plus_recall_seconds": 0.495551004,
+    "insert_plus_recall_seconds": 2.679740983,
     "valid": true
+  },
+  "stage2_finalization": {
+    "complete": true,
+    "drain_seconds_after_settle": 0.000207579,
+    "durable_sequences": [
+      196,
+      204,
+      251,
+      169,
+      180
+    ],
+    "target_sequences": [
+      196,
+      204,
+      251,
+      169,
+      180
+    ]
   }
 }

@@ -3,7 +3,7 @@
 namespace gpu_search {
 
 TelemetrySnapshot Telemetry::snapshot() const {
-  return {
+  TelemetrySnapshot snapshot{
     .gpu_memory_explicit_bytes = gpu_memory_explicit_bytes.load(std::memory_order_relaxed),
     .gpu_memory_base_pq_bytes = gpu_memory_base_pq_bytes.load(std::memory_order_relaxed),
     .gpu_memory_route_graph_bytes = gpu_memory_route_graph_bytes.load(std::memory_order_relaxed),
@@ -57,6 +57,10 @@ TelemetrySnapshot Telemetry::snapshot() const {
       graph_extent_underhint_reads.load(std::memory_order_relaxed),
     .graph_extent_hint_promotions =
       graph_extent_hint_promotions.load(std::memory_order_relaxed),
+    .expanded_parent_count =
+      expanded_parent_count.load(std::memory_order_relaxed),
+    .expanded_neighbor_count_sum =
+      expanded_neighbor_count_sum.load(std::memory_order_relaxed),
     .dynamic_graph_short_reads =
       dynamic_graph_short_reads.load(std::memory_order_relaxed),
     .dynamic_graph_full_reads =
@@ -236,6 +240,11 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .gpu_total_persistent_blocks =
       gpu_total_persistent_blocks.load(std::memory_order_relaxed),
   };
+  for (u32 bucket = 0; bucket < kGraphDegreeHistogramBuckets; ++bucket) {
+    snapshot.expanded_degree_histogram[bucket] =
+      expanded_degree_histogram[bucket].load(std::memory_order_relaxed);
+  }
+  return snapshot;
 }
 
 void Telemetry::set_gpu_occupancy(
@@ -302,6 +311,11 @@ void Telemetry::reset() {
   graph_extent_fallback_reads.store(0, std::memory_order_relaxed);
   graph_extent_underhint_reads.store(0, std::memory_order_relaxed);
   graph_extent_hint_promotions.store(0, std::memory_order_relaxed);
+  expanded_parent_count.store(0, std::memory_order_relaxed);
+  expanded_neighbor_count_sum.store(0, std::memory_order_relaxed);
+  for (auto& bucket : expanded_degree_histogram) {
+    bucket.store(0, std::memory_order_relaxed);
+  }
   dynamic_graph_short_reads.store(0, std::memory_order_relaxed);
   dynamic_graph_full_reads.store(0, std::memory_order_relaxed);
   dynamic_graph_read_bytes.store(0, std::memory_order_relaxed);

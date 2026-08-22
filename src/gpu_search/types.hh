@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 
@@ -11,6 +12,12 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using i32 = std::int32_t;
 using f32 = float;
+
+// Query-weighted histogram of authoritative live degrees for graph parents
+// that were actually committed and expanded. Buckets 0..12 represent
+// ceil(degree / 8); bucket 13 is the bounded overflow/full-record class for
+// the schema-16 832-byte graph record.
+inline constexpr u32 kGraphDegreeHistogramBuckets = 14;
 
 struct QueryDescriptor {
   u64 request_id{};
@@ -229,16 +236,19 @@ struct CompletionDescriptor {
   // Low 8 bits encode QueryFailureReason; the high 24 bits count complete
   // centroid-route snapshot retries caused by a concurrent publication.
   u32 diagnostic{};
-  // Successful 0 -> occupied arena transitions. Appending this field consumes
-  // the descriptor's former four-byte tail padding, preserving every existing
-  // field offset and the mapped-ring ABI size.
+  // Successful 0 -> occupied arena transitions. This field retains its
+  // existing offset; the motivation-only aggregate fields are appended below
+  // so all earlier mapped-ring fields remain layout-compatible.
   u32 dynamic_code_cache_first_occupancies{};
+  u32 expanded_parent_count{};
+  u32 expanded_neighbor_count_sum{};
+  u32 expanded_degree_histogram[kGraphDegreeHistogramBuckets]{};
 };
 
 // CompletionDescriptor is embedded once in persistent-kernel shared memory
 // and is also the mapped device-to-host ring ABI. Keep the explicit size check
 // synchronized with both sides whenever production telemetry extends it.
-static_assert(sizeof(CompletionDescriptor) == 584);
+static_assert(sizeof(CompletionDescriptor) == 648);
 static_assert(alignof(CompletionDescriptor) == alignof(u64));
 
 struct CentroidRoutePublishDescriptor {
@@ -296,6 +306,10 @@ struct TelemetrySnapshot {
   u64 graph_extent_fallback_reads{};
   u64 graph_extent_underhint_reads{};
   u64 graph_extent_hint_promotions{};
+  u64 expanded_parent_count{};
+  u64 expanded_neighbor_count_sum{};
+  std::array<u64, kGraphDegreeHistogramBuckets>
+    expanded_degree_histogram{};
   u64 dynamic_graph_short_reads{};
   u64 dynamic_graph_full_reads{};
   u64 dynamic_graph_read_bytes{};
@@ -454,6 +468,10 @@ public:
   std::atomic<u64> graph_extent_fallback_reads{0};
   std::atomic<u64> graph_extent_underhint_reads{0};
   std::atomic<u64> graph_extent_hint_promotions{0};
+  std::atomic<u64> expanded_parent_count{0};
+  std::atomic<u64> expanded_neighbor_count_sum{0};
+  std::array<std::atomic<u64>, kGraphDegreeHistogramBuckets>
+    expanded_degree_histogram{};
   std::atomic<u64> dynamic_graph_short_reads{0};
   std::atomic<u64> dynamic_graph_full_reads{0};
   std::atomic<u64> dynamic_graph_read_bytes{0};

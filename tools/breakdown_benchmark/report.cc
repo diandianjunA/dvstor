@@ -60,6 +60,10 @@ nlohmann::json telemetry_to_json(
       : 0;
   const uint64_t dynamic_graph_snapshot_attempts =
     telemetry.dynamic_graph_short_reads + telemetry.dynamic_graph_full_reads;
+  nlohmann::json expanded_degree_histogram = nlohmann::json::array();
+  for (const auto count : telemetry.expanded_degree_histogram) {
+    expanded_degree_histogram.push_back(count);
+  }
   return {
     {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
     {"gpu_memory_base_pq_bytes", telemetry.gpu_memory_base_pq_bytes},
@@ -197,6 +201,15 @@ nlohmann::json telemetry_to_json(
       telemetry.graph_extent_underhint_reads},
     {"graph_extent_hint_promotions",
       telemetry.graph_extent_hint_promotions},
+    {"expanded_parent_count", telemetry.expanded_parent_count},
+    {"expanded_neighbor_count_sum",
+      telemetry.expanded_neighbor_count_sum},
+    {"average_expanded_parent_degree",
+      telemetry.expanded_parent_count == 0 ? 0.0
+      : static_cast<double>(telemetry.expanded_neighbor_count_sum) /
+          static_cast<double>(telemetry.expanded_parent_count)},
+    {"expanded_degree_histogram_quantum", 8},
+    {"expanded_degree_histogram", expanded_degree_histogram},
     {"dynamic_graph_short_reads", telemetry.dynamic_graph_short_reads},
     {"dynamic_graph_full_reads", telemetry.dynamic_graph_full_reads},
     {"dynamic_graph_read_bytes", telemetry.dynamic_graph_read_bytes},
@@ -883,6 +896,14 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("graph_extent_fallback_reads", 0ULL) << "/"
            << gpu.value("graph_extent_underhint_reads", 0ULL) << "/"
            << gpu.value("graph_extent_hint_promotions", 0ULL) << '\n';
+    output << "  expanded parents/neighbor sum/average degree: "
+           << gpu.value("expanded_parent_count", 0ULL) << "/"
+           << gpu.value("expanded_neighbor_count_sum", 0ULL) << "/"
+           << gpu.value("average_expanded_parent_degree", 0.0) << '\n';
+    output << "  expanded degree histogram (ceil(degree/8), overflow=13): "
+           << gpu.value(
+                "expanded_degree_histogram", nlohmann::json::array()).dump()
+           << '\n';
     output << "  DynaExtent short/full/bytes/fallback/promotions/demotions: "
            << gpu.value("dynamic_graph_short_reads", 0ULL) << "/"
            << gpu.value("dynamic_graph_full_reads", 0ULL) << "/"

@@ -162,6 +162,9 @@ graph_full_record_reads
 graph_extent_fallback_reads
 graph_extent_underhint_reads
 graph_extent_hint_promotions
+expanded_parent_count
+expanded_neighbor_count_sum
+expanded_degree_histogram
 dynamic_graph_short_reads
 dynamic_graph_full_reads
 dynamic_graph_read_bytes
@@ -169,6 +172,11 @@ dynamic_graph_fallback_reads
 dynamic_graph_hint_promotions
 dynamic_graph_hint_demotions
 ```
+
+`expanded_degree_histogram` 是查询加权的权威 live degree 分布：只在父节点
+完成关键读取、进入 authoritative expansion 时按 `ceil(degree/8)` 计数，配套的
+parent count 和 neighbor sum 给出精确平均邻居数。它用于区分“整个索引的静态
+degree 分布”和“查询真正访问的节点分布”，不会记录逐请求 trace。
 
 其中 `graph_read_bytes` 是成功同步执行或成功进入 owner queue 的实际 graph payload
 总和，包含 snapshot retry 和 fallback；不能用逻辑 `remote_pages * record_bytes`
