@@ -2802,7 +2802,7 @@ __device__ __forceinline__ void process_query(
         blockDim.x == kApproximateSortThreadsCompact;
       const bool frontier_stable_run_enabled =
         ooo_pipeline_enabled &&
-        params.issue_width > params.commit_width &&
+        EnableAsfe &&
         params.beam_merge_policy ==
           static_cast<u32>(BeamMergePolicy::stable_run) &&
         expansions + selected_count < params.max_expansions;
@@ -3485,7 +3485,6 @@ __device__ __forceinline__ void process_query(
       }
       const bool exact_frontier_issue_enabled =
         asfe_stable_run && final_parent_chunk &&
-        params.issue_width > params.commit_width &&
         expansions + selected_count < params.max_expansions;
       if (exact_frontier_issue_enabled) {
         const u32 remaining_search_budget =
@@ -3730,8 +3729,13 @@ __device__ __forceinline__ void process_query(
             frontier_enqueue_cycles +=
               now - frontier_subphase_started_cycles;
             if (core_batch.active != 0) {
+              // The enqueue subphase timestamp is dead after this point;
+              // retain the completed doorbell time through Beam publication.
+              frontier_subphase_started_cycles = now;
               ++core_prefetch_waves;
               ++frontier_reusable_issued_certificates;
+            } else {
+              frontier_subphase_started_cycles = 0;
             }
             tail_feedback.queue_rejects +=
               speculative_queue_rejects -
@@ -3757,6 +3761,16 @@ __device__ __forceinline__ void process_query(
           rerank_handles, rerank_flags, rerank_distances,
           candidate_workspace, stable_merge_state,
           &beam_merge_round_breakdown, true);
+        if (threadIdx.x == 0) {
+          const u64 beam_published_at = clock64();
+          completion.frontier_prefix_to_beam_publish_cycles +=
+            beam_published_at - shadow_issue_started_cycles;
+          if (frontier_subphase_started_cycles != 0) {
+            completion.frontier_issue_to_beam_publish_cycles +=
+              beam_published_at - frontier_subphase_started_cycles;
+          }
+        }
+        __syncthreads();
       } else {
         if (asfe_stable_run) {
           if (stable_runs_prepared_before_issue == 0) {

@@ -628,6 +628,12 @@ void PersistentSearchEngine::Impl::completion_loop() {
     engine.telemetry_.gpu_frontier_enqueue_ns.fetch_add(
       phase_ns(completion.frontier_enqueue_cycles),
       std::memory_order_relaxed);
+    engine.telemetry_.gpu_frontier_prefix_to_beam_publish_ns.fetch_add(
+      phase_ns(completion.frontier_prefix_to_beam_publish_cycles),
+      std::memory_order_relaxed);
+    engine.telemetry_.gpu_frontier_issue_to_beam_publish_ns.fetch_add(
+      phase_ns(completion.frontier_issue_to_beam_publish_cycles),
+      std::memory_order_relaxed);
     engine.telemetry_.gpu_rdma_wait_ns.fetch_add(
       phase_ns(completion.rdma_wait_cycles), std::memory_order_relaxed);
     engine.telemetry_.gpu_graph_validation_ns.fetch_add(

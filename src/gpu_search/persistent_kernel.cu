@@ -58,10 +58,10 @@ void launch_persistent_search(cudaStream_t stream,
                               const PersistentKernelParams& params,
                               u32 blocks, u32 threads,
                               bool decoupled_search_progression) {
-  if (decoupled_search_progression !=
-      (params.issue_width > params.commit_width)) {
+  if (decoupled_search_progression &&
+      params.issue_width < params.commit_width) {
     throw std::invalid_argument(
-      "GPU-RDMA search progression mode does not match graph widths");
+      "exact-frontier progression requires issue width >= commit width");
   }
   if (threads == 128) {
     if (decoupled_search_progression) {
