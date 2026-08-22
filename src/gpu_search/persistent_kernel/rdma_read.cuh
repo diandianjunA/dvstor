@@ -2267,11 +2267,16 @@ __device__ bool prepare_graph_record_in_scratch(
   request_offset = graph_offset;
   request_local_iova = reinterpret_cast<u64>(destination) -
     params.direct_local_iova_base;
+  const bool header_neighbor =
+    params.graph_read_policy ==
+      static_cast<u32>(GraphReadPolicy::header_neighbor);
   // Both static sidecar and incarnation-scoped dynamic classes are hints:
   // validation below promotes any insufficient short read to an authoritative
   // full retry.  An unseen/BUSY/recycled dynamic slot returns the unknown class
   // and therefore preserves the legacy full-record path.
-  if (static_record && params.graph_extent_class_words != nullptr &&
+  if (header_neighbor && params.graph_request_bytes != nullptr) {
+    request_bytes = graph_record_validation::kGraphRecordHeaderBytes;
+  } else if (static_record && params.graph_extent_class_words != nullptr &&
       params.graph_request_bytes != nullptr &&
       (params.graph_entry_bytes & (sizeof(u64) - 1u)) == 0) {
     request_bytes = graph_record_validation::graph_extent_bytes_for_class(
@@ -2323,6 +2328,7 @@ inline constexpr u32 kGraphReadLogical = 1u;
 inline constexpr u32 kGraphReadStartedWithShortExtent = 2u;
 inline constexpr u32 kGraphReadNeedsExtentFallback = 4u;
 inline constexpr u32 kGraphReadExtentUnderhint = 8u;
+inline constexpr u32 kGraphReadHeaderNeighborBody = 16u;
 
 #ifdef __CUDACC__
 __host__ __device__
@@ -4407,14 +4413,14 @@ __device__ u32 fetch_graph_records_batch(
   u64* request_offsets = params.dynamic_code_request_offsets + request_base;
   u64* request_local_iovas =
     params.dynamic_code_request_local_iovas + request_base;
-  u32* request_bytes =
-    params.graph_extent_class_words == nullptr ||
-        params.graph_request_bytes == nullptr
-      ? nullptr
-      : params.graph_request_bytes +
+  u32* request_bytes = params.graph_request_bytes == nullptr
+      ? nullptr : params.graph_request_bytes +
           static_cast<size_t>(descriptor.query_slot) *
             kPersistentMaxPrefetch;
   const bool live_extent_enabled = request_bytes != nullptr;
+  const bool header_neighbor =
+    params.graph_read_policy ==
+      static_cast<u32>(GraphReadPolicy::header_neighbor);
 
   if (threadIdx.x == 0) failed = 0;
   for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
@@ -4477,11 +4483,44 @@ __device__ u32 fetch_graph_records_batch(
           ((min(scratch_slot, 0x3fu) & 0x3fu) << 9);
         atomicCAS(&failed, 0u, detail);
       } else {
-        const bool force_full =
+        const bool continue_header_neighbor =
+          header_neighbor && force_full_underhint != nullptr &&
+          force_full_underhint[index] != 0;
+        bool continue_header_neighbor_body = false;
+        if (continue_header_neighbor) {
+          const u8* prior_header = graph_record_pointer(
+            params, descriptor.query_slot, acquired_slots[index]);
+          u32 required_bytes = 0;
+          if (graph_record_validation::required_live_extent_bytes(
+                prior_header,
+                graph_record_validation::kGraphRecordHeaderBytes,
+                params.graph_degree, params.graph_entry_capacity,
+                required_bytes) &&
+              required_bytes >
+                graph_record_validation::kGraphRecordHeaderBytes) {
+            request_offsets[index] +=
+              graph_record_validation::kGraphRecordHeaderBytes;
+            request_local_iovas[index] +=
+              graph_record_validation::kGraphRecordHeaderBytes;
+            transfer_bytes = required_bytes -
+              graph_record_validation::kGraphRecordHeaderBytes;
+            continue_header_neighbor_body = true;
+          }
+        }
+        const bool force_full = !header_neighbor &&
           force_full_underhint != nullptr &&
           force_full_underhint[index] != 0;
         remote_reads[index] = prepare_graph_read_attempt_state(
           params.graph_entry_bytes, force_full, transfer_bytes);
+        if (continue_header_neighbor) {
+          // The speculative header and this exact-prefix transfer form one
+          // logical adjacency access.  Keep physical WQE/byte accounting for
+          // both stages but do not count a second logical graph read.
+          remote_reads[index] &= ~kGraphReadLogical;
+          if (continue_header_neighbor_body) {
+            remote_reads[index] |= kGraphReadHeaderNeighborBody;
+          }
+        }
         if (request_bytes != nullptr) {
           request_bytes[index] = transfer_bytes;
         }
@@ -4779,13 +4818,18 @@ __device__ u32 fetch_graph_records_batch(
       const u32 slot = acquired_slots[index];
       u8* record = graph_record_pointer(params, descriptor.query_slot, slot);
       const i32 status = shard_status[shard];
-      const u32 transfer_bytes = live_extent_enabled
+      const u32 physical_transfer_bytes = live_extent_enabled
         ? request_bytes[index] : params.graph_entry_bytes;
-      const bool partial_read = transfer_bytes < params.graph_entry_bytes;
+      const bool header_neighbor_body = header_neighbor &&
+        (remote_reads[index] & kGraphReadHeaderNeighborBody) != 0;
+      const u32 available_bytes = physical_transfer_bytes +
+        (header_neighbor_body
+          ? graph_record_validation::kGraphRecordHeaderBytes : 0u);
+      const bool partial_read = available_bytes < params.graph_entry_bytes;
       u32 required_bytes = 0;
       const bool prefix_valid = status == 0 &&
         graph_record_validation::required_live_extent_bytes(
-          record, transfer_bytes, params.graph_degree,
+          record, available_bytes, params.graph_degree,
           params.graph_entry_capacity, required_bytes);
       // Capacity is checked before checksum acceptance. This prevents a
       // truncated counted prefix from being accepted even in the event of a
@@ -4794,15 +4838,15 @@ __device__ u32 fetch_graph_records_batch(
       // same insufficient request.
       const bool short_read_requires_full =
         status == 0 && partial_read &&
-        (!prefix_valid || required_bytes > transfer_bytes);
+        (!prefix_valid || required_bytes > available_bytes);
       const bool extent_underhint =
         status == 0 && partial_read && prefix_valid &&
-        required_bytes > transfer_bytes;
+        required_bytes > available_bytes;
       const graph_record_validation::SnapshotState snapshot =
         status == 0 && !short_read_requires_full
           ? (partial_read
               ? classify_short_graph_record(
-                  params, record, transfer_bytes, handles[index])
+                  params, record, available_bytes, handles[index])
               : classify_graph_record(params, record, handles[index]))
           : graph_record_validation::SnapshotState::invalid;
       const bool started_with_short =
@@ -4854,12 +4898,33 @@ __device__ u32 fetch_graph_records_batch(
         continue;
       }
       if (action == graph_record_validation::ReadAction::retry) {
-        if (partial_read) {
-          request_bytes[index] = params.graph_entry_bytes;
-          remote_reads[index] |= kGraphReadNeedsExtentFallback;
-          if (extent_underhint) {
-            remote_reads[index] |= kGraphReadExtentUnderhint;
+        if (header_neighbor) {
+          if (header_neighbor_body) {
+            request_offsets[index] -=
+              graph_record_validation::kGraphRecordHeaderBytes;
+            request_local_iovas[index] -=
+              graph_record_validation::kGraphRecordHeaderBytes;
+            remote_reads[index] &= ~kGraphReadHeaderNeighborBody;
+            request_bytes[index] =
+              graph_record_validation::kGraphRecordHeaderBytes;
+          } else if (extent_underhint) {
+            request_offsets[index] +=
+              graph_record_validation::kGraphRecordHeaderBytes;
+            request_local_iovas[index] +=
+              graph_record_validation::kGraphRecordHeaderBytes;
+            request_bytes[index] = required_bytes -
+              graph_record_validation::kGraphRecordHeaderBytes;
+            remote_reads[index] |= kGraphReadHeaderNeighborBody;
+          } else {
+            request_bytes[index] =
+              graph_record_validation::kGraphRecordHeaderBytes;
           }
+        } else if (partial_read) {
+            request_bytes[index] = params.graph_entry_bytes;
+            remote_reads[index] |= kGraphReadNeedsExtentFallback;
+            if (extent_underhint) {
+              remote_reads[index] |= kGraphReadExtentUnderhint;
+            }
         }
         atomicAdd(&retry_pending, 1u);
         continue;

@@ -102,6 +102,10 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   format::GraphExtentHeader graph_extent_header{};
   const bool live_extent_graph_reads =
     config.gpu_query_graph_read_policy == "live-extent";
+  const bool header_neighbor_graph_reads =
+    config.gpu_query_graph_read_policy == "header-neighbor";
+  const bool variable_graph_reads =
+    live_extent_graph_reads || header_neighbor_graph_reads;
   const std::filesystem::path graph_extent_path =
     index_path::graph_extent_file(config.resolved_index_prefix());
   if (live_extent_graph_reads) {
@@ -135,6 +139,13 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
               << " extent_source=" << graph_extent_path
               << " extent_classes=" << graph_extent_classes.size()
               << " extent_payload_bytes=" << graph_extent_sidecar_bytes
+              << '\n';
+  } else if (header_neighbor_graph_reads) {
+    std::cerr << "[gpu-search] graph-read-policy=header-neighbor"
+              << " header_bytes="
+              << vamana::hot_graph::kTaggedNeighborBaseOffset
+              << " second_stage=exact_neighbor_body"
+              << " graph_record_bytes=" << index.layout.graph_entry_bytes
               << '\n';
   } else {
     std::cerr << "[gpu-search] graph-read-policy=fixed"
@@ -294,13 +305,13 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     : 0;
   const u64 graph_scratch_bytes = static_cast<u64>(query_slots) *
     kPersistentGraphScratchSlots * kPersistentGraphReadBytes;
-  const u64 graph_request_metadata_bytes = live_extent_graph_reads
+  const u64 graph_request_metadata_bytes = variable_graph_reads
     ? static_cast<u64>(query_slots) * kPersistentMaxPrefetch * sizeof(u32)
     : 0;
   const u64 speculative_graph_request_metadata_bytes =
     static_cast<u64>(query_slots) * kPersistentFrontierRobCapacity *
       (sizeof(u32) + 3 * sizeof(u64) + sizeof(u8) +
-       (live_extent_graph_reads ? sizeof(u32) : 0));
+       (variable_graph_reads ? sizeof(u32) : 0));
   // The sidecar remains exactly one byte per base node on disk. Round only
   // the device allocation to a u32 word so the last real byte can be repaired
   // with an in-bounds packed CAS.
@@ -523,7 +534,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                d_speculative_graph_validation_states, 0,
                speculative_graph_request_elements * sizeof(u8)),
              "cudaMemset(speculative graph validation states)");
-  if (live_extent_graph_reads) {
+  if (variable_graph_reads) {
     const size_t graph_request_elements =
       static_cast<size_t>(query_slots) * kPersistentMaxPrefetch;
     device_allocate(d_graph_request_bytes, graph_request_elements,
@@ -871,7 +882,9 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
             ? (config.gpu_dynamic_graph_extent
                  ? "static_gextent8_plus_dynamic_incarnation_tag"
                  : "offline_global_ordinal_gextent8")
-            : "fixed_physical_record")
+            : header_neighbor_graph_reads
+              ? "dependent_header_then_exact_neighbor_body"
+              : "fixed_physical_record")
       << "\"}\n";
   }
 
@@ -964,6 +977,11 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .centroid_route_entry_capacity = centroid_route_entry_capacity,
     .stop = stop_device,
     .graph_scratch = d_graph_scratch,
+    .graph_read_policy = header_neighbor_graph_reads
+      ? static_cast<u32>(GraphReadPolicy::header_neighbor)
+      : live_extent_graph_reads
+        ? static_cast<u32>(GraphReadPolicy::live_extent)
+        : static_cast<u32>(GraphReadPolicy::fixed),
     .graph_extent_class_words = d_graph_extent_class_words,
     .dynamic_graph_extent_enabled =
       live_extent_graph_reads && config.gpu_dynamic_graph_extent ? 1u : 0u,

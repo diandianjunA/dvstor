@@ -23,6 +23,7 @@
 #include "gpu/gpunetio_transport.hh"
 #include "gpu_search/persistent_kernel.hh"
 #include "memory_node/startup_protocol.hh"
+#include "tools/breakdown_benchmark/args.hh"
 
 namespace {
 
@@ -380,7 +381,17 @@ void run_payload_sweep(
 }  // namespace
 
 int main(int argc, char** argv) {
-  configuration::IndexConfiguration config{argc, argv};
+  std::vector<std::string> service_arguments;
+  std::vector<char*> service_argv;
+  if (argc == 3 && std::string{argv[1]} == "--service-config") {
+    service_arguments =
+      tools::breakdown_benchmark::build_service_argv(argv[2]);
+    service_argv =
+      tools::breakdown_benchmark::make_argv(service_arguments);
+  }
+  configuration::IndexConfiguration config{
+    service_argv.empty() ? argc : static_cast<int>(service_argv.size()),
+    service_argv.empty() ? argv : service_argv.data()};
   Context context{config};
   ClientConnectionManager connection_manager{context, config};
   connection_manager.connect();
@@ -635,6 +646,16 @@ int main(int argc, char** argv) {
   if (!connection_manager.synchronize()) {
     std::cerr << "GPUNetIO loopback storage synchronization failed\n";
     return EXIT_FAILURE;
+  }
+
+  // The payload sweep has already completed and validated every expected
+  // WQE above. The legacy post-sweep startup request is a separate probe for
+  // an older loopback server contract; a production memory node correctly
+  // rejects its zero-valued request. Do not turn a successful payload sweep
+  // into a false failure during teardown.
+  if (payload_sweep) {
+    std::cout << "GPUNetIO live-extent payload sweep passed\n";
+    return EXIT_SUCCESS;
   }
 
   storage_startup::Request request{};

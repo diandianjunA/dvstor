@@ -282,6 +282,12 @@ enum class QueryRdmaTraceMode : u32 {
   full = 2,
 };
 
+enum class GraphReadPolicy : u32 {
+  fixed = 0,
+  header_neighbor = 1,
+  live_extent = 2,
+};
+
 // Completion is intentionally limited to a software-visible owner priority
 // fence. Unsplit submissions expose their final READ (or dump WQE); split
 // submissions expose independent critical-prefix and speculative-tail fences.
@@ -418,6 +424,12 @@ struct PersistentKernelParams {
   u32* dispatcher_kernel_ready_count{};
   u32* control_kernel_ready_count{};
   u8* graph_scratch{};
+  // Header-neighbor deliberately performs a dependent 16-byte header READ
+  // followed by an exact-size neighbor-body READ. The assembled record still
+  // passes the ordinary checksum/incarnation validator, so a mutation between
+  // the two transfers restarts the two-stage snapshot instead of accepting a
+  // torn header/body splice.
+  u32 graph_read_policy{static_cast<u32>(GraphReadPolicy::fixed)};
   // Four eight-edge extent classes per aligned word, indexed by static
   // ordinal. Class zero is a header-only 16-byte record, class n covers n*8
   // neighbor slots, and 0xff means unknown/full-record. The device copy is a

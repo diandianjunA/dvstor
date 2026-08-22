@@ -1,0 +1,4 @@
+case	report
+fixed	/home/xjs/experiment/dvstor/motivation/program2/results/program2_20260822_231652/fixed/04_gpu_persistent_gpunetio/sift100m_04_gpu_persistent_gpunetio_20260822_231901.json
+live	/home/xjs/experiment/dvstor/motivation/program2/results/program2_20260822_231652/live/04_gpu_persistent_gpunetio/sift100m_04_gpu_persistent_gpunetio_20260822_232050.json
+probe	/home/xjs/experiment/dvstor/motivation/program2/results/program2_20260822_231652/probe/probe.log

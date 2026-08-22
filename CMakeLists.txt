@@ -396,8 +396,10 @@ else ()
                 ${DVSTOR_MLX5_LIBRARY}
             )
 
-            add_executable(dvstor_gpunetio_loopback_probe tools/gpunetio_loopback_probe.cc)
-            dvstor_target_common_includes(dvstor_gpunetio_loopback_probe)
+            add_executable(dvstor_gpunetio_loopback_probe
+                tools/gpunetio_loopback_probe.cc
+                tools/breakdown_benchmark/args.cc)
+            dvstor_target_tool_includes(dvstor_gpunetio_loopback_probe)
             target_link_libraries(dvstor_gpunetio_loopback_probe dvstor_runtime)
         endif ()
 

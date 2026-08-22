@@ -15,6 +15,11 @@ case "${1:-}" in
     graph_policy=fixed
     dynamic_extent=false
     ;;
+  header)
+    case_name=header
+    graph_policy=header-neighbor
+    dynamic_extent=false
+    ;;
   live|probe)
     case_name="${1}"
     graph_policy=live-extent
@@ -35,7 +40,7 @@ case "${1:-}" in
     exit 0
     ;;
   *)
-    echo "usage: $0 fixed|live|probe|status|stop" >&2
+    echo "usage: $0 fixed|header|live|probe|status|stop" >&2
     exit 2
     ;;
 esac

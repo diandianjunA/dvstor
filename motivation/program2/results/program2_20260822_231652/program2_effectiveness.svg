@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="390" viewBox="0 0 1000 390">
+<style>
+text { font-family: Arial, "Noto Sans", sans-serif; fill: #222; }
+.title { font-size: 18px; font-weight: 700; }
+.label { font-size: 14px; }
+.value { font-size: 14px; font-weight: 700; }
+.axis { stroke: #555; stroke-width: 1; }
+.grid { stroke: #ddd; stroke-width: 1; }
+</style>
+<rect width="100%" height="100%" fill="white"/>
+<text class="title" x="35" y="32">(a) Query throughput (+14.5%)</text><rect x="80" y="130.6" width="95" height="179.4" fill="#7570b3"/><text class="value" x="127" y="122.6" text-anchor="middle">58785.14</text><text class="label" x="127" y="338" text-anchor="middle">Fixed</text><rect x="245" y="104.6" width="95" height="205.4" fill="#1b9e77"/><text class="value" x="292" y="96.6" text-anchor="middle">67300.03</text><text class="label" x="292" y="338" text-anchor="middle">LiveExtent</text><text class="title" x="520" y="32">(b) P99 latency (-14.4%)</text><rect x="565" y="104.6" width="95" height="205.4" fill="#7570b3"/><text class="value" x="612" y="96.6" text-anchor="middle">6.20 ms</text><text class="label" x="612" y="338" text-anchor="middle">Fixed</text><rect x="730" y="134.2" width="95" height="175.8" fill="#1b9e77"/><text class="value" x="777" y="126.2" text-anchor="middle">5.31 ms</text><text class="label" x="777" y="338" text-anchor="middle">LiveExtent</text><text class="label" x="500" y="375" text-anchor="middle">Graph bytes/query: -49.6% | Physical WQE/query: -0.02% | Recall equal: True</text>
+</svg>
