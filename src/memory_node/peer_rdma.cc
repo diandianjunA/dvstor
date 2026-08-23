@@ -718,6 +718,7 @@ void MemoryNode::post_peer_read_async(StorageOwnerThread& thread,
 void MemoryNode::post_peer_reads_async(
     StorageOwnerThread& thread,
     span<const PeerReadRequest> requests) {
+  if (!requests.empty()) thread.prepare_exact_rdma_wave();
   const bool posted = post_peer_reads_async_impl(thread, requests, false);
   lib_assert(posted, "blocking peer RDMA read post unexpectedly deferred");
 }
@@ -983,6 +984,7 @@ bool MemoryNode::post_peer_reads_async_impl(
 void MemoryNode::post_peer_read_pairs_async(
     StorageOwnerThread& thread,
     span<const PeerReadPairRequest> requests) {
+  if (!requests.empty()) thread.prepare_exact_rdma_wave();
   const bool posted = post_peer_read_pairs_async_impl(
     thread, requests, false);
   lib_assert(posted,
@@ -1560,6 +1562,7 @@ void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, s
                " bytes=" + std::to_string(bytes) +
                " capacity=" + std::to_string(mn_memory_bytes_));
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
+  const auto exact_rdma_started = std::chrono::steady_clock::now();
   const u32 qp_idx = peer_data_qp_index(owner_thread != nullptr ? owner_thread->id : 0);
   QP& qp = peer_data_qp(shard_id, qp_idx);
   HugePage<byte_t>& scratch_buffer =
@@ -1594,6 +1597,9 @@ void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, s
                   wr_id);
   }
   wait_peer_sync_completion(wr_id);
+  if (owner_thread != nullptr) {
+    owner_thread->record_exact_sync_rdma_wait(exact_rdma_started);
+  }
   if (dst != scratch) std::memcpy(dst, scratch, bytes);
 }
 
@@ -1627,6 +1633,7 @@ void MemoryNode::remote_write_bytes(u32 shard_id, u64 remote_offset, const void*
     ? owner_thread->coroutine_scratch(scratch_offset)
     : scratch_buffer.get_full_buffer() + scratch_offset;
   if (src != scratch) std::memcpy(scratch, src, bytes);
+  const auto exact_rdma_started = std::chrono::steady_clock::now();
   const u64 wr_id = next_peer_sync_wr_id();
   {
     register_peer_pending_send_locked(
@@ -1645,6 +1652,9 @@ void MemoryNode::remote_write_bytes(u32 shard_id, u64 remote_offset, const void*
                   wr_id);
   }
   wait_peer_sync_completion(wr_id);
+  if (owner_thread != nullptr) {
+    owner_thread->record_exact_sync_rdma_wait(exact_rdma_started);
+  }
 }
 
 u64 MemoryNode::remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 expected, u64 desired, size_t scratch_offset) {
@@ -1659,6 +1669,7 @@ u64 MemoryNode::remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 exp
                " offset=" + std::to_string(remote_offset) +
                " capacity=" + std::to_string(mn_memory_bytes_));
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
+  const auto exact_rdma_started = std::chrono::steady_clock::now();
   const u32 qp_idx = peer_data_qp_index(owner_thread != nullptr ? owner_thread->id : 0);
   QP& qp = peer_data_qp(shard_id, qp_idx);
   HugePage<byte_t>& scratch_buffer =
@@ -1693,6 +1704,9 @@ u64 MemoryNode::remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 exp
                  wr_id);
   }
   wait_peer_sync_completion(wr_id);
+  if (owner_thread != nullptr) {
+    owner_thread->record_exact_sync_rdma_wait(exact_rdma_started);
+  }
   return *scratch;
 }
 
@@ -1712,6 +1726,7 @@ u64 MemoryNode::remote_fetch_add(u32 shard_id,
   lib_assert(remote_offset + sizeof(u64) <= mn_memory_bytes_,
              "peer FAA exceeds shard bounds");
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
+  const auto exact_rdma_started = std::chrono::steady_clock::now();
   const u32 qp_idx = peer_data_qp_index(
     owner_thread != nullptr ? owner_thread->id : 0);
   QP& qp = peer_data_qp(shard_id, qp_idx);
@@ -1746,6 +1761,9 @@ u64 MemoryNode::remote_fetch_add(u32 shard_id,
                  remote_offset, increment, true, wr_id);
   }
   wait_peer_sync_completion(wr_id);
+  if (owner_thread != nullptr) {
+    owner_thread->record_exact_sync_rdma_wait(exact_rdma_started);
+  }
   return *scratch;
 }
 

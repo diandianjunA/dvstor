@@ -1064,6 +1064,7 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     uint64_t exact_stage1_local_search_ns = 0;
     uint64_t exact_stage2_global_continuation_ns = 0;
     uint64_t exact_final_candidate_snapshot_ns = 0;
+    uint64_t exact_rdma_wait_ns = 0;
     if (counter_delta(first.exact_insert_items,
                       latest.exact_insert_items, &exact_items) &&
         counter_delta(first.exact_insert_total_ns,
@@ -1092,7 +1093,10 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
                       &exact_stage2_global_continuation_ns) &&
         counter_delta(first.exact_insert_final_candidate_snapshot_ns,
                       latest.exact_insert_final_candidate_snapshot_ns,
-                      &exact_final_candidate_snapshot_ns)) {
+                      &exact_final_candidate_snapshot_ns) &&
+        counter_delta(first.exact_insert_rdma_wait_ns,
+                      latest.exact_insert_rdma_wait_ns,
+                      &exact_rdma_wait_ns)) {
       summary.exact_insert_items += exact_items;
       summary.exact_insert_total_ns += exact_total_ns;
       summary.exact_insert_remote_read_ns += exact_remote_read_ns;
@@ -1107,6 +1111,7 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
         exact_stage2_global_continuation_ns;
       summary.exact_insert_final_candidate_snapshot_ns +=
         exact_final_candidate_snapshot_ns;
+      summary.exact_insert_rdma_wait_ns += exact_rdma_wait_ns;
       summary.exact_insert_counter_delta_available = true;
     }
 

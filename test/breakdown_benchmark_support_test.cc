@@ -673,6 +673,7 @@ void test_in_band_maintenance_snapshot_window() {
     begin[shard]->exact_insert_stage1_local_search_ns = 20'000;
     begin[shard]->exact_insert_stage2_global_continuation_ns = 60'000;
     begin[shard]->exact_insert_final_candidate_snapshot_ns = 5'000;
+    begin[shard]->exact_insert_rdma_wait_ns = 70'000;
     end[shard] = *begin[shard];
     auto& latest = *end[shard];
     latest.sequence = 4;
@@ -760,6 +761,7 @@ void test_in_band_maintenance_snapshot_window() {
     latest.exact_insert_stage1_local_search_ns += 40'000;
     latest.exact_insert_stage2_global_continuation_ns += 120'000;
     latest.exact_insert_final_candidate_snapshot_ns += 10'000;
+    latest.exact_insert_rdma_wait_ns += 140'000;
   }
   const auto summary = tools::breakdown_benchmark::
     summarize_maintenance_snapshot_window(begin, end);
@@ -796,6 +798,7 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.exact_insert_stage1_local_search_ns == 80'000);
   assert(summary.exact_insert_stage2_global_continuation_ns == 240'000);
   assert(summary.exact_insert_final_candidate_snapshot_ns == 20'000);
+  assert(summary.exact_insert_rdma_wait_ns == 280'000);
   assert(summary.stage2_remote_expansions == 120);
   assert(summary.stage2_scored_candidates == 4000);
   assert(summary.stage2_migrations == 4);

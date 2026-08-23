@@ -241,8 +241,74 @@ struct StorageOwnerThread {
     lib_assert(coroutine_id < post_balances.size(), "invalid storage-owner coroutine id");
     running_coroutine = coroutine_id;
   }
-  void track_post() { ++post_balances[running_coroutine]; }
-  bool is_ready(u32 coroutine_id) const { return post_balances[coroutine_id] == 0; }
+  void begin_exact_rdma_timing() {
+    lib_assert(!exact_rdma_timing_active,
+               "nested exact-insert RDMA timing scope");
+    lib_assert(post_balances[running_coroutine].load(
+                 std::memory_order_acquire) == 0,
+               "exact-insert RDMA timing began with outstanding work");
+    exact_rdma_timing_active = true;
+    exact_rdma_timing_coroutine = running_coroutine;
+    exact_rdma_wait_ns = 0;
+    exact_rdma_wave_started = {};
+  }
+  void prepare_exact_rdma_wave() {
+    if (!exact_rdma_timing_active ||
+        running_coroutine != exact_rdma_timing_coroutine ||
+        post_balances[running_coroutine].load(
+          std::memory_order_acquire) != 0 ||
+        exact_rdma_wave_started !=
+          std::chrono::steady_clock::time_point{}) {
+      return;
+    }
+    // Start before credit acquisition and WQE construction, since transport
+    // backpressure is part of the foreground RDMA dependency.
+    exact_rdma_wave_started = std::chrono::steady_clock::now();
+  }
+  void track_post() {
+    auto& balance = post_balances[running_coroutine];
+    const i32 previous = balance.fetch_add(1, std::memory_order_acq_rel);
+    if (previous == 0 && exact_rdma_timing_active &&
+        running_coroutine == exact_rdma_timing_coroutine &&
+        exact_rdma_wave_started ==
+          std::chrono::steady_clock::time_point{}) {
+      exact_rdma_wave_started = std::chrono::steady_clock::now();
+    }
+  }
+  bool is_ready(u32 coroutine_id) {
+    const bool ready = post_balances[coroutine_id].load(
+      std::memory_order_acquire) == 0;
+    if (ready && exact_rdma_timing_active &&
+        coroutine_id == exact_rdma_timing_coroutine &&
+        exact_rdma_wave_started !=
+          std::chrono::steady_clock::time_point{}) {
+      exact_rdma_wait_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - exact_rdma_wave_started).count());
+      exact_rdma_wave_started = {};
+    }
+    return ready;
+  }
+  void record_exact_sync_rdma_wait(
+      std::chrono::steady_clock::time_point started) {
+    if (!exact_rdma_timing_active ||
+        running_coroutine != exact_rdma_timing_coroutine) {
+      return;
+    }
+    exact_rdma_wait_ns += static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started).count());
+  }
+  u64 finish_exact_rdma_timing() {
+    lib_assert(exact_rdma_timing_active,
+               "exact-insert RDMA timing scope is not active");
+    lib_assert(is_ready(exact_rdma_timing_coroutine),
+               "exact-insert RDMA timing ended with outstanding work");
+    const u64 result = exact_rdma_wait_ns;
+    exact_rdma_timing_active = false;
+    exact_rdma_wave_started = {};
+    return result;
+  }
   StorageOwnerCoroutineScratch& coroutine_scratch_state() {
     lib_assert(running_coroutine < coroutine_scratch_states.size(),
                "storage-owner coroutine container scratch is not initialized");
@@ -269,6 +335,10 @@ struct StorageOwnerThread {
   // QP instead of pinning a low worker count to a strict subset of the lanes.
   u32 next_peer_data_qp_ticket{};
   size_t scratch_stride{};
+  bool exact_rdma_timing_active{};
+  u32 exact_rdma_timing_coroutine{};
+  u64 exact_rdma_wait_ns{};
+  std::chrono::steady_clock::time_point exact_rdma_wave_started{};
 };
 
 using FreshnessEntry =

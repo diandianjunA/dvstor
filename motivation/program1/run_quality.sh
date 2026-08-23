@@ -50,4 +50,4 @@ if [[ -f "$RUN_ROOT/manifest.tsv" ]]; then
   printf 'quality\t%s\n' "$report" >> "$RUN_ROOT/manifest.tsv"
 fi
 echo "quality report: $report"
-echo "汇总与画图：python3 $PROGRAM_DIR/summarize_program1.py $RUN_ROOT"
+echo "画图：python3 $PROGRAM_DIR/plot_program1.py $RUN_ROOT"

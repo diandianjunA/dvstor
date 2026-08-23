@@ -1647,6 +1647,12 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   const uint64_t exact_remote_dependency_ns =
     maintenance_summary.exact_insert_remote_read_ns +
     maintenance_summary.exact_insert_remote_reverse_ns;
+  const uint64_t exact_rdma_wait_ns =
+    maintenance_summary.exact_insert_rdma_wait_ns;
+  const uint64_t exact_cpu_and_local_ns =
+    maintenance_summary.exact_insert_total_ns >= exact_rdma_wait_ns
+      ? maintenance_summary.exact_insert_total_ns - exact_rdma_wait_ns
+      : 0;
   const uint64_t exact_local_ns =
     maintenance_summary.exact_insert_total_ns >= exact_remote_dependency_ns
       ? maintenance_summary.exact_insert_total_ns - exact_remote_dependency_ns
@@ -1673,6 +1679,16 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"remote_reverse_ns",
      maintenance_summary.exact_insert_remote_reverse_ns},
     {"remote_dependency_ns", exact_remote_dependency_ns},
+    {"rdma_wait_ns", exact_rdma_wait_ns},
+    {"cpu_and_local_ns", exact_cpu_and_local_ns},
+    {"rdma_wait_ratio",
+     maintenance_summary.exact_insert_total_ns == 0 ? 0.0 :
+       static_cast<double>(exact_rdma_wait_ns) /
+       static_cast<double>(maintenance_summary.exact_insert_total_ns)},
+    {"avg_rdma_wait_us",
+     maintenance_summary.exact_insert_items == 0 ? 0.0 :
+       static_cast<double>(exact_rdma_wait_ns) /
+       static_cast<double>(maintenance_summary.exact_insert_items) / 1e3},
     {"local_and_protocol_ns", exact_local_ns},
     {"remote_dependency_ratio",
      maintenance_summary.exact_insert_total_ns == 0 ? 0.0 :

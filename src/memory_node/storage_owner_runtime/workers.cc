@@ -102,6 +102,11 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
                  "compute/memory-node completion modes do not match");
     }
   }
+  if (synchronous_exact) {
+    lib_assert(current_storage_owner_thread_ != nullptr,
+               "exact insert has no storage-owner execution thread");
+    current_storage_owner_thread_->begin_exact_rdma_timing();
+  }
   const bool ok = synchronous_exact
     ? execute_storage_owner_batch_items_exact(
         ids,
@@ -131,6 +136,11 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
         &scratch.statuses,
         &scratch.results,
         emit_completion);
+
+  if (synchronous_exact) {
+    exact_phases.rdma_wait_ns +=
+      current_storage_owner_thread_->finish_exact_rdma_timing();
+  }
 
   if (synchronous_exact) {
     const u64 exact_total_ns = static_cast<u64>(
@@ -168,6 +178,8 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
     exact_insert_final_candidate_snapshot_ns_.fetch_add(
       exact_phases.final_candidate_snapshot_ns,
       std::memory_order_relaxed);
+    exact_insert_rdma_wait_ns_.fetch_add(
+      exact_phases.rdma_wait_ns, std::memory_order_relaxed);
 
     // The completion callback above has already emitted client-visible ACKs.
     // Serializing this cold publication cannot inflate the measured path.
@@ -206,6 +218,8 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
         .exact_insert_final_candidate_snapshot_ns =
           exact_insert_final_candidate_snapshot_ns_.load(
             std::memory_order_relaxed),
+        .exact_insert_rdma_wait_ns = exact_insert_rdma_wait_ns_.load(
+          std::memory_order_relaxed),
       });
   }
 

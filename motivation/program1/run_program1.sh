@@ -8,6 +8,7 @@ PROFILE="${PROFILE:-04_gpu_persistent_gpunetio_baseline}"
 WARMUP_OPS="${WARMUP_OPS:-128}"
 MEASURE_OPS="${MEASURE_OPS:-1000}"
 CLIENT_THREADS="${CLIENT_THREADS:-16}"
+BASELINE_ONLY="${BASELINE_ONLY:-0}"
 RUN_ROOT="${RUN_ROOT:-$PROGRAM_DIR/results/program1_$(date +%Y%m%d_%H%M%S)}"
 
 mkdir -p "$RUN_ROOT"
@@ -45,10 +46,30 @@ run_case() {
     "$EXPERIMENT_DIR/run_breakdown.sh" "$PROFILE" 2>&1 | tee "$report_dir/driver.log"
   report="$(find "$report_dir" -type f -name 'sift100m_*.json' -print -quit)"
   [[ -n "$report" ]] || { echo "missing report for $case_name" >&2; exit 1; }
+  if [[ "$case_name" == baseline ]]; then
+    python3 - "$report" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    critical = json.load(stream).get("coupled_insert_critical_path", {})
+if "rdma_wait_ns" not in critical:
+    raise SystemExit("baseline report is missing the new rdma_wait_ns counter")
+if critical["rdma_wait_ns"] > critical.get("total_ns", 0):
+    raise SystemExit("baseline rdma_wait_ns exceeds total_ns")
+print("exact RDMA timing present: "
+      f"{critical['rdma_wait_ns']/1e6:.3f} ms total, "
+      f"ratio={critical.get('rdma_wait_ratio', 0):.3f}")
+PY
+  fi
   printf '%s\t%s\n' "$case_name" "$report" >> "$RUN_ROOT/manifest.tsv"
 }
 
 run_case baseline coupled
+if [[ "$BASELINE_ONLY" == 1 ]]; then
+  python3 "$PROGRAM_DIR/plot_program1.py" "$RUN_ROOT"
+  echo "baseline-only RDMA timing complete: $RUN_ROOT"
+  exit 0
+fi
 run_case solution decoupled
 
 echo

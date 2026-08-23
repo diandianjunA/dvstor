@@ -898,6 +898,10 @@ private:
     u64 stage1_local_search_ns{};
     u64 stage2_global_continuation_ns{};
     u64 final_candidate_snapshot_ns{};
+    // Non-overlapping foreground intervals from RDMA submission/credit
+    // acquisition through observed completion. Local parsing/scoring after a
+    // CQE is deliberately excluded.
+    u64 rdma_wait_ns{};
   };
   bool execute_storage_owner_batch_items_exact(
       const node_t* ids,
@@ -1520,6 +1524,7 @@ private:
   std::atomic<u64> exact_insert_stage1_local_search_ns_{0};
   std::atomic<u64> exact_insert_stage2_global_continuation_ns_{0};
   std::atomic<u64> exact_insert_final_candidate_snapshot_ns_{0};
+  std::atomic<u64> exact_insert_rdma_wait_ns_{0};
   std::mutex exact_insert_telemetry_mutex_;
   std::unique_ptr<bounded::SlidingCompletionRing>
     storage_owner_maintenance_completion_ring_;

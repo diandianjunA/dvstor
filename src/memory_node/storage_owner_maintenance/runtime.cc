@@ -58,6 +58,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       0, std::memory_order_relaxed);
     exact_insert_final_candidate_snapshot_ns_.store(
       0, std::memory_order_relaxed);
+    exact_insert_rdma_wait_ns_.store(0, std::memory_order_relaxed);
     gpu_search::maintenance_telemetry::publish(
       reinterpret_cast<byte_t*>(control),
       gpu_search::maintenance_telemetry::Snapshot{
