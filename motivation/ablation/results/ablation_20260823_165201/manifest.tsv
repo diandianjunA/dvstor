@@ -1,0 +1,2 @@
+case	code	profile	update_mode	access_mode	progression_mode	report
+baseline	000	04_gpu_persistent_gpunetio_baseline	coupled	fixed	manual	/home/xjs/experiment/dvstor/motivation/ablation/results/ablation_20260823_165201/baseline/04_gpu_persistent_gpunetio_baseline/sift100m_04_gpu_persistent_gpunetio_baseline_20260823_165225.json

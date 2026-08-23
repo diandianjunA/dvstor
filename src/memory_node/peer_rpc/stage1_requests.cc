@@ -484,47 +484,57 @@ MemoryNode::prepare_local_stage1_item(
   decode_storage_vector_to_float(
     raw_vector, VamanaNode::vector_dtype(), VamanaNode::DIM,
     components.data());
-  const vec<RemotePtr> entries = local_centroid_route_entries();
-  if (entries.empty()) {
-    static std::atomic<u64> empty_route_failures{0};
-    const u64 failure = empty_route_failures.fetch_add(
-      1, std::memory_order_relaxed) + 1;
-    if (failure <= 16 || (failure & (failure - 1)) == 0) {
-      std::cerr << "[storage-owner] Stage1 prepare rejected: no live local "
-                   "centroid route entry"
-                << " id=" << item.id
-                << " generation=" << item.generation
-                << " count=" << failure << '\n';
-    }
-    result.status = static_cast<u32>(MutationStatus::failed);
-    seal_failed_reservation();
-    record_physical_stage1(0, 0, 0);
-    return result;
-  }
-
   vec<BeamEntry> stage1_beam;
   vec<RemotePtr> remote_frontier;
-  const auto search_started = std::chrono::steady_clock::now();
-  vec<RemotePtr> candidates = partition_local_search_candidates(
-    span<const element_t>{components}, entries, config, breakdown,
-    raw_vector, &stage1_beam, &remote_frontier);
-  physical_search_ns = elapsed_ns_since(search_started);
-  if (breakdown != nullptr) {
-    breakdown->storage_owner_search_ns += physical_search_ns;
-  }
   hashset_t<RemotePtr> skip;
   if (kind == MutationKind::upsert && item.old_raw != 0) {
     // The previous generation is tombstoned before authority commit. It must
     // not become a provisional backlink target for its replacement.
     skip.insert(RemotePtr{item.old_raw});
   }
-  const auto prune_started = std::chrono::steady_clock::now();
-  vec<RemotePtr> neighbors = robust_prune_cpu(
-    raw_vector, VamanaNode::vector_dtype(), candidates, skip, config,
-    breakdown, config.R);
-  physical_prune_ns = elapsed_ns_since(prune_started);
-  if (breakdown != nullptr) {
-    breakdown->storage_owner_prune_ns += physical_prune_ns;
+  vec<RemotePtr> candidates;
+  vec<RemotePtr> neighbors;
+  const auto refresh_stage1_candidates = [&]() {
+    const vec<RemotePtr> entries = local_centroid_route_entries();
+    if (entries.empty()) {
+      candidates.clear();
+      neighbors.clear();
+      stage1_beam.clear();
+      remote_frontier.clear();
+      return false;
+    }
+    const auto search_started = std::chrono::steady_clock::now();
+    candidates = partition_local_search_candidates(
+      span<const element_t>{components}, entries, config, breakdown,
+      raw_vector, &stage1_beam, &remote_frontier);
+    const u64 search_ns = elapsed_ns_since(search_started);
+    physical_search_ns += search_ns;
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_ns += search_ns;
+    }
+    const auto prune_started = std::chrono::steady_clock::now();
+    neighbors = robust_prune_cpu(
+      raw_vector, VamanaNode::vector_dtype(), candidates, skip, config,
+      breakdown, config.R);
+    const u64 prune_ns = elapsed_ns_since(prune_started);
+    physical_prune_ns += prune_ns;
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_prune_ns += prune_ns;
+    }
+    return !neighbors.empty();
+  };
+
+  while (!refresh_stage1_candidates()) {
+    if (storage_insert_shutdown_.load(std::memory_order_acquire) ||
+        storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
+      result.status = static_cast<u32>(MutationStatus::failed);
+      seal_failed_reservation();
+      record_physical_stage1(0, 0, 0);
+      return result;
+    }
+    std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+    storage_owner_maintenance_cv_.wait_for(
+      lock, std::chrono::microseconds(100));
   }
   const auto allocate_started = std::chrono::steady_clock::now();
   const RemotePtr target = allocate_local_node();
@@ -540,35 +550,65 @@ MemoryNode::prepare_local_stage1_item(
   if (breakdown != nullptr) {
     breakdown->storage_owner_write_node_ns += elapsed_ns_since(write_started);
   }
-  const auto backlink_started = std::chrono::steady_clock::now();
-  vec<RemotePtr> backlink_targets = install_local_provisional_backlinks(
-    target, span<const RemotePtr>{neighbors});
-  physical_backlink_ns = elapsed_ns_since(backlink_started);
-  if (backlink_targets.empty()) {
-    static std::atomic<u64> bridge_failures{0};
-    const u64 failure = bridge_failures.fetch_add(
-      1, std::memory_order_relaxed) + 1;
-    if (failure <= 16 || (failure & (failure - 1)) == 0) {
-      std::cerr << "[storage-owner] Stage1 prepare rejected: no provisional "
-                   "reachability bridge"
+  vec<RemotePtr> backlink_targets;
+  u64 bridge_refreshes = 0;
+  for (;;) {
+    const auto backlink_started = std::chrono::steady_clock::now();
+    backlink_targets = install_local_provisional_backlinks(
+      target, span<const RemotePtr>{neighbors});
+    physical_backlink_ns += elapsed_ns_since(backlink_started);
+    if (!backlink_targets.empty()) break;
+
+    // Search/prune observes an unlocked graph snapshot. Under a high-rate GPU
+    // query/update workload, every selected parent can retire or change
+    // incarnation before the provisional reachability certificate is
+    // installed. That is snapshot invalidation, not a permanent mutation
+    // failure. Refresh the candidates and rewrite the still-private
+    // provisional node's outgoing graph before trying a new parent set.
+    ++bridge_refreshes;
+    if (bridge_refreshes <= 8 ||
+        (bridge_refreshes & (bridge_refreshes - 1)) == 0) {
+      std::cerr << "[storage-owner] Stage1 reachability snapshot invalidated; "
+                   "refreshing candidates"
                 << " id=" << item.id
                 << " generation=" << item.generation
                 << " candidate_count=" << candidates.size()
                 << " neighbor_count=" << neighbors.size()
-                << " count=" << failure << '\n';
+                << " refresh=" << bridge_refreshes << '\n';
     }
-    const u64 retirement_sequence =
-      begin_storage_owner_maintenance_sequence(1);
-    (void)mark_node_deleted(target, item.generation);
-    retire_local_dynamic_node(target, retirement_sequence);
-    complete_storage_owner_maintenance_sequence(retirement_sequence);
-    result.status = static_cast<u32>(MutationStatus::failed);
-    seal_failed_reservation();
-    record_physical_stage1(
-      candidates.size(), remote_frontier.size(), neighbors.size());
-    return result;
-  }
+    if (storage_insert_shutdown_.load(std::memory_order_acquire) ||
+        storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
+      const u64 retirement_sequence =
+        begin_storage_owner_maintenance_sequence(1);
+      (void)mark_node_deleted(target, item.generation);
+      retire_local_dynamic_node(target, retirement_sequence);
+      complete_storage_owner_maintenance_sequence(retirement_sequence);
+      result.status = static_cast<u32>(MutationStatus::failed);
+      seal_failed_reservation();
+      record_physical_stage1(
+        candidates.size(), remote_frontier.size(), neighbors.size());
+      return result;
+    }
 
+    {
+      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+      storage_owner_maintenance_cv_.wait_for(
+        lock, std::chrono::microseconds(100));
+    }
+    if (!refresh_stage1_candidates()) continue;
+
+    const authority::IncarnationLockResult target_lock =
+      try_lock_node(target);
+    if (target_lock == authority::IncarnationLockResult::busy) continue;
+    lib_assert(target_lock == authority::IncarnationLockResult::locked,
+               "private Stage1 node became stale before authority commit");
+    const u64 target_header = load_local_node_header_acquire(target);
+    lib_assert((target_header & VamanaNode::HEADER_PROVISIONAL) != 0,
+               "private Stage1 retry lost its provisional state");
+    write_graph_adjacency(
+      target, neighbors, {}, item.generation, false);
+    unlock_node(target);
+  }
   result.target_raw = target.raw_address;
   result.status = static_cast<u32>(MutationStatus::ok);
   const size_t physical_candidate_count = candidates.size();
