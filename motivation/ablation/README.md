@@ -7,8 +7,12 @@ SIFT100M profile：
 |---|---:|---|---|---|
 | `baseline` | 000 | 关 | 关 | 关 |
 | `program1` | 100 | 开 | 关 | 关 |
-| `program2` | 110 | 开 | 开 | 关 |
+| `program3` | 101 | 开 | 关 | 开 |
 | `full` | 111 | 开 | 开 | 开 |
+
+Baseline 也是 Persistent GPU + GPUNetIO，只关闭方案三的 early/ahead-of-commit
+progression；HostOrchestrated CPU-posted 模式不参与贡献消融。累积顺序为
+`Baseline → +P1 → +P3 → +P2 (Full)`，让方案二在高性能 GPU 查询路径上体现收益。
 
 `full` 直接使用 `04_gpu_persistent_gpunetio` 正式 profile；默认 warmup 15 秒、测量
 120 秒、50% 查询线程和 50% 插入线程、自动 512 并发，与指定的主实验报告一致。
@@ -30,7 +34,7 @@ cd /home/xjs/experiment/dvstor
 ```
 
 看到 `storage ready` 后回到计算节点按 Enter。随后依次按提示启动 `program1`、
-`program2` 和 `full`。存储脚本会停止上一组存储进程，再从同一静态索引重新启动，
+`program3` 和 `full`。存储脚本会停止上一组存储进程，再从同一静态索引重新启动，
 避免前一组动态更新污染下一组。
 
 结果写入 `motivation/ablation/results/ablation_时间戳/`，包括原始 JSON/TXT、
@@ -40,7 +44,7 @@ cd /home/xjs/experiment/dvstor
 
 ```bash
 RUN_ROOT=/home/xjs/experiment/dvstor/motivation/ablation/results/ablation_YYYYmmdd_HHMMSS \
-  ./motivation/ablation/run_ablation.sh program2
+  ./motivation/ablation/run_ablation.sh program3
 ```
 
 四组完成后重新汇总：

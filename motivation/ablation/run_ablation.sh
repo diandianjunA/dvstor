@@ -31,21 +31,22 @@ case_config() {
       CASE_PROFILE=04_gpu_persistent_gpunetio_baseline
       CASE_UPDATE=coupled
       CASE_ACCESS=fixed
-      CASE_PROGRESSION=coupled
+      # GPU-centric common substrate, with Program 3's early progression off.
+      CASE_PROGRESSION=manual
       ;;
     program1)
       CASE_CODE=100
       CASE_PROFILE=04_gpu_persistent_gpunetio_baseline
       CASE_UPDATE=decoupled
       CASE_ACCESS=fixed
-      CASE_PROGRESSION=coupled
+      CASE_PROGRESSION=manual
       ;;
-    program2)
-      CASE_CODE=110
+    program3)
+      CASE_CODE=101
       CASE_PROFILE=04_gpu_persistent_gpunetio_baseline
       CASE_UPDATE=decoupled
-      CASE_ACCESS=adaptive
-      CASE_PROGRESSION=coupled
+      CASE_ACCESS=fixed
+      CASE_PROGRESSION=decoupled
       ;;
     full)
       CASE_CODE=111
@@ -149,6 +150,14 @@ if any(float(meta.get(key, -1)) != value for key, value in (
     errors.append("write mix is not append-only 1/0/0")
 if code == "111" and system.get("profile_name") != "04_gpu_persistent_gpunetio":
     errors.append("111 is not using the formal full profile")
+if progression == "manual":
+    if int(meta.get("gpu_graph_commit_width", 0)) != 16 or \
+       int(meta.get("gpu_graph_issue_width", 0)) != 16:
+        errors.append("GPU-centric late baseline requires commit/issue=16/16")
+    if meta.get("gpu_query_beam_merge_policy") != "stable-run":
+        errors.append("GPU-centric late baseline requires Stable-Run")
+    if bool(meta.get("gpu_exact_frontier_early_issue", False)):
+        errors.append("GPU-centric late baseline unexpectedly enabled early issue")
 if errors:
     raise SystemExit(case_name + ": invalid ablation report:\n  - " +
                      "\n  - ".join(errors))
@@ -177,6 +186,9 @@ run_case() {
   GPU_DYNAMIC_GRAPH_ACCESS_MODE="$CASE_ACCESS" \
   GPU_RDMA_SEARCH_PROGRESSION_MODE="$CASE_PROGRESSION" \
   GPU_EXACT_FRONTIER_EARLY_ISSUE=false \
+  GPU_GRAPH_COMMIT_WIDTH=16 \
+  GPU_GRAPH_ISSUE_WIDTH=16 \
+  GPU_QUERY_BEAM_MERGE_POLICY=stable-run \
   ENABLE_BREAKDOWN=false \
   WORKLOAD=mixed \
   MIXED_MODE=fixed_threads \
@@ -209,6 +221,20 @@ run_case() {
   record_case "$case_name" "$report"
 }
 
+run_or_reuse_case() {
+  local case_name="$1"
+  case_config "$case_name"
+  local existing
+  existing="$(awk -F '\t' -v name="$case_name" \
+    '$1 == name && $7 != "" { print $7; exit }' "$MANIFEST")"
+  if [[ -n "$existing" && -f "$existing" ]]; then
+    validate_report "$case_name" "$existing"
+    echo "[ablation] 复用已完成 case=$case_name report=$existing"
+    return
+  fi
+  run_case "$case_name"
+}
+
 summarize() {
   local args=("$RUN_ROOT")
   [[ ! -f "$REFERENCE_REPORT" ]] || args+=("$REFERENCE_REPORT")
@@ -220,20 +246,20 @@ summarize() {
 
 case "$ACTION" in
   all)
-    run_case baseline
-    run_case program1
-    run_case program2
-    run_case full
+    run_or_reuse_case baseline
+    run_or_reuse_case program1
+    run_or_reuse_case program3
+    run_or_reuse_case full
     summarize
     ;;
-  baseline|program1|program2|full)
+  baseline|program1|program3|full)
     run_case "$ACTION"
     ;;
   summarize)
     summarize
     ;;
   *)
-    echo "usage: $0 [all|baseline|program1|program2|full|summarize]" >&2
+    echo "usage: $0 [all|baseline|program1|program3|full|summarize]" >&2
     exit 2
     ;;
 esac

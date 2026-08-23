@@ -295,8 +295,22 @@ void HostOrchestratedSearchEngine::Impl::fetch_graph_wave(
   engine.telemetry_.critical_misses.fetch_add(
     reads.size(), std::memory_order_relaxed);
 
+  // A checksum failure is normally a read racing a whole-record graph
+  // publication, not persistent corruption.  Under the coupled baseline,
+  // hundreds of host query lanes can repeatedly hit the same centroid-near
+  // parents while backlink writers update them.  Three back-to-back reads
+  // were too small a contention budget and made one ordinary race terminate
+  // an otherwise healthy long benchmark.  Match the persistent reader's
+  // accounting rule (an optimistic short extent is outside the authoritative
+  // full-record budget) and give the CPU-posted path enough bounded full
+  // rereads to outlive a hot publication window.  The final invalid full
+  // snapshot still fails loudly, so durable corruption is never accepted.
+  constexpr u32 kFullGraphSnapshotAttempts = 8;
+  const u32 maximum_batch_attempts =
+    adaptive ? kFullGraphSnapshotAttempts + 1u
+             : kFullGraphSnapshotAttempts;
   u64 validation_ns = 0;
-  for (u32 attempt = 0; attempt < 3; ++attempt) {
+  for (u32 attempt = 0; attempt < maximum_batch_attempts; ++attempt) {
     const auto validation_started = Clock::now();
     std::vector<ReadRequest> retry;
     for (size_t item = 0; item < wave.size(); ++item) {
@@ -352,9 +366,14 @@ void HostOrchestratedSearchEngine::Impl::fetch_graph_wave(
         state.active = false;
         continue;
       }
-      if (attempt == 2) {
+      const bool attempts_remain =
+        graph_record_validation::snapshot_retry_available(
+          attempt, state.started_partial, state.partial,
+          maximum_batch_attempts, kFullGraphSnapshotAttempts);
+      if (!attempts_remain) {
         throw std::runtime_error(
-          "host query graph snapshot validation failed");
+          "host query graph snapshot validation failed after bounded "
+          "full-record rereads");
       }
       if (state.partial) {
         engine.telemetry_.graph_extent_fallback_reads.fetch_add(

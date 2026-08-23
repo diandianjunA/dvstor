@@ -17,7 +17,7 @@ with summary_path.open(encoding="utf-8") as stream:
     summary = json.load(stream)
 
 rows = summary["rows"]
-labels = ["Baseline", "+ P1", "+ P2", "+ P3 (Full)"]
+labels = ["Baseline", "+ P1", "+ P3", "+ P2 (Full)"]
 reference = summary.get("reference")
 
 canvas_width = 920

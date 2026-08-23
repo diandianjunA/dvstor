@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="350" viewBox="0 0 920 350">
+<rect width="100%" height="100%" fill="white"/>
+<style>text{font-family:DejaVu Sans,Arial,sans-serif;fill:#27323A}.tick{font-size:11px}.value{font-size:11px}.title{font-size:13px}.axis-label{font-size:12px}</style>
+<text class="title" x="245.0" y="20" text-anchor="middle">(a) Query</text>
+<line x1="80" y1="286.00" x2="410" y2="286.00" stroke="#D8DDE1" stroke-width="0.8"/>
+<text class="tick" x="72" y="290.00" text-anchor="end">0</text>
+<line x1="80" y1="226.00" x2="410" y2="226.00" stroke="#D8DDE1" stroke-width="0.8"/>
+<text class="tick" x="72" y="230.00" text-anchor="end">20,000</text>
+<line x1="80" y1="166.00" x2="410" y2="166.00" stroke="#D8DDE1" stroke-width="0.8"/>
+<text class="tick" x="72" y="170.00" text-anchor="end">40,000</text>
+<line x1="80" y1="106.00" x2="410" y2="106.00" stroke="#D8DDE1" stroke-width="0.8"/>
+<text class="tick" x="72" y="110.00" text-anchor="end">60,000</text>
+<line x1="80" y1="46.00" x2="410" y2="46.00" stroke="#D8DDE1" stroke-width="0.8"/>
+<text class="tick" x="72" y="50.00" text-anchor="end">80,000</text>
+<line x1="80" y1="46" x2="80" y2="286" stroke="#34424B" stroke-width="1"/>
+<line x1="80" y1="286" x2="410" y2="286" stroke="#34424B" stroke-width="1"/>
+<line x1="80" y1="77.38" x2="410" y2="77.38" stroke="#7E8A92" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text class="tick" x="408" y="72.38" text-anchor="end">Published full</text>
+<rect x="107.00" y="280.08" width="42" height="5.92" fill="#A9CFE5" stroke="#65727A" stroke-width="0.8"/>
+<text class="value" x="128.00" y="274.08" text-anchor="middle">1,974</text>
+<text class="tick" x="128.00" y="305" text-anchor="middle">Baseline</text>
+<rect x="185.00" y="279.63" width="42" height="6.37" fill="#A9CFE5" stroke="#65727A" stroke-width="0.8"/>
+<text class="value" x="206.00" y="273.63" text-anchor="middle">2,124</text>
+<text class="tick" x="206.00" y="305" text-anchor="middle">+ P1</text>
+<rect x="263.00" y="279.51" width="42" height="6.49" fill="#A9CFE5" stroke="#65727A" stroke-width="0.8"/>
+<text class="value" x="284.00" y="273.51" text-anchor="middle">2,163</text>
+<text class="tick" x="284.00" y="305" text-anchor="middle">+ P2</text>
+<rect x="341.00" y="78.33" width="42" height="207.67" fill="#A9CFE5" stroke="#65727A" stroke-width="0.8"/>
+<text class="value" x="362.00" y="72.33" text-anchor="middle">69,223</text>
+<text class="tick" x="362.00" y="305" text-anchor="middle">+ P3 (Full)</text>
+<text class="axis-label" x="22" y="166.0" text-anchor="middle" transform="rotate(-90 22 166.0)">Query throughput (QPS)</text>
+<text class="title" x="700.0" y="20" text-anchor="middle">(b) Insert</text>
+<line x1="535" y1="286.00" x2="865" y2="286.00" stroke="#D8DDE1" stroke-width="0.8"/>
+<text class="tick" x="527" y="290.00" text-anchor="end">0</text>
+<line x1="535" y1="226.00" x2="865" y2="226.00" stroke="#D8DDE1" stroke-width="0.8"/>
+<text class="tick" x="527" y="230.00" text-anchor="end">875</text>
+<line x1="535" y1="166.00" x2="865" y2="166.00" stroke="#D8DDE1" stroke-width="0.8"/>
+<text class="tick" x="527" y="170.00" text-anchor="end">1,750</text>
+<line x1="535" y1="106.00" x2="865" y2="106.00" stroke="#D8DDE1" stroke-width="0.8"/>
+<text class="tick" x="527" y="110.00" text-anchor="end">2,625</text>
+<line x1="535" y1="46.00" x2="865" y2="46.00" stroke="#D8DDE1" stroke-width="0.8"/>
+<text class="tick" x="527" y="50.00" text-anchor="end">3,500</text>
+<line x1="535" y1="46" x2="535" y2="286" stroke="#34424B" stroke-width="1"/>
+<line x1="535" y1="286" x2="865" y2="286" stroke="#34424B" stroke-width="1"/>
+<line x1="535" y1="99.24" x2="865" y2="99.24" stroke="#7E8A92" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text class="tick" x="863" y="94.24" text-anchor="end">Published full</text>
+<rect x="562.00" y="259.12" width="42" height="26.88" fill="#F3C59D" stroke="#65727A" stroke-width="0.8"/>
+<text class="value" x="583.00" y="253.12" text-anchor="middle">392</text>
+<text class="tick" x="583.00" y="305" text-anchor="middle">Baseline</text>
+<rect x="640.00" y="93.91" width="42" height="192.09" fill="#F3C59D" stroke="#65727A" stroke-width="0.8"/>
+<text class="value" x="661.00" y="87.91" text-anchor="middle">2,801</text>
+<text class="tick" x="661.00" y="305" text-anchor="middle">+ P1</text>
+<rect x="718.00" y="94.15" width="42" height="191.85" fill="#F3C59D" stroke="#65727A" stroke-width="0.8"/>
+<text class="value" x="739.00" y="88.15" text-anchor="middle">2,798</text>
+<text class="tick" x="739.00" y="305" text-anchor="middle">+ P2</text>
+<rect x="796.00" y="100.57" width="42" height="185.43" fill="#F3C59D" stroke="#65727A" stroke-width="0.8"/>
+<text class="value" x="817.00" y="94.57" text-anchor="middle">2,704</text>
+<text class="tick" x="817.00" y="305" text-anchor="middle">+ P3 (Full)</text>
+<text class="axis-label" x="477" y="166.0" text-anchor="middle" transform="rotate(-90 477 166.0)">Insert throughput (QPS)</text>
+</svg>

@@ -346,13 +346,14 @@ vec<RemotePtr> MemoryNode::install_local_provisional_backlinks(
   }
 
   // A fresh insert cannot be reported as a permanent mutation failure merely
-  // because maintenance held every eligible parent lock during one bounded
-  // try_lock sweep.  That became observable once Stage2 was made
-  // work-conserving: foreground Stage1 and maintenance now intentionally
-  // overlap on the same graph.  Keep retrying only while at least one target
-  // is still the same live incarnation but busy.  A sweep containing no busy
-  // target is terminal (all candidates are stale, quiesced, remote, deleted,
-  // or out of protected slots), so this does not spin on an impossible graph.
+  // because maintenance held every eligible parent lock or all eligible
+  // parents temporarily used their bounded provisional slots.  Stage2 frees
+  // those slots when it promotes/removes the corresponding reachability
+  // bridges, so both conditions are ordinary backpressure.  Keep retrying
+  // while at least one live target is busy or capacity-blocked.  A sweep with
+  // neither remains terminal (all candidates are stale, remote, deleted, or
+  // otherwise permanently ineligible), so this cannot spin on an impossible
+  // graph.
   const auto try_install = [&](const RemotePtr target) {
       using InstallDisposition =
         memory_node_storage_owner_index_detail::
@@ -391,7 +392,7 @@ vec<RemotePtr> MemoryNode::install_local_provisional_backlinks(
       if (adjacency.provisional.size() >=
           VamanaNode::provisional_slots()) {
         unlock_node(target);
-        return InstallDisposition::rejected;
+        return InstallDisposition::busy;
       }
 
       adjacency.provisional.push_back(candidate);
@@ -407,8 +408,12 @@ vec<RemotePtr> MemoryNode::install_local_provisional_backlinks(
       if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
         return false;
       }
-      std::this_thread::yield();
-      return true;
+      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+      storage_owner_maintenance_cv_.wait_for(
+        lock, std::chrono::microseconds(100));
+      return !storage_insert_shutdown_.load(std::memory_order_acquire) &&
+        !storage_owner_maintenance_shutdown_.load(
+          std::memory_order_acquire);
     });
 }
 

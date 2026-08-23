@@ -16,18 +16,18 @@ manifest_path = root / "manifest.tsv"
 if not manifest_path.is_file():
     raise SystemExit(f"missing manifest: {manifest_path}")
 
-expected_order = ["baseline", "program1", "program2", "full"]
+expected_order = ["baseline", "program1", "program3", "full"]
 expected_modes = {
-    "baseline": ("coupled", "fixed", "coupled"),
-    "program1": ("decoupled", "fixed", "coupled"),
-    "program2": ("decoupled", "adaptive", "coupled"),
+    "baseline": ("coupled", "fixed", "manual"),
+    "program1": ("decoupled", "fixed", "manual"),
+    "program3": ("decoupled", "fixed", "decoupled"),
     "full": ("decoupled", "adaptive", "decoupled"),
 }
 display_names = {
     "baseline": "Baseline",
     "program1": "+ 方案一",
-    "program2": "+ 方案二",
-    "full": "+ 方案三（Full）",
+    "program3": "+ 方案三",
+    "full": "+ 方案二（Full）",
 }
 
 
@@ -79,6 +79,13 @@ for case_name in expected_order:
         raise SystemExit(
             f"{case_name}: modes {actual_modes!r}, expected "
             f"{expected_modes[case_name]!r}")
+    if actual_modes[2] == "manual":
+        if (int(meta.get("gpu_graph_commit_width", 0)) != 16 or
+                int(meta.get("gpu_graph_issue_width", 0)) != 16 or
+                meta.get("gpu_query_beam_merge_policy") != "stable-run" or
+                bool(meta.get("gpu_exact_frontier_early_issue", False))):
+            raise SystemExit(
+                f"{case_name}: invalid persistent-GPU late-issue baseline")
 
     index = system.get("index", {})
     concurrency = meta.get("benchmark_driver_concurrency", {})
@@ -212,9 +219,10 @@ lines = [
     "",
     "## 实验设计",
     "",
-    "本实验从三个机制均关闭的 Baseline 出发，依次开启方案一、方案二和方案三。"
+    "本实验从三个机制均关闭的 GPU-centric Baseline 出发，依次开启方案一、方案三和方案二。"
     "每个配置只运行一次；四组实验均从同一份静态索引重启，使用相同数据、硬件资源、"
-    "查询参数、客户端并发和 50% 读线程/50% 写线程的闭环混合负载。写操作均为 fresh "
+    "查询参数、Persistent GPU/GPUNetIO 查询底座、客户端并发和 50% 读线程/50% 写线程"
+    "的闭环混合负载。写操作均为 fresh "
     "insert，因此严格 coupled Baseline 与完整系统具有相同的有效操作语义。",
     "",
     "| 配置 | 编码 | 更新完成 | 动态邻接读取 | 查询推进 |",
@@ -227,7 +235,9 @@ for row in rows:
 
 lines += [
     "",
-    "编码 `100 → 110 → 111` 表示在上一配置上只增加一个方案。`111` 直接使用正式 "
+    "编码 `100 → 101 → 111` 表示在上一配置上依次只增加方案一、方案三和方案二。"
+    "方案三关闭时仍使用 Persistent GPU + GPUNetIO，只关闭 early/ahead-of-commit "
+    "progression，避免把 CPU→GPU 架构迁移错误计入方案三。`111` 直接使用正式 "
     "`04_gpu_persistent_gpunetio` profile，因此它就是当前全功能系统，而不是另行调参的配置。",
     "",
     "## 性能结果",
@@ -245,9 +255,10 @@ for row in rows:
 lines += [
     "",
     "图见 [ablation_performance.svg](ablation_performance.svg)。方案一带来的增量主要应"
-    "体现在插入完成吞吐和前台写延迟；方案二减少动态邻接表 RDMA 读取浪费；方案三"
-    "将严格波次的 CPU-posted 查询推进替换为 GPU 持有状态的流水推进，因此主要影响"
-    "查询吞吐。由于这是累积消融，每一行相对上一行的变化才是对应方案的边际收益。",
+    "体现在插入完成吞吐和前台写延迟；方案三在相同 GPU-centric 查询引擎内把下一轮"
+    "RDMA 从完整 Merge 之后提前到 exact prefix 就绪之后；最后开启方案二，减少动态"
+    "邻接表的 RDMA 读取字节。由于这是累积消融，每一行相对上一行的变化才是对应方案"
+    "的边际收益。",
     "",
     "## 完整性与质量",
     "",

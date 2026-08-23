@@ -13,21 +13,21 @@ case "${1:-}" in
     profile=04_gpu_persistent_gpunetio_baseline
     update_mode=coupled
     access_mode=fixed
-    progression_mode=coupled
+    progression_mode=manual
     ;;
   program1)
     case_name=program1
     profile=04_gpu_persistent_gpunetio_baseline
     update_mode=decoupled
     access_mode=fixed
-    progression_mode=coupled
+    progression_mode=manual
     ;;
-  program2)
-    case_name=program2
+  program3)
+    case_name=program3
     profile=04_gpu_persistent_gpunetio_baseline
     update_mode=decoupled
-    access_mode=adaptive
-    progression_mode=coupled
+    access_mode=fixed
+    progression_mode=decoupled
     ;;
   full)
     case_name=full
@@ -51,7 +51,7 @@ case "${1:-}" in
     exit 0
     ;;
   *)
-    echo "usage: $0 baseline|program1|program2|full|status|stop" >&2
+    echo "usage: $0 baseline|program1|program3|full|status|stop" >&2
     exit 2
     ;;
 esac
@@ -70,6 +70,9 @@ export GPU_RDMA_SEARCH_PROGRESSION_MODE="$progression_mode"
 # Clear any manual motivation-test residue. In formal decoupled mode the
 # complete progression bundle is selected by the top-level mode itself.
 export GPU_EXACT_FRONTIER_EARLY_ISSUE=false
+export GPU_GRAPH_COMMIT_WIDTH=16
+export GPU_GRAPH_ISSUE_WIDTH=16
+export GPU_QUERY_BEAM_MERGE_POLICY=stable-run
 export ENABLE_BREAKDOWN=false
 export LOG_DIR="${STORAGE_LOG_ROOT:-$PROGRAM_DIR/storage_logs}/$(date +%Y%m%d_%H%M%S)_$case_name"
 
