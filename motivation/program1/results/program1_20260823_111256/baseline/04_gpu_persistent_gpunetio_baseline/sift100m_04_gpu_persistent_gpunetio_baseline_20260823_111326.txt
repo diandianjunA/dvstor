@@ -16,13 +16,13 @@ query_inputs
   performance_row_reuse_policy: single_pass_no_reuse
   performance_warmup/measure/total_rows_consumed: 0/0/0
 throughput
-  duration_seconds: 2.90344
-  total_ops_per_sec: 344.419 (ops=1000)
+  duration_seconds: 2.96163
+  total_ops_per_sec: 337.652 (ops=1000)
   query_ops_per_sec: 0 (ops=0)
   effective_query_ops_per_sec: 0
-  write_ops_per_sec: 344.419 (ops=1000)
-  effective_write_ops_per_sec: 344.419
-  insert_ops_per_sec: 344.419 (ops=1000)
+  write_ops_per_sec: 337.652 (ops=1000)
+  effective_write_ops_per_sec: 337.652
+  insert_ops_per_sec: 337.652 (ops=1000)
   client_drain_seconds: 0
   scheduled_query/write_ops: 0/0
   query/write_rate_attainment_ratio: 1/1
@@ -75,6 +75,10 @@ gpu_persistent
   graph snapshot reread records total/per_query: 0/0
   graph RDMA bytes total/per_query/per_parent: 0/0/0
   graph live/full/fallback/underhint/promotions reads: 0/0/0/0/0
+  expanded parents/neighbor sum/average degree: 0/0/0
+  expanded degree histogram (ceil(degree/8), overflow=13): [0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+  dynamic expanded parents/neighbor sum/average degree/share: 0/0/0/0
+  dynamic expanded degree histogram (ceil(degree/8), overflow=13): [0,0,0,0,0,0,0,0,0,0,0,0,0,0]
   DynaExtent short/full/bytes/fallback/promotions/demotions: 0/0/0/0/0/0
   DynaExtent snapshot-attempts/nonfallback-full-attempts/short-physical-ratio/fallback-ratio/bytes-per-physical-read: 0/0/0/0/0
   ASFE logical expansions total/per_query: 0/0
@@ -102,11 +106,11 @@ gpu_persistent
   ASFE critical ROB hits/speculative wait ns/us_per_query: 0/0/0
   ASFE critical misses/ROB hit ratio: 0/0
   ASFE RDMA completion groups/avg us (critical/speculative): 0/0 (0/0)
-  GPU occupancy threads/registers/static_shared: 128/166/48992
+  GPU occupancy threads/registers/static_shared: 128/166/49136
   GPU occupancy active/effective blocks per SM: 3/3
   GPU persistent query/owner/total blocks: 256/40/298
-  centroid route publications/shard_updates/live/snapshot_skips: 434/852/20/3
-  centroid route probe_reads/body_reads/unchanged_polls/poll_us: 2700/857/103/4599
+  centroid route publications/shard_updates/live/snapshot_skips: 453/872/20/1
+  centroid route probe_reads/body_reads/unchanged_polls/poll_us: 2765/875/99/4611
   centroid route query snapshot retries/timeouts: 0/0
   GPU query/prepare/graph/score/beam/exact us: 0/0/0/0/0/0
   exact snapshot train batches/fallbacks/success ratio: 0/0/0
@@ -122,9 +126,9 @@ gpu_persistent
 storage_owner_runtime
   submitted/completed batches: 994/994
   submitted/completed items: 1000/1000
-  average batch / average RPC wall us / max RPC wall us: 1.00604/42.2904/10054.7
+  average batch / average RPC wall us / max RPC wall us: 1.00604/35.0719/6858.69
 insert breakdown
   count: 1000
-  latency_ms: mean=45.9687 p50=23.1109 p95=178.901 p99=272.48 p999=360.904
-  cpu_ms: 45968.7
+  latency_ms: mean=46.7596 p50=22.5187 p95=181.298 p99=296.841 p999=369.228
+  cpu_ms: 46759.6
   rdma_ms: 0

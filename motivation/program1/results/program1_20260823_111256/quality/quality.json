@@ -14,10 +14,10 @@
   },
   "insert": {
     "attempted": 1000,
-    "duration_seconds": 0.242857579,
+    "duration_seconds": 0.26175524,
     "failed": 0,
     "inserted": 1000,
-    "inserts_per_second": 4117.639664027121
+    "inserts_per_second": 3820.362870290581
   },
   "meta": {
     "baseline_groundtruth_file": "",
@@ -40,29 +40,29 @@
     "search": "gpu_persistent_opq_pq",
     "self_recall_k": 10,
     "self_recall_queries": 1000,
-    "service_config": "/home/xjs/experiment/dvstor/motivation/program1/results/program1_20260822_222429/quality/service.ini",
+    "service_config": "/home/xjs/experiment/dvstor/motivation/program1/results/program1_20260823_111256/quality/service.ini",
     "settle_seconds": 30,
     "storage_owner_maintenance_workers": 8,
     "storage_owner_update_protocol": "centroid_home_two_stage"
   },
   "self_recall_delta": {
-    "final_minus_stage1": 0.14100000000000001,
-    "stage1_final_result_overlap_at_k": 0.9701999999999966,
-    "stage1_minus_final": -0.14100000000000001
+    "final_minus_stage1": 0.135,
+    "stage1_final_result_overlap_at_k": 0.9725999999999964,
+    "stage1_minus_final": -0.135
   },
   "stage1_only_self_recall": {
-    "hit_rate": 0.859,
+    "hit_rate": 0.865,
     "k": 10,
     "queries": 1000
   },
   "stage1_only_window": {
     "configured_stage2_delay_seconds": 15.0,
-    "insert_plus_recall_seconds": 2.679740983,
+    "insert_plus_recall_seconds": 2.706176625,
     "valid": true
   },
   "stage2_finalization": {
     "complete": true,
-    "drain_seconds_after_settle": 0.000207579,
+    "drain_seconds_after_settle": 0.000270364,
     "durable_sequences": [
       196,
       204,

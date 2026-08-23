@@ -17,33 +17,53 @@ def esc(value):
     return html.escape(str(value))
 
 
-def write_svg(name, body, width=1050, height=420):
+def write_svg(name, body, width=1050, height=365):
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
 <style>
 text {{ font-family: Arial, "Noto Sans", sans-serif; fill: #222; }}
 .title {{ font-size: 18px; font-weight: 700; }}
-.label {{ font-size: 14px; }}
-.small {{ font-size: 12px; fill: #555; }}
-.value {{ font-size: 14px; font-weight: 700; }}
-.axis {{ stroke: #555; stroke-width: 1; }}
-.grid {{ stroke: #ddd; stroke-width: 1; }}
+.label {{ font-size: 12px; fill: #374151; }}
+.small {{ font-size: 11px; fill: #555; }}
+.value {{ font-size: 12px; font-weight: 700; fill: #25313b; }}
+.tick {{ font-size: 10px; fill: #4b5563; }}
+.axis-title {{ font-size: 11px; fill: #374151; }}
+.axis {{ stroke: #555; stroke-width: 1.1; }}
+.grid {{ stroke: #e5e7eb; stroke-width: 1; }}
 </style><rect width="100%" height="100%" fill="white"/>{body}</svg>'''
     (root / name).write_text(svg, encoding="utf-8")
     print(root / name)
 
 
-def vertical_bars(x0, title, labels, values, colors, unit, width=460):
-    maximum = max(values) * 1.15 or 1
-    spacing = width / len(values)
-    pieces = [f'<text class="title" x="{x0}" y="34">{esc(title)}</text>']
-    for index, (label, value, color) in enumerate(zip(labels, values, colors)):
-        x = x0 + 30 + index * spacing
-        height = 235 * value / maximum
-        y = 325 - height
+def vertical_bars(x0, title, ylabel, labels, values, colors,
+                  maximum, ticks, value_format, width=460):
+    plot_left = x0 + 62
+    plot_right = x0 + width - 12
+    plot_top, plot_bottom = 70, 295
+    plot_height = plot_bottom - plot_top
+    spacing = (plot_right - plot_left) / len(values)
+    bar_width = 56
+    pieces = [
+        f'<text class="title" x="{x0 + width/2:.1f}" y="34" text-anchor="middle">{esc(title)}</text>',
+    ]
+    for tick in ticks:
+        y = plot_bottom - plot_height * tick / maximum
         pieces += [
-            f'<rect x="{x:.1f}" y="{y:.1f}" width="92" height="{height:.1f}" fill="{color}"/>',
-            f'<text class="value" x="{x + 46:.1f}" y="{y - 8:.1f}" text-anchor="middle">{value:.1f}{esc(unit)}</text>',
-            f'<text class="label" x="{x + 46:.1f}" y="351" text-anchor="middle">{esc(label)}</text>',
+            f'<line class="grid" x1="{plot_left}" y1="{y:.2f}" x2="{plot_right}" y2="{y:.2f}"/>',
+            f'<text class="tick" x="{plot_left - 7}" y="{y + 4:.2f}" text-anchor="end">{esc(value_format(tick, True))}</text>',
+        ]
+    pieces += [
+        f'<line class="axis" x1="{plot_left}" y1="{plot_top}" x2="{plot_left}" y2="{plot_bottom}"/>',
+        f'<line class="axis" x1="{plot_left}" y1="{plot_bottom}" x2="{plot_right}" y2="{plot_bottom}"/>',
+        f'<text class="axis-title" x="{x0 + 16}" y="{(plot_top + plot_bottom)/2:.1f}" text-anchor="middle" transform="rotate(-90 {x0 + 16} {(plot_top + plot_bottom)/2:.1f})">{esc(ylabel)}</text>',
+    ]
+    for index, (label, value, color) in enumerate(zip(labels, values, colors)):
+        center = plot_left + spacing * (index + 0.5)
+        height = plot_height * value / maximum
+        y = plot_bottom - height
+        pieces += [
+            f'<rect x="{center - bar_width/2:.1f}" y="{y:.1f}" width="{bar_width}" height="{height:.1f}" fill="{color}" stroke="white" stroke-width="1"/>',
+            f'<text class="value" x="{center:.1f}" y="{max(plot_top + 12, y - 7):.1f}" text-anchor="middle">{esc(value_format(value, False))}</text>',
+            f'<text class="label" x="{center:.1f}" y="316" text-anchor="middle">{esc(label)}</text>',
         ]
     return "".join(pieces)
 
@@ -54,41 +74,44 @@ points, cumulative = [], 0
 for extent_class, count in enumerate(hist):
     cumulative += count
     x = 65 + min(extent_class * 8, 104) / 104 * 390
-    y = 325 - cumulative / total * 240
+    y = 295 - cumulative / total * 225
     points.append(f"{x:.1f},{y:.1f}")
 
 oracle_b = d["oracle"]["average_bytes_per_committed_dynamic_parent"]
 motivation = f'''
-<text class="title" x="30" y="34">(a) Dynamic-node live-degree CDF</text>
-<line class="axis" x1="65" y1="325" x2="455" y2="325"/><line class="axis" x1="65" y1="325" x2="65" y2="75"/>
-<line class="grid" x1="65" y1="205" x2="455" y2="205"/><line class="grid" x1="65" y1="85" x2="455" y2="85"/>
-<polyline points="{' '.join(points)}" fill="none" stroke="#377eb8" stroke-width="4"/>
-<text class="label" x="225" y="357">Live neighbors (8-neighbor buckets)</text>
-<text class="small" x="22" y="330">0%</text><text class="small" x="15" y="210">50%</text><text class="small" x="8" y="90">100%</text>
-<text class="value" x="92" y="120">Mean = {d['average_dynamic_degree']:.2f}</text>
-<text class="value" x="92" y="143">P50 ≤ {d['dynamic_degree_p50_upper_bound']}</text>
-<text class="value" x="92" y="166">P95 ≤ {d['dynamic_degree_p95_upper_bound']}</text>
+<text class="title" x="242" y="34" text-anchor="middle">(a) Distribution of valid neighbor counts</text>
+<line class="grid" x1="65" y1="295" x2="455" y2="295"/><line class="grid" x1="65" y1="182.5" x2="455" y2="182.5"/><line class="grid" x1="65" y1="70" x2="455" y2="70"/>
+<line class="axis" x1="65" y1="295" x2="455" y2="295"/><line class="axis" x1="65" y1="295" x2="65" y2="70"/>
+<polyline points="{' '.join(points)}" fill="none" stroke="#7faed0" stroke-width="3"/>
+<text class="axis-title" x="260" y="326" text-anchor="middle">Number of valid neighbors</text>
+<text class="axis-title" x="18" y="182.5" text-anchor="middle" transform="rotate(-90 18 182.5)">Cumulative query accesses (%)</text>
+<text class="tick" x="58" y="299" text-anchor="end">0</text><text class="tick" x="58" y="186.5" text-anchor="end">50</text><text class="tick" x="58" y="74" text-anchor="end">100</text>
+<text class="tick" x="65" y="311" text-anchor="middle">0</text><text class="tick" x="140" y="311" text-anchor="middle">20</text><text class="tick" x="215" y="311" text-anchor="middle">40</text><text class="tick" x="290" y="311" text-anchor="middle">60</text><text class="tick" x="365" y="311" text-anchor="middle">80</text><text class="tick" x="440" y="311" text-anchor="middle">100</text>
+<text class="value" x="91" y="102">Average = {d['average_dynamic_degree']:.2f} neighbors</text>
+<text class="value" x="91" y="123">50% of accesses ≤ {d['dynamic_degree_p50_upper_bound']} neighbors</text>
+<text class="value" x="91" y="144">95% of accesses ≤ {d['dynamic_degree_p95_upper_bound']} neighbors</text>
 '''
 motivation += vertical_bars(
-    540, "(b) Traditional reads vs ideal lower bound",
+    540, "(b) Traditional reads vs ideal lower bound", "Bytes per node",
     ["Fixed", "Header→N", "Oracle"], [832, oracle_b, oracle_b],
-    ["#7570b3", "#d95f02", "#999999"], " B")
-motivation += '''
-<text class="small" x="610" y="383">RDMA reads per node: Fixed 1 · Header→N 2 serial · Oracle 1</text>
-<text class="small" x="610" y="401">Oracle assumes free exact-length knowledge; it is not deployable.</text>
-'''
+    ["#b8c4d8", "#efc08d", "#d9dde3"], 900,
+    [0, 200, 400, 600, 800],
+    lambda value, tick: f"{value:g}" if tick else f"{value:.0f} B")
 write_svg("program2_motivation.svg", motivation)
 
 
 cases = d["cases"]
 fixed, header, live = cases["fixed"], cases["header"], cases["live"]
 effect = vertical_bars(
-    20, "(a) Dynamic mixed-workload query throughput",
+    20, "(a) Dynamic mixed-workload query throughput", "Query throughput (QPS)",
     ["Fixed", "Header→N", "ClassExtent"],
     [fixed["query_qps"], header["query_qps"], live["query_qps"]],
-    ["#7570b3", "#d95f02", "#1b9e77"], "", width=470)
+    ["#b8c4d8", "#efc08d", "#8fc9b5"], 80000,
+    [0, 20000, 40000, 60000, 80000],
+    lambda value, tick: f"{value/1000:.0f}k" if tick and value else
+      ("0" if tick else f"{value:,.0f}"), width=470)
 effect += vertical_bars(
-    555, "(b) Dynamic bytes per committed parent",
+    555, "(b) Dynamic bytes per committed parent", "Bytes per parent",
     ["Oracle", "Fixed", "Header→N", "ClassExtent"],
     [
         oracle_b,
@@ -96,9 +119,8 @@ effect += vertical_bars(
         header["dynamic_bytes_per_committed_parent"],
         live["dynamic_bytes_per_committed_parent"],
     ],
-    ["#999999", "#7570b3", "#d95f02", "#1b9e77"], " B", width=470)
-effect += f'''
-<text class="small" x="525" y="383" text-anchor="middle">fixed update target: {d['target_write_qps']:.0f} op/s · attained: {fixed['write_rate_attainment_ratio']:.3f}/{header['write_rate_attainment_ratio']:.3f}/{live['write_rate_attainment_ratio']:.3f}</text>
-<text class="small" x="525" y="402" text-anchor="middle">ClassExtent fallback: {100*live['fallback_ratio']:.3f}% · dynamic access share: {100*live['dynamic_expanded_parent_ratio']:.3f}% · Oracle has no QPS bar</text>
-'''
+    ["#d9dde3", "#b8c4d8", "#efc08d", "#8fc9b5"], 900,
+    [0, 200, 400, 600, 800],
+    lambda value, tick: f"{value:g}" if tick else f"{value:.0f} B",
+    width=470)
 write_svg("program2_effectiveness.svg", effect)

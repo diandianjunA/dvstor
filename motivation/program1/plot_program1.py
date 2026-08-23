@@ -221,5 +221,83 @@ svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{heigh
 '''
 combined = root / "program1_motivation.svg"
 combined.write_text(svg, encoding="utf-8")
+
+
+def evaluation_panel(index, title, ylabel, labels, values, colors,
+                     maximum, ticks, value_format):
+    panel_width = 330
+    x0 = 12 + index * panel_width
+    plot_left, plot_right = 58, 307
+    plot_top, plot_bottom = 64, 285
+    plot_height = plot_bottom - plot_top
+    bar_width = 58
+    centers = [135, 230]
+    pieces = [
+        f'<g transform="translate({x0},12)">',
+        f'<text class="eval-title" x="165" y="22" text-anchor="middle">{esc(title)}</text>',
+    ]
+    for tick in ticks:
+        y = plot_bottom - plot_height * tick / maximum
+        pieces += [
+            f'<line class="eval-grid" x1="{plot_left}" y1="{y:.2f}" x2="{plot_right}" y2="{y:.2f}"/>',
+            f'<text class="eval-tick" x="51" y="{y + 4:.2f}" text-anchor="end">{tick:g}</text>',
+        ]
+    pieces += [
+        f'<line class="eval-axis" x1="{plot_left}" y1="{plot_top}" x2="{plot_left}" y2="{plot_bottom}"/>',
+        f'<line class="eval-axis" x1="{plot_left}" y1="{plot_bottom}" x2="{plot_right}" y2="{plot_bottom}"/>',
+        f'<text class="eval-axis-title" x="15" y="{(plot_top + plot_bottom)/2:.1f}" text-anchor="middle" transform="rotate(-90 15 {(plot_top + plot_bottom)/2:.1f})">{esc(ylabel)}</text>',
+    ]
+    for center, label, value, color in zip(centers, labels, values, colors):
+        height = plot_height * value / maximum
+        y = plot_bottom - height
+        pieces += [
+            f'<rect x="{center - bar_width/2:.1f}" y="{y:.2f}" width="{bar_width}" height="{height:.2f}" fill="{color}" stroke="white" stroke-width="1"/>',
+            f'<text class="eval-value" x="{center}" y="{max(plot_top + 12, y - 7):.2f}" text-anchor="middle">{esc(value_format(value))}</text>',
+            f'<text class="eval-label" x="{center}" y="303" text-anchor="middle">{esc(label)}</text>',
+        ]
+    pieces.append('</g>')
+    return "\n".join(pieces)
+
+
+evaluation_panels = []
+evaluation_panels.append(evaluation_panel(
+    0, "(a) Update throughput", "Insert throughput (ops/s)",
+    ["Coupled", "Two-stage"],
+    [d["baseline_insert_qps"], d["solution_insert_qps"]],
+    ["#b8c4d8", "#8fc9b5"], 2500, [0, 500, 1000, 1500, 2000, 2500],
+    lambda value: f"{value:.0f}"))
+evaluation_panels.append(evaluation_panel(
+    1, "(b) Temporary self-hit@10", "Self-hit@10 (%)",
+    ["Stage1-only", "Stage2 final"],
+    [100 * d["stage1_only_self_hit_rate"],
+     100 * d["finalized_self_hit_rate"]],
+    ["#f2cf7d", "#8fc9b5"], 100, [0, 20, 40, 60, 80, 100],
+    lambda value: f"{value:.1f}%"))
+evaluation_panels.append(evaluation_panel(
+    2, "(c) Cross-shard edges", "Cross-shard edges (%)",
+    ["Before move", "After move"],
+    [100 * d["cross_edge_ratio_stage1_home"],
+     100 * d["cross_edge_ratio_final_home"]],
+    ["#d9a6b2", "#8fc9b5"], 20, [0, 4, 8, 12, 16, 20],
+    lambda value: f"{value:.2f}%"))
+
+evaluation_svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="365" viewBox="0 0 1000 365">
+<style>
+  text {{ font-family: Arial, "Noto Sans", sans-serif; fill: #25313b; }}
+  .eval-title {{ font-size: 16px; font-weight: 700; }}
+  .eval-tick {{ font-size: 10px; fill: #4b5563; }}
+  .eval-axis-title {{ font-size: 11px; fill: #374151; }}
+  .eval-label {{ font-size: 11px; fill: #374151; }}
+  .eval-value {{ font-size: 11px; font-weight: 700; }}
+  .eval-grid {{ stroke: #e5e7eb; stroke-width: 1; }}
+  .eval-axis {{ stroke: #555; stroke-width: 1.1; }}
+</style>
+<rect width="100%" height="100%" fill="white"/>
+{''.join(evaluation_panels)}
+</svg>
+'''
+evaluation = root / "program1_evaluation_three_panel.svg"
+evaluation.write_text(evaluation_svg, encoding="utf-8")
 print(standalone)
 print(combined)
+print(evaluation)

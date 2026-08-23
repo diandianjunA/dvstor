@@ -67,6 +67,9 @@ for row in rows:
                 float(g.get("frontier_reusable_certificates", 1))
                 if g.get("frontier_reusable_certificates", 0) else 0
             ),
+            "gpu_query_us": float(g.get("average_gpu_query_us", 0)),
+            "gpu_distance_score_us": float(g.get("average_gpu_score_us", 0)),
+            "gpu_merge_us": float(g.get("average_gpu_beam_merge_us", 0)),
         }
 
 motivation.sort(key=lambda item: item["commit_width"])
@@ -75,6 +78,11 @@ if len(motivation) < 2:
 if set(performance) != {"late", "early"}:
     raise SystemExit("need one late and one early performance case")
 late, early = performance["late"], performance["early"]
+late["gpu_other_us"] = max(
+    0.0,
+    late["gpu_query_us"] - late["gpu_distance_score_us"] -
+    late["rdma_wait_us_per_query"] - late["gpu_merge_us"],
+)
 summary = {
     "experiment": "program3_story_motivation_then_effectiveness",
     "motivation": motivation,
@@ -103,6 +111,10 @@ remaining_opportunity_us = (
     last["remaining_merge_us_per_round"] * last["certificate_rounds_per_query"]
 )
 wait_saved_us = late["rdma_wait_us_per_query"] - early["rdma_wait_us_per_query"]
+distance_share = late["gpu_distance_score_us"] / late["gpu_query_us"]
+rdma_share = late["rdma_wait_us_per_query"] / late["gpu_query_us"]
+merge_share = late["gpu_merge_us"] / late["gpu_query_us"]
+other_share = late["gpu_other_us"] / late["gpu_query_us"]
 lines = [
     "# 方案三：从批量扩展的 Merge 膨胀到 GPU–RDMA 推进解耦",
     "",
@@ -136,11 +148,25 @@ lines += [
     "",
     "这里的 Prefix 时间采用 exact certificate 的保守成本：它包含为 prefix 准备可复用 Stable-Run leaves 的工作。完整 Merge pipeline 使用两个不重叠的直接时间区间：certificate 构造，以及 RDMA 提交完成后到 Beam publication 的剩余 materialization；不包含 RDMA enqueue 和网络等待。普通 `beam_merge` breakdown 会再次包含 certificate 阶段完成的 leaf sort，因此没有与 `frontier_preview` 相加，避免重复计时。`候选+Beam容量` 是按固定 Beam=128 给出的输入槽位上界，真实旧 Beam 在早期轮次可能未填满。",
     "",
-    "## 3. 可重叠窗口有多大",
+    "## 3. 基线查询时间构成",
+    "",
+    "下表使用未开启推进解耦的 Late-Issue、C=16 查询作为基线。距离评分、RDMA 等待和 Merge 是互斥的 GPU 计时间隔；Other 由完整 GPU 查询驻留时间减去前三者得到，用于保证比例以完整查询时间为分母。",
+    "",
+    "| 查询阶段 | 时间/查询 | 占 GPU 查询时间比例 |",
+    "|---|---:|---:|",
+    f"| GPU 距离评分 | {late['gpu_distance_score_us']:.1f} μs | {100*distance_share:.1f}% |",
+    f"| RDMA 等待 | {late['rdma_wait_us_per_query']:.1f} μs | {100*rdma_share:.1f}% |",
+    f"| Merge | {late['gpu_merge_us']:.1f} μs | {100*merge_share:.1f}% |",
+    f"| 其他准备、校验及最终处理 | {late['gpu_other_us']:.1f} μs | {100*other_share:.1f}% |",
+    f"| **合计** | **{late['gpu_query_us']:.1f} μs** | **100%** |",
+    "",
+    f"RDMA 与 Merge 合计占 GPU 查询时间的 **{100*(rdma_share+merge_share):.1f}%**。这说明查询同时受到网络等待和 Merge 软件屏障影响，为让下一轮 RDMA 与剩余 Merge 重叠提供了直接动机。",
+    "",
+    "## 4. Prefix 占比与可重叠窗口",
     "",
     f"在 C={last['commit_width']} 时，exact prefix 平均在 {last['prefix_us_per_certificate']:.2f} μs 后就绪，而完整 Beam 还需要 {last['remaining_merge_us_per_round']:.2f} μs 才发布。每查询平均经历 {last['certificate_rounds_per_query']:.2f} 个 certificate round，因此从结构上存在约 {remaining_opportunity_us:.1f} μs/query 的 Merge–RDMA 重叠机会。该值是软件时间窗口，不等于端到端收益上限；实际收益还受 RDMA 完成时间、队列并发、首尾轮以及 certificate 是否成功发出的影响。",
     "",
-    "## 4. 方案效果（单次严格 A/B）",
+    "## 5. 方案效果（单次严格 A/B）",
     "",
     "| 模式 | QPS | P50 (ms) | P99 (ms) | RDMA wait/query (μs) | Post Recall@10 |",
     "|---|---:|---:|---:|---:|---:|",
@@ -151,13 +177,19 @@ lines += [
     "",
     f"Early 的 exact certificate 发出覆盖率为 {100*early['certificate_coverage']:.2f}%，critical ROB hit 为 {100*early['critical_rob_hit_ratio']:.2f}%。这说明提前 issue 的 mandatory 数据通常能在下一轮权威提交需要它们之前到达。",
     "",
-    "## 5. 证据边界与论文表述",
+    "## 6. 证据边界与论文表述",
     "",
     "动机扫描清楚支持单轮结构性趋势，但 Merge 时间没有随候选槽位线性增长：候选扩大 15.06× 时，单轮 pipeline 只增长约 26.4%。这是合理的，因为 Stable-Run 只保留固定宽度的有序结果，GPU 排序/归并也具有并行性。因此论文应表述为“批量扩展显著放大候选集合，并使完整 Merge 屏障持续增长”，不能声称 Merge 成本与候选数线性增长。",
     "",
     "性能部分按你的要求只测了一次，适合作为简洁的方案效果图；它不能单独给出置信区间。此前多次重复结果可作为内部稳定性证据，但若论文审稿要求统计显著性，仍建议对最终 C=16 A/B 补 3 次短重复。",
     "",
-    "## 6. 结论",
+    "## 7. 图文件",
+    "",
+    "- `program3_story_motivation.svg`：候选槽位与完整 Merge 时间随扩展批量的变化；Prefix 不再作为堆叠段展示。",
+    "- `program3_query_time_breakdown.svg`：Late-Issue、C=16 的完整 GPU 查询时间构成。",
+    "- `program3_story_effectiveness.svg`：Late-Issue 与 Exact-Early-Issue 的实际查询 QPS。",
+    "",
+    "## 8. 结论",
     "",
     "动机扫描先证明了批量扩展使候选集合和完整 merge 成本增长，而通信真正依赖的 exact prefix 只占其中一部分；随后单变量 A/B 证明，将 mandatory RDMA 从完整 Beam publication 之后移动到 exact prefix 就绪之后，能够把剩余 merge 与网络传输重叠，并在不增加预测读取、不改变最终 Recall 的情况下改善吞吐和尾延迟。",
     "",

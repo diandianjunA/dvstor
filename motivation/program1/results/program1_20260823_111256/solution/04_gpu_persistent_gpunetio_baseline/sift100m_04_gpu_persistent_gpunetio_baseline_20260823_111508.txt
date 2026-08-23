@@ -16,13 +16,13 @@ query_inputs
   performance_row_reuse_policy: single_pass_no_reuse
   performance_warmup/measure/total_rows_consumed: 0/0/0
 throughput
-  duration_seconds: 0.462227
-  total_ops_per_sec: 2163.44 (ops=1000)
+  duration_seconds: 0.451226
+  total_ops_per_sec: 2216.18 (ops=1000)
   query_ops_per_sec: 0 (ops=0)
   effective_query_ops_per_sec: 0
-  write_ops_per_sec: 2163.44 (ops=1000)
-  effective_write_ops_per_sec: 2163.44
-  insert_ops_per_sec: 2163.44 (ops=1000)
+  write_ops_per_sec: 2216.18 (ops=1000)
+  effective_write_ops_per_sec: 2216.18
+  insert_ops_per_sec: 2216.18 (ops=1000)
   client_drain_seconds: 0
   scheduled_query/write_ops: 0/0
   query/write_rate_attainment_ratio: 1/1
@@ -39,19 +39,19 @@ stage2
   source: in_band_control_page
   shards observed/requested: 5/5
   p99_stage2_delay_upper_ms: 512 (samples=1128)
-  remaining/max_backlog: 0/10
+  remaining/max_backlog: 0/9
   completion_outstanding/admission_window: 0/327680 (max_per_shard=0)
   completion_incomplete/admission_window: 0/327680 (max_per_shard=0, completed_behind_hole=0)
   completion admission stalls logical/physical: 0/0
   backlog_slope_per_sec: 0
   failures (hard): 0
-  peer_reverse_retry_attempts: 1
-  locality telemetry: home_match_rate=0.89539 cross_edge_reduction=0.202652 avg_frontier/expansions/scored=708.712/22.2225/1308.93
+  peer_reverse_retry_attempts: 0
+  locality telemetry: home_match_rate=0.89539 cross_edge_reduction=0.202554 avg_frontier/expansions/scored=708.881/22.2172/1309
   search budget exhausted (stage1/stage2): 0/0
-  execution batching: contexts=161 avg_items=7.00621 graph_reads/wave=6.57694 vector_reads/wave=95.5548 pressure_yields=1000
-  ordered graph issue: issued/hit/wasted=19974/19483/491 promotion_ratio=0.975418
-  graph home RPC: batches/items/avg_items=4271/25558/5.98408
-  executor service demand: stage1_total/search/prune_us=4758.26/4316.48/304.83 stage1_candidates/frontier/neighbors=127.979/708.712/46.8644 stage2_search/freeze/reverse_us=10542.2/1058.44/4011.91
+  execution batching: contexts=164 avg_items=6.87805 graph_reads/wave=6.52708 vector_reads/wave=94.997 pressure_yields=967
+  ordered graph issue: issued/hit/wasted=19948/19462/486 promotion_ratio=0.975637
+  graph home RPC: batches/items/avg_items=4362/25547/5.85672
+  executor service demand: stage1_total/search/prune_us=4692.11/4231.16/308.877 stage1_candidates/frontier/neighbors=127.977/708.881/46.8688 stage2_search/freeze/reverse_us=9345.36/909.469/3662.02
 recall
   recall@10: 0.8
   queries: 1
@@ -75,6 +75,10 @@ gpu_persistent
   graph snapshot reread records total/per_query: 0/0
   graph RDMA bytes total/per_query/per_parent: 0/0/0
   graph live/full/fallback/underhint/promotions reads: 0/0/0/0/0
+  expanded parents/neighbor sum/average degree: 0/0/0
+  expanded degree histogram (ceil(degree/8), overflow=13): [0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+  dynamic expanded parents/neighbor sum/average degree/share: 0/0/0/0
+  dynamic expanded degree histogram (ceil(degree/8), overflow=13): [0,0,0,0,0,0,0,0,0,0,0,0,0,0]
   DynaExtent short/full/bytes/fallback/promotions/demotions: 0/0/0/0/0/0
   DynaExtent snapshot-attempts/nonfallback-full-attempts/short-physical-ratio/fallback-ratio/bytes-per-physical-read: 0/0/0/0/0
   ASFE logical expansions total/per_query: 0/0
@@ -102,11 +106,11 @@ gpu_persistent
   ASFE critical ROB hits/speculative wait ns/us_per_query: 0/0/0
   ASFE critical misses/ROB hit ratio: 0/0
   ASFE RDMA completion groups/avg us (critical/speculative): 0/0 (0/0)
-  GPU occupancy threads/registers/static_shared: 128/166/48992
+  GPU occupancy threads/registers/static_shared: 128/166/49136
   GPU occupancy active/effective blocks per SM: 3/3
   GPU persistent query/owner/total blocks: 256/40/298
-  centroid route publications/shard_updates/live/snapshot_skips: 63/152/20/0
-  centroid route probe_reads/body_reads/unchanged_polls/poll_us: 575/152/53/63584
+  centroid route publications/shard_updates/live/snapshot_skips: 56/152/20/0
+  centroid route probe_reads/body_reads/unchanged_polls/poll_us: 475/152/39/63607
   centroid route query snapshot retries/timeouts: 0/0
   GPU query/prepare/graph/score/beam/exact us: 0/0/0/0/0/0
   exact snapshot train batches/fallbacks/success ratio: 0/0/0
@@ -120,11 +124,11 @@ gpu_persistent
   dynamic PQ arena hits/batch_dedup/authoritative_avoidance: 0/0/0
   dynamic PQ arena publish success/race/capacity: 0/0/25431721
 storage_owner_runtime
-  submitted/completed batches: 992/992
+  submitted/completed batches: 993/993
   submitted/completed items: 1000/1000
-  average batch / average RPC wall us / max RPC wall us: 1.00806/11.632/63.889
+  average batch / average RPC wall us / max RPC wall us: 1.00705/11.7909/107.768
 insert breakdown
   count: 1000
-  latency_ms: mean=7.29793 p50=6.00641 p95=16.0504 p99=21.6821 p999=25.8227
-  cpu_ms: 7297.93
+  latency_ms: mean=7.10951 p50=5.87372 p95=16.0256 p99=21.7581 p999=23.7813
+  cpu_ms: 7109.51
   rdma_ms: 0

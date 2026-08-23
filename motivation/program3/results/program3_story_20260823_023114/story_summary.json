@@ -60,7 +60,11 @@
       "logical_graph_reads_per_query": 195.1434633999165,
       "speculative_graph_reads": 0,
       "critical_rob_hit_ratio": 0.0,
-      "certificate_coverage": 0
+      "certificate_coverage": 0,
+      "gpu_query_us": 4149.227016529657,
+      "gpu_distance_score_us": 529.9911064834905,
+      "gpu_merge_us": 995.9244823457449,
+      "gpu_other_us": 1469.3349748364353
     },
     "early": {
       "qps": 67230.96610115479,
@@ -71,7 +75,10 @@
       "logical_graph_reads_per_query": 195.16954589995495,
       "speculative_graph_reads": 0,
       "critical_rob_hit_ratio": 0.9679676339548247,
-      "certificate_coverage": 0.9238604087910686
+      "certificate_coverage": 0.9238604087910686,
+      "gpu_query_us": 3718.641916651921,
+      "gpu_distance_score_us": 549.825990422547,
+      "gpu_merge_us": 492.1919334916441
     }
   },
   "effect": {
