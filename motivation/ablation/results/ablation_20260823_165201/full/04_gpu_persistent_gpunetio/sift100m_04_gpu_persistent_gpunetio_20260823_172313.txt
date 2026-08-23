@@ -1,0 +1,138 @@
+system_variant
+  profile_name: 04_gpu_persistent_gpunetio
+  label: full
+  update_mutation_api: insert_upsert_erase
+  storage_owner_update_completion_mode: decoupled
+  gpu_dynamic_graph_access_mode: adaptive
+  gpu_rdma_search_progression_mode: decoupled
+  index_prefix: /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16
+  index_schema_version: 16
+  index_build_fingerprint: 68737734120060254
+query_inputs
+  recall_source: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  recall_rows: 10000
+  performance_source: /data/xjs/datasets/sift1b/sift100m_to_110m_query.u8bin
+  performance_rows: 10000000
+  performance_row_reuse_policy: single_pass_no_reuse
+  performance_warmup/measure/total_rows_consumed: 1049201/8315288/9364489
+throughput
+  duration_seconds: 120.073
+  total_ops_per_sec: 71991.1 (ops=8644157)
+  query_ops_per_sec: 69252.2 (ops=8315288)
+  effective_query_ops_per_sec: 69252.2
+  write_ops_per_sec: 2738.92 (ops=328869)
+  effective_write_ops_per_sec: 2738.92
+  insert_ops_per_sec: 2738.92 (ops=328869)
+  client_drain_seconds: 0.072538
+  scheduled_query/write_ops: 0/0
+  query/write_rate_attainment_ratio: 1/1
+  nominal/effective_rate_basis: effective_wall_clock/wall_clock_including_client_drain
+  write_mix_completed: insert=328869 upsert=0 delete=0
+  query_head/tail_qps: 69662.9/68764.5
+  query_tail_to_head_ratio: 0.987105
+  query_min_5s_qps: 68604.2
+  write_head/tail_qps: 2661.53/2795.07
+  write_tail_to_head_ratio: 1.05017
+  write_min_5s_qps: 2360.2
+  zero_completion_windows: 0
+  zero_query/write_windows: 0/0
+stage2
+  source: in_band_control_page
+  shards observed/requested: 5/5
+  p99_stage2_delay_upper_ms: 30000 (samples=329392)
+  remaining/max_backlog: 14456/49853
+  completion_outstanding/admission_window: 14501/327680 (max_per_shard=14501)
+  completion_incomplete/admission_window: 14453/327680 (max_per_shard=14453, completed_behind_hole=48)
+  completion admission stalls logical/physical: 0/0
+  backlog_slope_per_sec: -3.69413
+  failures (hard): 0
+  peer_reverse_retry_attempts: 37
+  locality telemetry: home_match_rate=0.894457 cross_edge_reduction=0.229676 avg_frontier/expansions/scored=649.656/21.5621/1219.6
+  search budget exhausted (stage1/stage2): 0/0
+  execution batching: contexts=41078 avg_items=7.99494 graph_reads/wave=6.52093 vector_reads/wave=86.248 pressure_yields=5192201
+  ordered graph issue: issued/hit/wasted=5714691/5573821/141213 promotion_ratio=0.975291
+  graph home RPC: batches/items/avg_items=1035890/7220767/6.97059
+  executor service demand: stage1_total/search/prune_us=3819.42/3493.11/215.697 stage1_candidates/frontier/neighbors=127.917/663.078/46.1275 stage2_search/freeze/reverse_us=41565.2/2301.92/15143.6
+recall
+  recall@10: 0.9401
+  queries: 1000
+  mode/base_id_limit/search_width/insufficient_queries: all/0/10/0
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+static_gt_post_recall
+  recall@10: 0.9356
+  queries: 1000
+  mode/base_id_limit/search_width/insufficient_queries: all/0/10/0
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+gpu_persistent
+  GPU memory explicit/base_pq/route GiB: 4.30936/2.98023/2.87592e-06
+  average_batch_size: 1.10403
+  average_submission_wait_us: 2.8065
+  rdma_read_bytes: 829949388792
+  owner WQE submitted/capacity/utilization: 3934321985/152451177472/0.0258071
+  owner critical/speculative batches: 198697695/968644
+  graph_route_hit_ratio/refreshes: 0/0
+  graph snapshot reread records total/per_query: 1105599/0.13296
+  graph RDMA bytes total/per_query/per_parent: 668153382064/80352.4/418.78
+  graph live/full/fallback/underhint/promotions reads: 1591876191/3610278/1105599/1105598/1102921
+  expanded parents/neighbor sum/average degree: 1593412280/74835591014/46.9656
+  expanded degree histogram (ceil(degree/8), overflow=13): [0,1643484,41032861,163410626,256479684,268547017,232044613,180725359,130642233,92692309,65583901,47482907,111122268,2005018]
+  dynamic expanded parents/neighbor sum/average degree/share: 36146652/1759701408/48.6823/0.0226851
+  dynamic expanded degree histogram (ceil(degree/8), overflow=13): [0,480064,1239756,3402365,4681789,4595877,4172272,4799373,3586694,3139971,2805823,2079460,1163123,85]
+  DynaExtent short/full/bytes/fallback/promotions/demotions: 36235850/27205/15737507616/27081/26879/278
+  DynaExtent snapshot-attempts/nonfallback-full-attempts/short-physical-ratio/fallback-ratio/bytes-per-physical-read: 36263055/124/0.99925/0.000747354/433.982
+  ASFE logical expansions total/per_query: 1593412280/191.624
+  ASFE critical/speculative graph reads: 1594505422/968644
+  ASFE critical/speculative graph bytes: 667648943456/504438608
+  ASFE core reads/bytes/arrived/promoted/stale: 1542531583/633503840304/1542531583/1541438387/19805883
+  ASFE core waves/ready waves/ready ratio: 110341229/7528613/0.0682303
+  terminal exact cache attempts/rate: 8315288/1
+  terminal exact cache issued/promoted/misses/rejects (total/per_query): 1064356864/128, 1034381990/124.395, 0/0, 0/0
+  terminal exact cache promotion/waste ratio: 0.971838/0.0281624
+  terminal exact cache wasted bytes total/per_query: 4556180848/547.928
+  ASFE completion scoring batches/candidates (total/per_query/candidates_per_batch): 119532684/14.3751, 74835591014/8999.76/626.068
+  ASFE reusable exact certificates total/per_query: 119532684/14.3751
+  ASFE streamed runs/ordered scoring batches/candidates (total/per_query/candidates_per_batch): 234553381/28.2075, 0/0, 0/0/0
+  OOO ROB parents retired beyond an unresolved rank hole (total/per_query): 210628436/25.3303
+  ASFE reusable prefix ranks/full/issued certificates (total/per_query): 1561193624/187.75, 0/0, 110341229/13.2697
+  ASFE certificate rejects total/per_query: 0/0
+  ASFE speculative wasted bytes/ratio: 504414384/0.999952
+  ASFE speculative arrived/promoted/stale/queue_rejects: 968644/54/968590/70772
+  ASFE promotion/waste ratio: 5.5748e-05/0.999944
+  ASFE issue/commit epochs: 111217396/119532684
+  ASFE average issue/commit width: 14.0373/13.3303
+  ASFE issue capacity/utilization: 16.0094/0.876817
+  ASFE max issue/commit width: 17/16
+  ASFE critical ROB hits/speculative wait ns/us_per_query: 1541438441/6743171641970/810.937
+  ASFE critical misses/ROB hit ratio: 51973839/0.967382
+  ASFE RDMA completion groups/avg us (critical/speculative): 217393676/84.4986 (968644/92.1602)
+  GPU occupancy threads/registers/static_shared: 128/166/49136
+  GPU occupancy active/effective blocks per SM: 3/3
+  GPU persistent query/owner/total blocks: 256/40/298
+  centroid route publications/shard_updates/live/snapshot_skips: 17280/39801/20/408
+  centroid route probe_reads/body_reads/unchanged_polls/poll_us: 118100/41376/5932/8507
+  centroid route query snapshot retries/timeouts: 87171/0
+  GPU query/prepare/graph/score/beam/exact us: 3606.95/117.642/404.574/615.072/480.106/263.099
+  exact snapshot train batches/fallbacks/success ratio: 8670396/0/1
+  GPU graph commit/issue width: 16/32
+  GPU graph read/dynamic extent: live-extent/1
+  GPU Beam merge policy: stable-run
+  Stage2 score-many/graph-issue/home-combining: 1/16/1
+  GPU Beam merge total/prepare/sort/materialize us: 480.106/16.8133/230.514/232.777
+  dynamic PQ candidates/reads/bytes/incarnation_rejects: 907149277/344085/13763400/0
+  dynamic PQ reads/query and wait_us/query: 0.0413798/8.29504
+  dynamic PQ arena hits/batch_dedup/authoritative_avoidance: 906805192/0/0.999621
+  dynamic PQ arena publish success/race/capacity: 340365/3720/25431721
+storage_owner_runtime
+  submitted/completed batches: 12778842/12778842
+  submitted/completed items: 63183282/63183282
+  average batch / average RPC wall us / max RPC wall us: 4.94437/12.0762/19116.8
+insert breakdown
+  count: 328869
+  latency_ms: mean=93.4324 p50=79.1273 p95=216.614 p99=288.218 p999=375.095
+  fine_grained_breakdown: disabled
+query breakdown
+  count: 8315288
+  latency_ms: mean=3.693 p50=3.66048 p95=4.55504 p99=5.00494 p999=5.59015
+  fine_grained_breakdown: disabled
