@@ -176,7 +176,7 @@ GPU，也不需要额外重分片可执行文件。
 完整构建：
 
 ```bash
-./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
+./experiment/sift100m/build_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
 该命令先产出 schema-15 tagged graph 中间态及每个物理分片的精确 `.centroid`
@@ -188,62 +188,31 @@ OPQ/PQ32 模型和每分片 PQ32 码流，最后全量校验图记录并生成 `
 
 若已有完整、静态的 schema-15 `vamana_compact_v1` 分片，可用
 `vamana_legacy_index_converter` 保留原图与 METIS placement 并流式升级，无需重新
-构图或训练 PQ；输入要求、只读校验和命令见
-[`experiment/README.md`](experiment/README.md#转换旧-compact-v1-索引)。
+构图或训练 PQ；具体参数可通过 `./build/vamana_legacy_index_converter --help` 查看。
 
-## 运行 SIFT100M
+## 运行论文实验
 
-正式实验在 `main` 内使用两个同二进制、同 schema-16 索引的 profile：
-`04_gpu_persistent_gpunetio_baseline` 关闭三个贡献级机制，
-`04_gpu_persistent_gpunetio` 全部开启。两者只允许在更新完成语义、动态图访问粒度和
-GPU-RDMA 搜索推进三个 mode 上不同，其他配置来自同一个 common profile。
-baseline 的 coupled update 只接受 append-only fresh insert，由单一 logical storage
-owner 同步完成全局 RDMA 搜索、剪枝、稳定写入和 one-sided RDMA 反向边后再 ACK；
-它没有远端更新 CPU handler、Stage1/Stage2、accepted backlog 或 maintenance
-migration，且 `maintenance_sequence=0`。upsert/delete 在提交给 authority 前 fail-fast，
-不会暗中退回远端 CPU helper。baseline 的 coupled search 使用
-CPU-owned Beam/visited、CPU-posted RDMA 和有限生命周期 CUDA scoring；full 的
-decoupled search 使用 persistent GPU/GPUNetIO 流水。两者始终读取同一份 schema-16
-索引，只改变查询执行 owner 与推进语义。完整语义见实验文档。
-
-先配置 `HOSTS`、`INDEX_DIR`、GPU 与内存预算。baseline 运行：
+SIFT100M 实验代码位于 `experiment/sift100m/`，不再维护平行的 `motivation/`
+目录。该数据集只保留三个动机实验和一套累积消融实验：
 
 ```bash
-./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio_baseline
-./experiment/run_recall.sh 04_gpu_persistent_gpunetio_baseline
-./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio_baseline
-./experiment/stop_memory_nodes.sh
+./experiment/sift100m/program1/run_program1.sh
+./experiment/sift100m/program2/run_program2.sh
+./experiment/sift100m/program3/run_program3.sh
+./experiment/sift100m/ablation/run_ablation.sh
 ```
 
-full 运行：
-
-```bash
-./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio
-./experiment/run_recall.sh 04_gpu_persistent_gpunetio
-./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
-./experiment/stop_memory_nodes.sh
-```
-
-Benchmark 并发使用独立的 `BENCHMARK_CLIENT_THREADS`，不写入索引/系统 profile。
-默认 `auto` 由 GPU query slots 和分片 RPC depth 的有界容量推导；显式整数值用于
-并发/延迟扫描，详细语义见 [`experiment/README.md`](experiment/README.md#召回率与性能)。
-标准的 10K `query.u8bin` 只用于 recall 检查。吞吐阶段使用独立的
-`PERFORMANCE_QUERY_FILE`，并从 warmup 到 measure 单遍消费；文件耗尽会直接失败，
-不会回绕重复。默认性能查询集是 `bigann_base.bvecs` 的 `[100M,110M)`，插入集是
-`[110M,120M)`；生成的 `.u8bin` 文件位于 SIFT1B 数据集目录。两个流使用相邻且
-不重叠的 held-out 范围。计算节点只需这两份生成文件，不需要完整的
-`bigann_base.bvecs`。
-
-分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.centroid`、
-`.pq32.codes`，再加共享 metadata。计算节点运行正式 baseline/full 时还需要
-`.gextent8`；它不是路由或图副本。详细流程见
-`experiment/README.md`。
+四套入口共享同一份 SIFT100M schema-16 索引、profile、benchmark driver 和存储
+节点启动脚本。每个入口都会打印与当前 case 精确匹配的存储节点命令，并将结果写入
+自身的 `results/`。完整目录说明见
+[`experiment/sift100m/README.md`](experiment/sift100m/README.md)。
 
 ## 验证
 
 ```bash
 ctest --test-dir build --output-on-failure
-bash -n experiment/*.sh experiment/profiles/*.env
+bash -n experiment/sift100m/*.sh experiment/sift100m/*/*.sh \
+  experiment/sift100m/profiles/*.env
 ```
 
 `gpu_memory_budget_test` 覆盖 SIFT100M/SIFT1B 预算；格式、PQ、centroid 路由和
@@ -258,4 +227,4 @@ bash -n experiment/*.sh experiment/profiles/*.env
 - `src/service/`：计算服务、索引契约和统计；
 - `src/vamana/`：compact graph、CentroidRouter、centroid state 和 idmap 格式；
 - `tools/vamana_offline/`：离线构图与 PQ sidecar 生成；
-- `experiment/`：同索引的 SIFT100M baseline/full profiles 与实验脚本。
+- `experiment/{sift100m,deep100m,spacev100m}/`：按数据集组织论文实验；当前完整实现位于 `sift100m/`。

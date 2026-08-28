@@ -1,8 +1,0 @@
-threads=128,capacity=64,issue_capacity=1,preview_count=1,serial_cycles=1749,parallel_cycles=3787
-threads=128,capacity=128,issue_capacity=1,preview_count=1,serial_cycles=2944,parallel_cycles=3990
-threads=128,capacity=64,issue_capacity=8,preview_count=8,serial_cycles=7874,parallel_cycles=9008
-threads=128,capacity=128,issue_capacity=8,preview_count=8,serial_cycles=8930,parallel_cycles=9307
-threads=128,capacity=64,issue_capacity=16,preview_count=16,serial_cycles=15456,parallel_cycles=11329
-threads=128,capacity=128,issue_capacity=16,preview_count=16,serial_cycles=16464,parallel_cycles=12094
-threads=128,capacity=64,issue_capacity=32,preview_count=32,serial_cycles=29198,parallel_cycles=13563
-threads=128,capacity=128,issue_capacity=32,preview_count=32,serial_cycles=31782,parallel_cycles=15026

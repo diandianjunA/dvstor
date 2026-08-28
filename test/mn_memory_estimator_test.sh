@@ -57,7 +57,7 @@ metadata_estimate="$({
   PARTITION_IMBALANCE=1.03
   MN_DYNAMIC_HEADROOM_PERCENT=20
   MN_MEMORY_MIN_GB=8
-  source "$PROJECT_DIR/experiment/sift100m_common.sh"
+  source "$PROJECT_DIR/experiment/sift100m/sift100m_common.sh"
   estimate_mn_memory_gb
 } 2>/dev/null)"
 assert_equal 24 "$metadata_estimate" "metadata-driven estimate"
@@ -75,7 +75,7 @@ profile_estimate="$({
   PQ_SUBQUANTIZERS=32
   MN_DYNAMIC_HEADROOM_PERCENT=20
   MN_MEMORY_MIN_GB=8
-  source "$PROJECT_DIR/experiment/common.sh"
+  source "$PROJECT_DIR/experiment/sift100m/common.sh"
   [[ -z "${MN_MEMORY_GB:-}" ]] ||
     fail "MN_MEMORY_GB was resolved before the profile"
   load_experiment_profile 04_gpu_persistent_gpunetio
@@ -89,7 +89,7 @@ explicit_estimate="$({
   WORK_DIR="$TEST_DIR/explicit-work"
   INDEX_DIR="$WORK_DIR/index"
   PQ_INDEX_PREFIX="$PREFIX"
-  source "$PROJECT_DIR/experiment/common.sh"
+  source "$PROJECT_DIR/experiment/sift100m/common.sh"
   load_experiment_profile 04_gpu_persistent_gpunetio
   resolve_mn_memory_gb
   printf '%s' "$MN_MEMORY_GB"
@@ -110,7 +110,7 @@ fallback_estimate="$({
   PARTITION_IMBALANCE=1.03
   MN_DYNAMIC_HEADROOM_PERCENT=20
   MN_MEMORY_MIN_GB=8
-  source "$PROJECT_DIR/experiment/sift100m_common.sh"
+  source "$PROJECT_DIR/experiment/sift100m/sift100m_common.sh"
   estimate_mn_memory_gb
 } 2>/dev/null)"
 assert_equal 24 "$fallback_estimate" "schema16 fallback estimate"
@@ -129,7 +129,7 @@ float_estimate="$({
   PARTITION_IMBALANCE=1.03
   MN_DYNAMIC_HEADROOM_PERCENT=20
   MN_MEMORY_MIN_GB=1
-  source "$PROJECT_DIR/experiment/sift100m_common.sh"
+  source "$PROJECT_DIR/experiment/sift100m/sift100m_common.sh"
   estimate_mn_memory_gb
 } 2>/dev/null)"
 assert_equal 33 "$float_estimate" "float32 fallback estimate"
@@ -148,7 +148,7 @@ r64_estimate="$({
   PARTITION_IMBALANCE=1.03
   MN_DYNAMIC_HEADROOM_PERCENT=20
   MN_MEMORY_MIN_GB=1
-  source "$PROJECT_DIR/experiment/sift100m_common.sh"
+  source "$PROJECT_DIR/experiment/sift100m/sift100m_common.sh"
   estimate_mn_memory_gb
 } 2>/dev/null)"
 assert_equal 18 "$r64_estimate" "R-sensitive fallback estimate"
@@ -165,7 +165,7 @@ absolute_slots_estimate="$({
   R=96
   VECTOR_DATA_TYPE=uint8
   PQ_SUBQUANTIZERS=32
-  source "$PROJECT_DIR/experiment/sift100m_common.sh"
+  source "$PROJECT_DIR/experiment/sift100m/sift100m_common.sh"
   estimate_mn_memory_gb
 } 2>/dev/null)"
 assert_equal 21 "$absolute_slots_estimate" "absolute dynamic-slot estimate"
@@ -178,7 +178,7 @@ if (
   INDEX_DIR="$WORK_DIR/index"
   INDEX_PREFIX="$BAD_PREFIX"
   SHARDS=5
-  source "$PROJECT_DIR/experiment/sift100m_common.sh"
+  source "$PROJECT_DIR/experiment/sift100m/sift100m_common.sh"
   estimate_mn_memory_gb
 ) >/dev/null 2>&1; then
   fail "malformed metadata was silently accepted"

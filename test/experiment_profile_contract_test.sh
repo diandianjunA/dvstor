@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXPERIMENT_DIR="$PROJECT_DIR/experiment"
+EXPERIMENT_DIR="$PROJECT_DIR/experiment/sift100m"
 PROFILE_DIR="$EXPERIMENT_DIR/profiles"
 COMMON_PROFILE="$PROFILE_DIR/04_gpu_persistent_gpunetio_common.sh"
 BASELINE_PROFILE=04_gpu_persistent_gpunetio_baseline
@@ -171,7 +171,7 @@ for key in "${!mode_variables[@]}"; do
     "$EXPERIMENT_DIR/start_memory_node.sh"
 done
 
-for runner in run_breakdown.sh run_recall.sh; do
+for runner in run_breakdown.sh; do
   grep -Fq -- '--profile-name "$PROFILE"' "$EXPERIMENT_DIR/$runner"
   grep -Fq -- '--system-variant-label "$SYSTEM_VARIANT_LABEL"' \
     "$EXPERIMENT_DIR/$runner"

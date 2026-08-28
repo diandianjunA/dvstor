@@ -1,0 +1,104 @@
+{
+  "experiment": "program3_motivation_then_effectiveness",
+  "motivation": [
+    {
+      "commit_width": 1,
+      "candidate_slots_per_round": 42.287977424397226,
+      "merge_input_slots_per_round": 170.28797742439724,
+      "graph_rounds_per_query": 134.20621111868283,
+      "certificate_rounds_per_query": 134.20621111868283,
+      "prefix_us_per_certificate": 5.472418220952643,
+      "full_merge_pipeline_us_per_round": 18.793864667223488,
+      "remaining_merge_us_per_round": 13.321446446270844,
+      "prefix_compute_share": 0.29118110180374684,
+      "qps": 18166.304355897497
+    },
+    {
+      "commit_width": 4,
+      "candidate_slots_per_round": 176.52251590973114,
+      "merge_input_slots_per_round": 304.52251590973117,
+      "graph_rounds_per_query": 37.73805832841462,
+      "certificate_rounds_per_query": 37.73805832841462,
+      "prefix_us_per_certificate": 6.806251447400391,
+      "full_merge_pipeline_us_per_round": 20.012684633404582,
+      "remaining_merge_us_per_round": 13.20643318600419,
+      "prefix_compute_share": 0.3400968721627481,
+      "qps": 46219.06495943339
+    },
+    {
+      "commit_width": 8,
+      "candidate_slots_per_round": 339.7449458804847,
+      "merge_input_slots_per_round": 467.7449458804847,
+      "graph_rounds_per_query": 22.114311672959783,
+      "certificate_rounds_per_query": 22.114311672959783,
+      "prefix_us_per_certificate": 7.808496178339353,
+      "full_merge_pipeline_us_per_round": 20.997974609830575,
+      "remaining_merge_us_per_round": 13.18947843149122,
+      "prefix_compute_share": 0.3718690170567054,
+      "qps": 61379.40483975082
+    },
+    {
+      "commit_width": 16,
+      "candidate_slots_per_round": 637.0600448820371,
+      "merge_input_slots_per_round": 765.0600448820371,
+      "graph_rounds_per_query": 14.614127492000984,
+      "certificate_rounds_per_query": 14.614127492000984,
+      "prefix_us_per_certificate": 9.71188445029099,
+      "full_merge_pipeline_us_per_round": 23.747494250726582,
+      "remaining_merge_us_per_round": 14.035609800435592,
+      "prefix_compute_share": 0.4089645984436376,
+      "qps": 66999.60467669768
+    }
+  ],
+  "performance": {
+    "late": {
+      "qps": 60468.061002400995,
+      "p50_ms": 4.198974,
+      "p99_ms": 5.448345,
+      "post_recall": 0.9400999999999946,
+      "rdma_wait_us_per_query": 1153.976452863986,
+      "logical_graph_reads_per_query": 195.1434633999165,
+      "speculative_graph_reads": 0,
+      "critical_rob_hit_ratio": 0.0,
+      "certificate_coverage": 0,
+      "gpu_query_us": 4149.227016529657,
+      "gpu_candidate_maintenance_us": 1669.0358711245572,
+      "candidate_maintenance_breakdown": {
+        "Candidate Validation": 435.2022890644051,
+        "Candidate Select": 237.90909971440738,
+        "Merge": 995.9244823457449
+      },
+      "gpu_rdma_us": 1153.976452863986,
+      "gpu_distance_us": 690.1538373279108,
+      "gpu_other_us": 636.0608552132029
+    },
+    "early": {
+      "qps": 67230.96610115479,
+      "p50_ms": 3.752377,
+      "p99_ms": 5.289095,
+      "post_recall": 0.9400999999999946,
+      "rdma_wait_us_per_query": 1087.7227149559046,
+      "logical_graph_reads_per_query": 195.16954589995495,
+      "speculative_graph_reads": 0,
+      "critical_rob_hit_ratio": 0.9679676339548247,
+      "certificate_coverage": 0.9238604087910686,
+      "gpu_query_us": 3718.641916651921,
+      "gpu_candidate_maintenance_us": 806.8787232813445,
+      "candidate_maintenance_breakdown": {
+        "Candidate Validation": 35.22439082432117,
+        "Candidate Select": 279.4623989653793,
+        "Merge": 492.1919334916441
+      },
+      "gpu_rdma_us": 1087.7227149559046,
+      "gpu_distance_us": 583.7718297604374,
+      "gpu_other_us": 1240.268648654234
+    }
+  },
+  "effect": {
+    "qps_improvement": 0.11184259899594373,
+    "p50_reduction": 0.10635860093441862,
+    "p99_reduction": 0.029229059466682084,
+    "rdma_wait_reduction": 0.05741342272942407,
+    "logical_read_ratio": 1.0001336580769042
+  }
+}

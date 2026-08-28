@@ -1,4 +1,0 @@
-case	report
-baseline	/home/xjs/experiment/dvstor/motivation/program1/results/program1_20260823_111256/baseline/04_gpu_persistent_gpunetio_baseline/sift100m_04_gpu_persistent_gpunetio_baseline_20260823_111326.json
-solution	/home/xjs/experiment/dvstor/motivation/program1/results/program1_20260823_111256/solution/04_gpu_persistent_gpunetio_baseline/sift100m_04_gpu_persistent_gpunetio_baseline_20260823_111508.json
-quality	/home/xjs/experiment/dvstor/motivation/program1/results/program1_20260823_111256/quality/quality.json
