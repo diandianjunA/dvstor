@@ -49,7 +49,8 @@ wait_storage() {
 }
 
 run_update_case() {
-  local case_name="$1" mode="$2" report_dir="$RUN_ROOT/$case_name"
+  local case_name="$1" mode="$2"
+  local report_dir="$RUN_ROOT/$case_name"
   local existing
   existing="$(existing_report "$case_name")"
   if [[ -n "$existing" && -f "$existing" ]]; then
