@@ -1,0 +1,4 @@
+[build] command: /home/xjs/experiment/dvstor/build/vamana_offline_builder --data-path '' --output-prefix /data/xjs/index/dvstor_spacev100m/index/spacev100m_R96_bw128_metis_pmd32_pq20_schema16 --memory-nodes 5 --partition-strategy metis --R 96 --beam-width 128 --alpha 1.2 --threads 32 --max-vectors 100000000 --vector-data-type int8 --partition-max-degree 32 --partition-imbalance 1.03 --skip-sanity-check
+terminate called after throwing an instance of 'boost::wrapexcept<boost::program_options::invalid_option_value>'
+  what():  the argument for option '--data-path' is invalid
+/home/xjs/experiment/dvstor/experiment/spacev100m/build_spacev100m_index.sh: line 73: 1829451 Aborted                 (core dumped) OMP_NUM_THREADS="$BUILD_THREADS" OMP_THREAD_LIMIT="$BUILD_THREAD_LIMIT" "${builder[@]}"

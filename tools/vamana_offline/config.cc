@@ -1,5 +1,6 @@
 #include "tools/vamana_offline/config.hh"
 
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -50,6 +51,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "METIS ubvec balance tolerance, e.g. 1.03 allows about 3% imbalance.")
     ("skip-sanity-check", po::bool_switch(&config.skip_sanity_check),
      "Skip the expensive in-memory brute-force recall sanity check after graph construction.")
+    ("preflight-only", po::bool_switch(&config.preflight_only),
+     "Validate binary capabilities and command-line parameters without reading vectors.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
@@ -73,6 +76,9 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
   if (config.num_memory_nodes > RemotePtr::MEMORY_NODE_MASK + 1)
     lib_failure("--memory-nodes exceeds the 64-shard tagged pointer limit");
   if (config.R == 0) lib_failure("--R must be > 0");
+  if (config.beam_width == 0) lib_failure("--beam-width must be > 0");
+  if (!std::isfinite(config.alpha) || config.alpha < 1.0)
+    lib_failure("--alpha must be finite and >= 1.0");
   if (config.R > kMaxSupportedGraphDegree)
     lib_failure("--R exceeds the system-wide degree limit of " +
                 std::to_string(kMaxSupportedGraphDegree));
@@ -89,8 +95,11 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--partition-strategy must be balanced, bfs, or metis");
   if (config.partition_max_degree == 0)
     lib_failure("--partition-max-degree must be > 0");
-  if (config.partition_imbalance < 1.0)
-    lib_failure("--partition-imbalance must be >= 1.0");
+  if (config.partition_max_degree > config.R)
+    lib_failure("--partition-max-degree must be <= --R");
+  if (!std::isfinite(config.partition_imbalance) ||
+      config.partition_imbalance < 1.0)
+    lib_failure("--partition-imbalance must be finite and >= 1.0");
   return config;
 }
 

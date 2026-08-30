@@ -238,6 +238,28 @@ if (DVSTOR_STORAGE_NODE_ONLY)
     if (DVSTOR_BUILD_OFFLINE_TOOLS)
         dvstor_add_offline_tools()
     endif ()
+    if (DVSTOR_BUILD_TESTS)
+        enable_testing()
+        add_executable(offline_local_id_set_test
+            test/offline_local_id_set_test.cc)
+        dvstor_target_tool_includes(offline_local_id_set_test)
+        target_compile_options(offline_local_id_set_test PRIVATE -UNDEBUG)
+        add_test(NAME offline_local_id_set_test
+                 COMMAND offline_local_id_set_test)
+        set_tests_properties(offline_local_id_set_test PROPERTIES TIMEOUT 10)
+
+        add_executable(vamana_offline_graph_test
+            test/vamana_offline_graph_test.cc
+            tools/vamana_offline/dataset_io.cc
+            tools/vamana_offline/graph.cc
+            tools/vamana_offline/progress.cc)
+        dvstor_target_tool_includes(vamana_offline_graph_test)
+        target_link_libraries(vamana_offline_graph_test PRIVATE rdma_library)
+        target_compile_options(vamana_offline_graph_test PRIVATE -UNDEBUG)
+        add_test(NAME vamana_offline_graph_test
+                 COMMAND vamana_offline_graph_test)
+        set_tests_properties(vamana_offline_graph_test PROPERTIES TIMEOUT 10)
+    endif ()
 else ()
     find_path(DVSTOR_DOCA_INCLUDE_DIR doca_gpunetio.h
         HINTS "${DVSTOR_DOCA_ROOT}/include")

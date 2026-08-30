@@ -10,8 +10,8 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
-#include <utility>
 #include <unistd.h>
+#include <utility>
 
 #include "common/types.hh"
 
@@ -23,36 +23,46 @@ str format_duration(std::chrono::steady_clock::duration duration);
 class ProgressReporter {
 public:
   ProgressReporter(str label, size_t total)
-      : label_(std::move(label)),
-        total_(std::max<size_t>(total, 1)),
+      : label_(std::move(label)), total_(std::max<size_t>(total, 1)),
         interactive_(::isatty(fileno(stderr)) != 0),
-        start_(std::chrono::steady_clock::now()),
-        last_render_(start_),
+        start_(std::chrono::steady_clock::now()), last_render_(start_),
         thread_([this]() { run(); }) {}
 
-  ~ProgressReporter() { finish(); }
+  ~ProgressReporter() { stop(false); }
 
-  void increment(size_t value = 1) { current_.fetch_add(value, std::memory_order_relaxed); }
-
-  void finish() {
-    if (!finished_.exchange(true, std::memory_order_relaxed)) {
-      current_.store(total_, std::memory_order_relaxed);
-      if (thread_.joinable()) thread_.join();
-    }
+  void increment(size_t value = 1) {
+    current_.fetch_add(value, std::memory_order_relaxed);
   }
+
+  void finish() { stop(true); }
 
 private:
+  void stop(bool successful) {
+    bool expected = false;
+    if (!stopping_.compare_exchange_strong(expected, true,
+                                           std::memory_order_acq_rel)) {
+      return;
+    }
+    if (successful)
+      current_.store(total_, std::memory_order_relaxed);
+    successful_.store(successful, std::memory_order_relaxed);
+    finished_.store(true, std::memory_order_release);
+    if (thread_.joinable())
+      thread_.join();
+  }
   void run() {
-    while (!finished_.load(std::memory_order_relaxed)) {
-      render(false);
+    while (!finished_.load(std::memory_order_acquire)) {
+      render(false, false);
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
-    render(true);
+    render(true, successful_.load(std::memory_order_relaxed));
   }
 
-  void render(bool done) {
-    const size_t current = std::min(current_.load(std::memory_order_relaxed), total_);
-    const double ratio = static_cast<double>(current) / static_cast<double>(total_);
+  void render(bool terminal, bool successful) {
+    const size_t current =
+        std::min(current_.load(std::memory_order_relaxed), total_);
+    const double ratio =
+        static_cast<double>(current) / static_cast<double>(total_);
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = now - start_;
 
@@ -61,31 +71,41 @@ private:
 
     if (interactive_) {
       constexpr size_t bar_width = 28;
-      const size_t filled = static_cast<size_t>(ratio * static_cast<double>(bar_width));
+      const size_t filled =
+          static_cast<size_t>(ratio * static_cast<double>(bar_width));
       os << "[";
-      for (size_t i = 0; i < bar_width; ++i) os << (i < filled ? '=' : ' ');
+      for (size_t i = 0; i < bar_width; ++i)
+        os << (i < filled ? '=' : ' ');
       os << "] " << std::setw(3) << static_cast<int>(ratio * 100.0) << "% ";
       os << "(" << current << "/" << total_ << ") ";
       os << "elapsed " << format_duration(elapsed);
       if (current > 0 && current < total_) {
-        const auto estimated = std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed / ratio);
+        const auto estimated =
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                elapsed / ratio);
         os << " eta " << format_duration(estimated - elapsed);
       }
+      if (terminal)
+        os << (successful ? " done" : " aborted");
       std::cerr << '\r' << os.str();
-      if (done) std::cerr << '\n';
+      if (terminal)
+        std::cerr << '\n';
       std::cerr.flush();
       return;
     }
 
-    const size_t bucket = done ? 20 : static_cast<size_t>(ratio * 20.0);
+    const size_t bucket = terminal ? 20 : static_cast<size_t>(ratio * 20.0);
     const auto log_interval = std::chrono::seconds(15);
-    if (!done && bucket <= last_bucket_ && (now - last_render_) < log_interval) return;
+    if (!terminal && bucket <= last_bucket_ &&
+        (now - last_render_) < log_interval)
+      return;
     last_bucket_ = std::max(last_bucket_, bucket);
     last_render_ = now;
 
-    os << static_cast<int>(ratio * 100.0) << "% (" << current << "/" << total_ << ") elapsed "
-       << format_duration(elapsed);
-    if (done) os << " done";
+    os << static_cast<int>(ratio * 100.0) << "% (" << current << "/" << total_
+       << ") elapsed " << format_duration(elapsed);
+    if (terminal)
+      os << (successful ? " done" : " aborted");
     std::cerr << os.str() << '\n';
   }
 
@@ -94,6 +114,8 @@ private:
   const bool interactive_;
   const std::chrono::steady_clock::time_point start_;
   std::atomic<size_t> current_{0};
+  std::atomic<bool> stopping_{false};
+  std::atomic<bool> successful_{false};
   std::atomic<bool> finished_{false};
   size_t last_bucket_{0};
   std::chrono::steady_clock::time_point last_render_;
@@ -101,35 +123,50 @@ private:
 };
 
 template <class Function>
-void parallel_for(size_t begin, size_t end, size_t num_threads, Function&& fn) {
+void parallel_for(size_t begin, size_t end, size_t num_threads, Function &&fn) {
   num_threads = effective_thread_count(num_threads);
   if (num_threads == 1 || end <= begin + 1) {
-    for (size_t i = begin; i < end; ++i) fn(i, 0);
+    for (size_t i = begin; i < end; ++i)
+      fn(i, 0);
     return;
   }
+  num_threads = std::min(num_threads, end - begin);
   std::atomic<size_t> current{begin};
   std::exception_ptr last_exception;
   std::mutex exception_mutex;
   vec<std::thread> threads;
   threads.reserve(num_threads);
-  for (size_t tid = 0; tid < num_threads; ++tid) {
-    threads.emplace_back([&, tid]() {
-      for (;;) {
-        const size_t i = current.fetch_add(1);
-        if (i >= end) return;
-        try { fn(i, tid); }
-        catch (...) {
-          std::lock_guard<std::mutex> lock(exception_mutex);
-          if (!last_exception) last_exception = std::current_exception();
-          current.store(end);
-          return;
+  try {
+    for (size_t tid = 0; tid < num_threads; ++tid) {
+      threads.emplace_back([&, tid]() {
+        for (;;) {
+          const size_t i = current.fetch_add(1);
+          if (i >= end)
+            return;
+          try {
+            fn(i, tid);
+          } catch (...) {
+            std::lock_guard<std::mutex> lock(exception_mutex);
+            if (!last_exception)
+              last_exception = std::current_exception();
+            current.store(end);
+            return;
+          }
         }
-      }
-    });
+      });
+    }
+  } catch (...) {
+    current.store(end, std::memory_order_relaxed);
+    for (auto &thread : threads) {
+      if (thread.joinable())
+        thread.join();
+    }
+    throw;
   }
-  for (auto& t : threads) t.join();
-  if (last_exception) std::rethrow_exception(last_exception);
+  for (auto &t : threads)
+    t.join();
+  if (last_exception)
+    std::rethrow_exception(last_exception);
 }
 
-
-}  // namespace tools::vamana_offline
+} // namespace tools::vamana_offline

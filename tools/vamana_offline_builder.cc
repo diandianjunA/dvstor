@@ -7,6 +7,7 @@
 #include "tools/vamana_offline/config.hh"
 #include "tools/vamana_offline/dataset_io.hh"
 #include "tools/vamana_offline/graph.hh"
+#include "tools/vamana_offline/partitioning.hh"
 #include "tools/vamana_offline/progress.hh"
 #include "tools/vamana_offline/recall_check.hh"
 #include "tools/vamana_offline/shard_writer.hh"
@@ -16,6 +17,15 @@ using namespace tools::vamana_offline;
 
 int main(int argc, char** argv) {
   const VamanaBuildConfig config = parse_configuration(argc, argv);
+  if (config.partition_strategy == "metis") {
+    lib_assert(metis_partitioning_available(), metis_unavailable_reason());
+    lib_assert(metis_index_bits() >= 64,
+               "METIS partitioning for large indexes requires a 64-bit idx_t build");
+  }
+  std::cerr << "offline builder preflight: metis="
+            << (metis_partitioning_available() ? "enabled" : "disabled")
+            << " metis_idx_bits=" << metis_index_bits() << "\n";
+  if (config.preflight_only) return EXIT_SUCCESS;
   const Dataset dataset = read_dataset(config);
   const filepath_t output_prefix =
       config.output_prefix.empty()

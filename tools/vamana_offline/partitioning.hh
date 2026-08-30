@@ -27,9 +27,11 @@ struct PartitionStats {
 };
 
 bool metis_partitioning_available();
+u32 metis_index_bits();
 str metis_unavailable_reason();
 u64 pack_undirected_edge(u32 a, u32 b);
-void append_partition_edges(u32 source, const vec<u32>& neighbors, u32 max_degree, vec<u64>& edges);
+void append_partition_edges(u32 source, size_t num_nodes, const vec<u32>& neighbors,
+                            u32 max_degree, vec<u64>& edges);
 vec<u32> compute_metis_partition(size_t num_nodes,
                                  vec<u64>& edges,
                                  const PartitionOptions& options,

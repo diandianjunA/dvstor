@@ -61,7 +61,27 @@ Dataset read_dataset(const VamanaBuildConfig& config) {
   dataset.total_vectors = read_u32(input);
   dataset.dim = read_u32(input);
   dataset.vector_bytes = vector_dtype_bytes(dataset.dtype, dataset.dim);
+  lib_assert(dataset.dim > 0, "dataset dimension must be > 0");
+  lib_assert(dataset.vector_bytes > 0, "dataset vector byte size must be > 0");
+  lib_assert(static_cast<size_t>(dataset.total_vectors) <=
+                 (std::numeric_limits<size_t>::max() - 2 * sizeof(u32)) /
+                     dataset.vector_bytes,
+             "dataset file size calculation overflows");
+  const size_t expected_file_bytes = 2 * sizeof(u32) +
+      static_cast<size_t>(dataset.total_vectors) * dataset.vector_bytes;
+  std::error_code file_size_error;
+  const auto actual_file_bytes =
+      std::filesystem::file_size(dataset.source_file, file_size_error);
+  lib_assert(!file_size_error,
+             "cannot stat dataset file: " + dataset.source_file.string());
+  lib_assert(actual_file_bytes == expected_file_bytes,
+             "dataset file size does not match its header: expected " +
+                 std::to_string(expected_file_bytes) + ", got " +
+                 std::to_string(actual_file_bytes));
   dataset.vector_count = std::min(dataset.total_vectors, config.max_vectors);
+  lib_assert(dataset.vector_count <=
+                 std::numeric_limits<size_t>::max() / dataset.vector_bytes,
+             "dataset memory allocation size overflows");
   lib_assert(dataset.vector_count > 0, "dataset is empty");
   lib_assert(dataset.vector_count <= static_cast<size_t>(std::numeric_limits<u32>::max()),
              "offline builder currently supports at most 2^32-1 vectors");

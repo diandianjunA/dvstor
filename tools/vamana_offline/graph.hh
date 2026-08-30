@@ -37,6 +37,10 @@ struct NodeLockGuard {
   size_t node;
   NodeLockGuard(VamanaGraph& graph_, size_t node_) : graph(graph_), node(node_) { graph.lock_node(node); }
   ~NodeLockGuard() { graph.unlock_node(node); }
+  NodeLockGuard(const NodeLockGuard&) = delete;
+  NodeLockGuard& operator=(const NodeLockGuard&) = delete;
+  NodeLockGuard(NodeLockGuard&&) = delete;
+  NodeLockGuard& operator=(NodeLockGuard&&) = delete;
 };
 
 size_t compute_medoid(const Dataset& dataset);

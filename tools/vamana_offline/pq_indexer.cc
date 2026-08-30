@@ -414,6 +414,7 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   if (!metadata_input.good()) throw std::runtime_error("missing metadata: " + metadata_path.string());
   nlohmann::json metadata;
   metadata_input >> metadata;
+  const nlohmann::json graph_metadata = metadata;
   const Layout layout = parse_layout(metadata);
   const u32 hardware_threads = std::max(1u, std::thread::hardware_concurrency());
   const u32 training_threads = options.threads == 0
@@ -483,7 +484,15 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   gpu_search::format::View manifest;
   if (!gpu_search::format::synthesize_distributed_view(
         options.index_prefix, manifest, &error)) {
-    throw std::runtime_error(error);
+    try {
+      write_metadata_atomic(metadata_path, graph_metadata);
+    } catch (const std::exception& rollback_error) {
+      throw std::runtime_error(
+        error + "; failed to restore schema-15 metadata: " +
+        rollback_error.what());
+    }
+    throw std::runtime_error(
+      error + "; schema-15 metadata was restored for PQ retry");
   }
   std::cerr << "PQ index ready: nodes=" << result.node_count
             << " code_bytes=" << result.code_bytes

@@ -1,0 +1,253 @@
+[state] dataset=DEEP100M stage=graph prefix=/tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke
+[state] graph recovery metadata=/tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke.graph.meta.json
+5e5035302448621da3f400b7d16d3c9cbfd63989e9671c5688804b1ee4c1ef72  /home/xjs/experiment/dvstor/build/vamana_offline_builder
+1e771d49ed6846cca99328fd9a4e682aff782268700fd27ade61b52214510914  /home/xjs/experiment/dvstor/build/vamana_pq_indexer
+e10b64edcf137b246937140f396cc0824c367213a714716cba080a8e81a710bf  /home/xjs/experiment/dvstor/build/vamana_graph_extent_indexer
+[graph] command: /home/xjs/experiment/dvstor/build/vamana_offline_builder --data-path /data/xjs/datasets/deep1b/deep100m/100M.fbin --output-prefix /tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke --memory-nodes 5 --partition-strategy metis --R 96 --beam-width 128 --alpha 1.2 --threads 8 --max-vectors 512 --vector-data-type float32 --partition-max-degree 32 --partition-imbalance 1.03 --skip-sanity-check
+offline builder preflight: metis=enabled metis_idx_bits=64
+reading dataset "/data/xjs/datasets/deep1b/deep100m/100M.fbin" (dim=96, vectors=512/100000000, dtype=float32, vector_bytes=384)
+Reading raw dataset 100% (512/512) elapsed 0s done
+offline dataset memory: raw_vectors=196608 bytes, float_expansion=0 bytes
+output prefix: "/tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke"
+memory nodes: 5
+threads: 8
+R=96 construction_beam_width=128 alpha=1.2 vector_data_type=float32
+partition_strategy=metis partition_max_degree=32 partition_imbalance=1.03
+skip_sanity_check=true
+offline distance execution: cpu-avx2
+offline graph memory: neighbors=196608 bytes, degrees=512 bytes, lock_stripes=512
+computing medoid...
+medoid: node 250
+initializing random R-regular graph (degree=96)...
+random graph unique neighbor signature ratio=1 sample=512
+note: using alpha=1.0 for construction (config alpha=1.2 stored in metadata)
+reverse edge maintenance: cheap append plus bulk consolidation
+Building Vamana graph 100% (512/512) elapsed 0s done
+building reverse-edge CSR for bulk consolidation...
+bulk reverse consolidation memory: incoming_edges=7111 edge_bytes=28444 offset_bytes=4104 count_bytes=2048
+Bulk reverse-edge consolidation 100% (512/512) elapsed 0s done
+graph stats: avg_degree=11.3926 max=19 min=6
+partition strategy: metis max_degree=32 imbalance=1.03
+METIS partition edges: input=5833 unique=4172 edge_cut=2186 partition_cut_ratio=0.523969
+partition node counts: 101 104 102 103 102
+active neighbor cross-shard ratio: 0.511229
+Exporting Vamana shards 100% (517/517) elapsed 0s done
+offline build finished in 0.756677 seconds
+[validate] schema-15 graph stage is complete and resumable: /tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke
+[graph] committed recovery metadata: /tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke.graph.meta.json
+[validate] schema-15 graph stage is complete and resumable: /tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke
+[pq] command: /home/xjs/experiment/dvstor/build/vamana_pq_indexer --index-prefix /tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke --subquantizers 32 --train-samples 256 --opq-iterations 1 --pq-iterations 1 --chunk-vectors 256 --threads 8 --seed 1234 --overwrite
+PQ CPU runtime: threads=8 hardware_threads=112
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+OPQMatrix::train: training an OPQ rotation matrix for M=32 from 256 vectors in 96D -> 96D
+  OPQMatrix::train: making random 96*96 rotation
+Training PQ slice 0/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 1/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 2/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 3/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 4/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 5/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 6/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 7/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 8/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 9/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 10/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 11/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 12/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 13/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 14/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 15/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 16/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 17/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 18/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 19/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 20/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 21/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 22/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 23/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 24/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 25/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 26/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 27/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 28/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 29/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 30/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 31/32
+Number of training points (256) same as number of clusters, just copying
+    encode / decode
+    Iteration 0 (1 PQ iterations):0.004 s, obj=0
+    X * recons
+Training PQ slice 0/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 1/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 2/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 3/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 4/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 5/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 6/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 7/32
+Number of training points (256) same as number of clusters, just copying
+Training PQWARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+ slice 8/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 9/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 10/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 11/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 12/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 13/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 14/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 15/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 16/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 17/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 18/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 19/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 20/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 21/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 22/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 23/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 24/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 25/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 26/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 27/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 28/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 29/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 30/32
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 31/32
+Number of training points (256) same as number of clusters, just copying
+PQ encoder audit shard 1/5: vectors=64 component_mismatches=0
+PQ encoding shard 1/5: 101/101
+PQ encoder audit shard 2/5: vectors=64 component_mismatches=0
+PQ encoding shard 2/5: 104/104
+PQ encoder audit shard 3/5: vectors=64 component_mismatches=0
+PQ encoding shard 3/5: 102/102
+PQ encoder audit shard 4/5: vectors=64 component_mismatches=0
+PQ encoding shard 4/5: 103/103
+PQ encoder audit shard 5/5: vectors=64 component_mismatches=0
+PQ encoding shard 5/5: 102/102
+PQ index ready: nodes=512 code_bytes=16384 model_checksum=16423744722524240835
+[extent] command: /home/xjs/experiment/dvstor/build/vamana_graph_extent_indexer --index-prefix /tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke --overwrite
+GPU graph extent sidecar built: output="/tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke.gextent8" nodes=512 payload_bytes=512 graph_bytes_validated=425984 maximum_class=3 payload_checksum=8164796985754365131
+[build] complete: /tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke
+[build] resumable graph commit: /tmp/dvstor_deep_smoke.7ksftk/index/deep_smoke.graph.meta.json
+[build] log: /home/xjs/experiment/dvstor/experiment/deep100m/logs/build_metis_20260829_123857.log

@@ -1,0 +1,8 @@
+[state] dataset=SPACEV100M stage=complete prefix=/tmp/dvstor_space_smoke.R6Euro/index/space_smoke
+[state] graph recovery metadata=/tmp/dvstor_space_smoke.R6Euro/index/space_smoke.graph.meta.json
+5e5035302448621da3f400b7d16d3c9cbfd63989e9671c5688804b1ee4c1ef72  /home/xjs/experiment/dvstor/build/vamana_offline_builder
+1e771d49ed6846cca99328fd9a4e682aff782268700fd27ade61b52214510914  /home/xjs/experiment/dvstor/build/vamana_pq_indexer
+e10b64edcf137b246937140f396cc0824c367213a714716cba080a8e81a710bf  /home/xjs/experiment/dvstor/build/vamana_graph_extent_indexer
+[build] complete: /tmp/dvstor_space_smoke.R6Euro/index/space_smoke
+[build] resumable graph commit: /tmp/dvstor_space_smoke.R6Euro/index/space_smoke.graph.meta.json
+[build] log: /home/xjs/experiment/dvstor/experiment/spacev100m/logs/build_metis_20260829_123913.log

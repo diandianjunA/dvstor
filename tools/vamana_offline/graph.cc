@@ -11,60 +11,12 @@
 #include <library/utils.hh>
 
 #include "common/constants.hh"
+#include "tools/vamana_offline/local_id_set.hh"
 #include "tools/vamana_offline/progress.hh"
 
 namespace tools::vamana_offline {
 
 namespace {
-
-class LocalIdSet {
-public:
-  explicit LocalIdSet(size_t expected_items) {
-    size_t capacity = 1;
-    while (capacity < expected_items * 2) capacity <<= 1;
-    table_.assign(capacity, kEmpty);
-    mask_ = capacity - 1;
-  }
-
-  bool contains(u32 value) const {
-    size_t pos = hash(value) & mask_;
-    for (;;) {
-      const u32 current = table_[pos];
-      if (current == kEmpty) return false;
-      if (current == value) return true;
-      pos = (pos + 1) & mask_;
-    }
-  }
-
-  bool insert(u32 value) {
-    size_t pos = hash(value) & mask_;
-    for (;;) {
-      const u32 current = table_[pos];
-      if (current == value) return false;
-      if (current == kEmpty) {
-        table_[pos] = value;
-        return true;
-      }
-      pos = (pos + 1) & mask_;
-    }
-  }
-
-private:
-  static constexpr u32 kEmpty = std::numeric_limits<u32>::max();
-
-  static size_t hash(u32 value) {
-    uint64_t x = value;
-    x ^= x >> 16;
-    x *= 0x7feb352dU;
-    x ^= x >> 15;
-    x *= 0x846ca68bU;
-    x ^= x >> 16;
-    return static_cast<size_t>(x);
-  }
-
-  vec<u32> table_;
-  size_t mask_{0};
-};
 
 bool candidate_id_less(const std::pair<float, u32>& a, const std::pair<float, u32>& b) {
   if (a.first != b.first) return a.first < b.first;
@@ -103,8 +55,11 @@ void insert_sorted_beam(vec<std::pair<float, u32>>& beam,
 }  // namespace
 
 void VamanaGraph::init(size_t n, u32 d, u32 max_degree, size_t requested_lock_stripes) {
+  lib_assert(n > 0, "offline graph requires at least one node");
   lib_assert(max_degree > 0 && max_degree <= kMaxSupportedGraphDegree,
              "offline graph degree exceeds the system-wide limit");
+  lib_assert(n <= std::numeric_limits<size_t>::max() / static_cast<size_t>(max_degree),
+             "offline graph neighbor allocation size overflows");
   num_nodes = n;
   dim = d;
   R = max_degree;
@@ -424,6 +379,10 @@ void build_vamana_graph(VamanaGraph& graph,
   const float alpha = static_cast<float>(config.alpha);
   const u32 beam_width = config.beam_width;
   const size_t num_threads = effective_thread_count(config.threads);
+
+  lib_assert(beam_width > 0, "offline graph beam width must be > 0");
+  lib_assert(n > static_cast<size_t>(R),
+             "dataset must contain at least R + 1 vectors");
 
   graph.init(n, dataset.dim, R);
 

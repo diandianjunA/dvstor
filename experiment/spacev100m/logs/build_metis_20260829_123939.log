@@ -1,0 +1,149 @@
+[state] dataset=SPACEV100M stage=pq prefix=/tmp/dvstor_space_smoke.R6Euro/index/space_smoke
+[state] graph recovery metadata=/tmp/dvstor_space_smoke.R6Euro/index/space_smoke.graph.meta.json
+5e5035302448621da3f400b7d16d3c9cbfd63989e9671c5688804b1ee4c1ef72  /home/xjs/experiment/dvstor/build/vamana_offline_builder
+1e771d49ed6846cca99328fd9a4e682aff782268700fd27ade61b52214510914  /home/xjs/experiment/dvstor/build/vamana_pq_indexer
+e10b64edcf137b246937140f396cc0824c367213a714716cba080a8e81a710bf  /home/xjs/experiment/dvstor/build/vamana_graph_extent_indexer
+[validate] schema-15 graph stage is complete and resumable: /tmp/dvstor_space_smoke.R6Euro/index/space_smoke
+[pq] command: /home/xjs/experiment/dvstor/build/vamana_pq_indexer --index-prefix /tmp/dvstor_space_smoke.R6Euro/index/space_smoke --subquantizers 20 --train-samples 256 --opq-iterations 1 --pq-iterations 1 --chunk-vectors 256 --threads 8 --seed 1234 --overwrite
+PQ CPU runtime: threads=8 hardware_threads=112
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+OPQMatrix::train: training an OPQ rotation matrix for M=20 from 256 vectors in 100D -> 100D
+  OPQMatrix::train: making random 100*100 rotation
+Training PQ slice 0/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 1/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 2/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 3/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 4/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 5/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 6/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 7/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 8/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 9/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 10/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 11/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 12/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 13/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 14/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 15/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 16/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 17/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 18/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 19/20
+Number of training points (256) same as number of clusters, just copying
+    encode / decode
+    Iteration 0 (1 PQ iterations):0.002 s, obj=0
+    X * recons
+Training PQ slice 0/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 1/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 2/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 3/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 4/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 5/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 6/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 7/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 8/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 9/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 10/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 11/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 12/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 13/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 14/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 15/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 16/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 17/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 18/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 19/20
+Number of training points (256) same as number of clusters, just copying
+PQ encoder audit shard 1/5: vectors=64 component_mismatches=0
+PQ encoding shard 1/5: 99/99
+PQ encoder audit shard 2/5: vectors=64 component_mismatches=0
+PQ encoding shard 2/5: 105/105
+PQ encoder audit shard 3/5: vectors=64 component_mismatches=0
+PQ encoding shard 3/5: 99/99
+PQ encoder audit shard 4/5: vectors=64 component_mismatches=0
+PQ encoding shard 4/5: 105/105
+PQ encoder audit shard 5/5: vectors=64 component_mismatches=0
+PQ encoding shard 5/5: 104/104
+PQ index ready: nodes=512 code_bytes=10240 model_checksum=10610452066134751985
+[extent] command: /home/xjs/experiment/dvstor/build/vamana_graph_extent_indexer --index-prefix /tmp/dvstor_space_smoke.R6Euro/index/space_smoke --overwrite
+GPU graph extent sidecar built: output="/tmp/dvstor_space_smoke.R6Euro/index/space_smoke.gextent8" nodes=512 payload_bytes=512 graph_bytes_validated=425984 maximum_class=4 payload_checksum=5544532913897639488
+[build] complete: /tmp/dvstor_space_smoke.R6Euro/index/space_smoke
+[build] resumable graph commit: /tmp/dvstor_space_smoke.R6Euro/index/space_smoke.graph.meta.json
+[build] log: /home/xjs/experiment/dvstor/experiment/spacev100m/logs/build_metis_20260829_123939.log

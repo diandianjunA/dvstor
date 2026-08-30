@@ -1,0 +1,181 @@
+[state] dataset=SPACEV100M stage=graph prefix=/tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic
+[state] graph recovery metadata=/tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic.graph.meta.json
+906c9fd9aad8bff6bcdefd6640ebb3197ac83140f2bfca7e2935d3dfbbea1c50  /home/xjs/experiment/dvstor/build/vamana_offline_builder
+840349f8baedadbdf56925b77e49774c75460d8af45ede1c2b622fddfd8b0c84  /home/xjs/experiment/dvstor/build/vamana_pq_indexer
+e10b64edcf137b246937140f396cc0824c367213a714716cba080a8e81a710bf  /home/xjs/experiment/dvstor/build/vamana_graph_extent_indexer
+[graph] command: /home/xjs/experiment/dvstor/build/vamana_offline_builder --data-path /data/xjs/datasets/spacev1b/spacev100m/spacev100m_base.i8bin --output-prefix /tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic --memory-nodes 5 --partition-strategy metis --R 96 --beam-width 128 --alpha 1.2 --threads 8 --max-vectors 256 --vector-data-type int8 --partition-max-degree 32 --partition-imbalance 1.03 --skip-sanity-check
+offline builder preflight: metis=enabled metis_idx_bits=64
+reading dataset "/data/xjs/datasets/spacev1b/spacev100m/spacev100m_base.i8bin" (dim=100, vectors=256/100000000, dtype=int8, vector_bytes=100)
+Reading raw dataset 100% (256/256) elapsed 0s done
+offline dataset memory: raw_vectors=25600 bytes, float_expansion=0 bytes
+output prefix: "/tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic"
+memory nodes: 5
+threads: 8
+R=96 construction_beam_width=128 alpha=1.2 vector_data_type=int8
+partition_strategy=metis partition_max_degree=32 partition_imbalance=1.03
+skip_sanity_check=true
+offline distance execution: cpu-avx2
+offline graph memory: neighbors=98304 bytes, degrees=256 bytes, lock_stripes=256
+computing medoid...
+medoid: node 38
+initializing random R-regular graph (degree=96)...
+random graph unique neighbor signature ratio=1 sample=256
+note: using alpha=1.0 for construction (config alpha=1.2 stored in metadata)
+reverse edge maintenance: cheap append plus bulk consolidation
+Building Vamana graph 100% (256/256) elapsed 0s done
+building reverse-edge CSR for bulk consolidation...
+bulk reverse consolidation memory: incoming_edges=3081 edge_bytes=12324 offset_bytes=2056 count_bytes=1024
+Bulk reverse-edge consolidation 100% (256/256) elapsed 0s done
+graph stats: avg_degree=9.75 max=23 min=4
+partition strategy: metis max_degree=32 imbalance=1.03
+METIS partition edges: input=2496 unique=1816 edge_cut=997 partition_cut_ratio=0.549009
+partition node counts: 51 51 51 52 51
+active neighbor cross-shard ratio: 0.552083
+Exporting Vamana shards 100% (261/261) elapsed 0s done
+offline build finished in 0.754667 seconds
+[validate] schema-15 graph stage is complete and resumable: /tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic
+[graph] committed recovery metadata: /tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic.graph.meta.json
+[validate] schema-15 graph stage is complete and resumable: /tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic
+[pq] command: /home/xjs/experiment/dvstor/build/vamana_pq_indexer --index-prefix /tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic --subquantizers 20 --train-samples 256 --opq-iterations 1 --pq-iterations 1 --chunk-vectors 256 --threads 8 --seed 1234 --overwrite
+PQ CPU runtime: threads=8 hardware_threads=112
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+WARNING clustering 256 points to 256 centroids: please provide at least 9984 training points
+OPQMatrix::train: training an OPQ rotation matrix for M=20 from 256 vectors in 100D -> 100D
+  OPQMatrix::train: making random 100*100 rotation
+Training PQ slice 0/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 1/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 2/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 3/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 4/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 5/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 6/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 7/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 8/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 9/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 10/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 11/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 12/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 13/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 14/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 15/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 16/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 17/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 18/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 19/20
+Number of training points (256) same as number of clusters, just copying
+    encode / decode
+    Iteration 0 (1 PQ iterations):0.003 s, obj=0
+    X * recons
+Training PQ slice 0/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 1/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 2/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 3/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 4/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 5/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 6/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 7/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 8/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 9/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 10/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 11/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 12/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 13/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 14/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 15/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 16/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 17/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 18/20
+Number of training points (256) same as number of clusters, just copying
+Training PQ slice 19/20
+Number of training points (256) same as number of clusters, just copying
+PQ encoder audit shard 1/5: vectors=51 component_mismatches=0
+PQ encoding shard 1/5: 51/51
+PQ encoder audit shard 2/5: vectors=51 component_mismatches=0
+PQ encoding shard 2/5: 51/51
+PQ encoder audit shard 3/5: vectors=51 component_mismatches=0
+PQ encoding shard 3/5: 51/51
+PQ encoder audit shard 4/5: vectors=52 component_mismatches=0
+PQ encoding shard 4/5: 52/52
+PQ encoder audit shard 5/5: vectors=51 component_mismatches=0
+PQ encoding shard 5/5: 51/51
+PQ index ready: nodes=256 code_bytes=5120 model_checksum=3729716652276147958
+[extent] command: /home/xjs/experiment/dvstor/build/vamana_graph_extent_indexer --index-prefix /tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic --overwrite
+GPU graph extent sidecar built: output="/tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic.gextent8" nodes=256 payload_bytes=256 graph_bytes_validated=212992 maximum_class=3 payload_checksum=3930645473848549877
+[build] complete: /tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic
+[build] resumable graph commit: /tmp/dvstor_atomic_smoke.5t6RVK/index/space_atomic.graph.meta.json
+[build] log: /home/xjs/experiment/dvstor/experiment/spacev100m/logs/build_metis_20260829_124504.log

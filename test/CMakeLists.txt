@@ -36,6 +36,23 @@ dvstor_target_common_includes(vector_dtype_test)
 target_compile_options(vector_dtype_test PRIVATE -UNDEBUG)
 add_test(NAME vector_dtype_test COMMAND vector_dtype_test)
 
+add_executable(offline_local_id_set_test offline_local_id_set_test.cc)
+dvstor_target_tool_includes(offline_local_id_set_test)
+target_compile_options(offline_local_id_set_test PRIVATE -UNDEBUG)
+add_test(NAME offline_local_id_set_test COMMAND offline_local_id_set_test)
+set_tests_properties(offline_local_id_set_test PROPERTIES TIMEOUT 10)
+
+add_executable(vamana_offline_graph_test
+    vamana_offline_graph_test.cc
+    ../tools/vamana_offline/dataset_io.cc
+    ../tools/vamana_offline/graph.cc
+    ../tools/vamana_offline/progress.cc)
+dvstor_target_tool_includes(vamana_offline_graph_test)
+target_link_libraries(vamana_offline_graph_test PRIVATE rdma_library)
+target_compile_options(vamana_offline_graph_test PRIVATE -UNDEBUG)
+add_test(NAME vamana_offline_graph_test COMMAND vamana_offline_graph_test)
+set_tests_properties(vamana_offline_graph_test PROPERTIES TIMEOUT 10)
+
 add_executable(adaptive_frontier_policy_test adaptive_frontier_policy_test.cc)
 dvstor_target_common_includes(adaptive_frontier_policy_test)
 target_link_libraries(adaptive_frontier_policy_test PRIVATE rdma_library)

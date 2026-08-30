@@ -71,6 +71,14 @@ bool metis_partitioning_available() {
   return DVSTOR_HAVE_METIS != 0;
 }
 
+u32 metis_index_bits() {
+#if DVSTOR_HAVE_METIS
+  return static_cast<u32>(sizeof(metis_idx_t) * 8);
+#else
+  return 0;
+#endif
+}
+
 str metis_unavailable_reason() {
 #if DVSTOR_HAVE_METIS
   return {};
@@ -88,9 +96,17 @@ u64 pack_undirected_edge(u32 a, u32 b) {
   return (static_cast<u64>(lo) << 32) | static_cast<u64>(hi);
 }
 
-void append_partition_edges(u32 source, const vec<u32>& neighbors, u32 max_degree, vec<u64>& edges) {
+void append_partition_edges(u32 source, size_t num_nodes,
+                            const vec<u32>& neighbors, u32 max_degree,
+                            vec<u64>& edges) {
+  if (source >= num_nodes) {
+    throw std::runtime_error("partition edge source is outside graph");
+  }
   const size_t limit = std::min<size_t>(neighbors.size(), max_degree);
   for (size_t i = 0; i < limit; ++i) {
+    if (neighbors[i] >= num_nodes) {
+      throw std::runtime_error("partition edge references node outside graph");
+    }
     const u64 edge = pack_undirected_edge(source, neighbors[i]);
     if (edge != 0) {
       edges.push_back(edge);
@@ -128,6 +144,10 @@ vec<u32> compute_metis_partition(size_t num_nodes,
   edges.erase(std::remove(edges.begin(), edges.end(), 0), edges.end());
   std::sort(edges.begin(), edges.end());
   edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+
+  if (edges.size() > std::numeric_limits<size_t>::max() / 2) {
+    throw std::runtime_error("partition adjacency entry count overflows");
+  }
 
   if (stats != nullptr) {
     stats->unique_edges = edges.size();

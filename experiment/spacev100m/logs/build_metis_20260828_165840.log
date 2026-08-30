@@ -1,0 +1,22 @@
+[build] command: /home/xjs/experiment/dvstor/build/vamana_offline_builder --data-path /data/xjs/datasets/spacev1b/spacev100m/spacev100m_base.i8bin --output-prefix /data/xjs/index/dvstor_spacev100m/index/spacev100m_R96_bw128_metis_pmd32_pq20_schema16 --memory-nodes 5 --partition-strategy metis --R 96 --beam-width 128 --alpha 1.2 --threads 32 --max-vectors 100000000 --vector-data-type int8 --partition-max-degree 32 --partition-imbalance 1.03 --skip-sanity-check
+reading dataset "/data/xjs/datasets/spacev1b/spacev100m/spacev100m_base.i8bin" (dim=100, vectors=100000000/100000000, dtype=int8, vector_bytes=100)
+Reading raw dataset 14% (14092848/100000000) elapsed 0s
+Reading raw dataset 28% (28185696/100000000) elapsed 0s
+Reading raw dataset 40% (40936368/100000000) elapsed 0s
+Reading raw dataset 54% (54358128/100000000) elapsed 1s
+Reading raw dataset 68% (68450976/100000000) elapsed 1s
+Reading raw dataset 81% (81201648/100000000) elapsed 1s
+Reading raw dataset 94% (94623408/100000000) elapsed 1s
+Reading raw dataset 100% (100000000/100000000) elapsed 2s done
+offline dataset memory: raw_vectors=10000000000 bytes, float_expansion=0 bytes
+output prefix: "/data/xjs/index/dvstor_spacev100m/index/spacev100m_R96_bw128_metis_pmd32_pq20_schema16"
+memory nodes: 5
+threads: 32
+R=96 construction_beam_width=128 alpha=1.2 vector_data_type=int8
+partition_strategy=metis partition_max_degree=32 partition_imbalance=1.03
+skip_sanity_check=true
+offline distance execution: cpu-avx2
+offline graph memory: neighbors=38400000000 bytes, degrees=100000000 bytes, lock_stripes=1048576
+computing medoid...
+medoid: node 15248034
+initializing random R-regular graph (degree=96)...

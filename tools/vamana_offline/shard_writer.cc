@@ -72,6 +72,38 @@ size_t graph_input_edges(const VamanaGraph& graph) {
   return total;
 }
 
+void validate_graph_for_serialization(const VamanaGraph& graph,
+                                      const Dataset& dataset,
+                                      const VamanaBuildConfig& config) {
+  lib_assert(graph.num_nodes == dataset.size(),
+             "graph and dataset vector counts do not match");
+  lib_assert(graph.dim == dataset.dim,
+             "graph and dataset dimensions do not match");
+  lib_assert(graph.R == config.R,
+             "graph degree does not match build configuration");
+  lib_assert(graph.medoid < graph.num_nodes,
+             "graph medoid is outside the graph");
+
+  vec<u32> neighbors;
+  vec<u32> sorted;
+  for (size_t node = 0; node < graph.num_nodes; ++node) {
+    graph.copy_neighbors(node, neighbors);
+    lib_assert(neighbors.size() == graph.degree(node) &&
+                   neighbors.size() <= graph.R,
+               "graph node has an invalid stored degree");
+    sorted = neighbors;
+    std::sort(sorted.begin(), sorted.end());
+    for (size_t index = 0; index < sorted.size(); ++index) {
+      lib_assert(sorted[index] < graph.num_nodes,
+                 "graph edge references a node outside the graph");
+      lib_assert(sorted[index] != node,
+                 "graph contains a self edge");
+      lib_assert(index == 0 || sorted[index] != sorted[index - 1],
+                 "graph contains a duplicate edge");
+    }
+  }
+}
+
 vec<u32> compute_bfs_partition_graph(const VamanaGraph& graph,
                                      u32 num_parts,
                                      u32 start_node,
@@ -243,7 +275,8 @@ PlacementResult place_nodes(const VamanaGraph& graph,
     vec<u32> nbrs;
     for (size_t i = 0; i < graph.num_nodes; ++i) {
       graph.copy_neighbors(i, nbrs);
-      append_partition_edges(static_cast<u32>(i), nbrs, config.partition_max_degree, edges);
+      append_partition_edges(static_cast<u32>(i), graph.num_nodes, nbrs,
+                             config.partition_max_degree, edges);
     }
     PartitionOptions options;
     options.num_parts = config.num_memory_nodes;
@@ -350,6 +383,7 @@ void write_vamana_shards(const VamanaGraph& graph,
              "tagged RemotePtr supports between 1 and 64 physical shards");
   const size_t n = dataset.size();
   const u32 dim = dataset.dim;
+  validate_graph_for_serialization(graph, dataset, config);
   VamanaNode::disable_hot_graph();
   const size_t node_size = VamanaNode::total_size();
   const size_t aligned_size = (node_size + 7) & ~7ULL;
@@ -501,6 +535,9 @@ void write_vamana_shards(const VamanaGraph& graph,
   for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
     shard_files[shard].flush();
     lib_assert(shard_files[shard].good(), "failed to flush output shard file: " + shard_paths[shard].string());
+    shard_files[shard].close();
+    lib_assert(!shard_files[shard].fail(),
+               "failed to close output shard file: " + shard_paths[shard].string());
     progress.increment();
   }
 
@@ -603,6 +640,9 @@ void write_vamana_shards(const VamanaGraph& graph,
     lib_assert(output.good(),
                "failed to write centroid sidecar: " +
                  centroid_path.string());
+    output.close();
+    lib_assert(!output.fail(),
+               "failed to close centroid sidecar: " + centroid_path.string());
   }
 
   nlohmann::json metadata{
@@ -734,10 +774,21 @@ void write_vamana_shards(const VamanaGraph& graph,
   // advertises a partially-written authority directory set.
   const filepath_t metadata_file =
     filepath_t(output_prefix.string() + ".meta.json");
-  std::ofstream metadata_output(metadata_file);
-  metadata_output << std::setw(2) << metadata << std::endl;
-  lib_assert(metadata_output.good(),
-             "failed to write index metadata: " + metadata_file.string());
+  const filepath_t temporary_metadata =
+    filepath_t(metadata_file.string() + ".schema15.tmp");
+  {
+    std::ofstream metadata_output(temporary_metadata, std::ios::trunc);
+    metadata_output << std::setw(2) << metadata << std::endl;
+    metadata_output.close();
+    lib_assert(!metadata_output.fail(),
+               "failed to write temporary index metadata: " +
+                 temporary_metadata.string());
+  }
+  std::error_code metadata_error;
+  std::filesystem::rename(temporary_metadata, metadata_file, metadata_error);
+  lib_assert(!metadata_error,
+             "failed to publish index metadata atomically: " +
+               metadata_error.message());
   progress.finish();
 }
 
