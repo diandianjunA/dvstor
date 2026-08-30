@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstdint>
 #include <limits>
+#include "common/constants.hh"
 #include "gpu_search/persistent_kernel.hh"
 
 namespace gpu_search::memory_budget {
@@ -64,7 +65,7 @@ inline bool checked_sum(u64& result, Terms... terms) {
 
 inline Result estimate(const Request& request) {
   Result result;
-  if (request.nodes == 0 || request.nodes >= (1ull << 30) || request.dim == 0 ||
+  if (request.nodes == 0 || request.nodes > kMaxGpuNavigationNodes || request.dim == 0 ||
       request.pq_subquantizers == 0 || request.code_bytes == 0 ||
       request.code_bytes != request.pq_subquantizers ||
       request.dim % request.pq_subquantizers != 0 ||

@@ -36,11 +36,33 @@ dvstor_target_common_includes(vector_dtype_test)
 target_compile_options(vector_dtype_test PRIVATE -UNDEBUG)
 add_test(NAME vector_dtype_test COMMAND vector_dtype_test)
 
+add_executable(index_metadata_test
+    index_metadata_test.cc
+    ../src/service/index_metadata.cc
+    ../src/gpu_search/index_format.cc)
+dvstor_target_common_includes(index_metadata_test)
+target_compile_options(index_metadata_test PRIVATE -UNDEBUG)
+add_test(NAME index_metadata_test COMMAND index_metadata_test)
+set_tests_properties(index_metadata_test PROPERTIES TIMEOUT 10)
+
 add_executable(offline_local_id_set_test offline_local_id_set_test.cc)
 dvstor_target_tool_includes(offline_local_id_set_test)
 target_compile_options(offline_local_id_set_test PRIVATE -UNDEBUG)
 add_test(NAME offline_local_id_set_test COMMAND offline_local_id_set_test)
 set_tests_properties(offline_local_id_set_test PROPERTIES TIMEOUT 10)
+
+add_executable(shard_publication_test
+    shard_publication_test.cc
+    ../tools/vamana_offline/dataset_io.cc
+    ../tools/vamana_offline/graph.cc
+    ../tools/vamana_offline/partitioning.cc
+    ../tools/vamana_offline/progress.cc
+    ../tools/vamana_offline/shard_writer.cc)
+dvstor_target_tool_includes(shard_publication_test)
+target_link_libraries(shard_publication_test PRIVATE rdma_library)
+target_compile_options(shard_publication_test PRIVATE -UNDEBUG)
+add_test(NAME shard_publication_test COMMAND shard_publication_test)
+set_tests_properties(shard_publication_test PROPERTIES TIMEOUT 20)
 
 add_executable(vamana_offline_graph_test
     vamana_offline_graph_test.cc

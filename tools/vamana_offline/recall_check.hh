@@ -6,6 +6,9 @@
 
 namespace tools::vamana_offline {
 
+void preflight_optional_recall_inputs(
+  const Dataset& dataset, const VamanaBuildConfig& config);
+
 void run_optional_recall_check(VamanaGraph& graph,
                                const Dataset& dataset,
                                const VamanaBuildConfig& config);

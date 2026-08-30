@@ -31,6 +31,7 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -47,7 +48,30 @@ constexpr size_t kExternalQueueBytes = 128 * 1024;
 constexpr size_t kExternalDbrBytes = 4 * 1024;
 
 size_t align_up(const size_t value, const size_t alignment) {
-  return ((value + alignment - 1) / alignment) * alignment;
+  if (alignment == 0) {
+    throw std::invalid_argument("GPUNetIO alignment must be non-zero");
+  }
+  const size_t remainder = value % alignment;
+  if (remainder == 0) return value;
+  const size_t increment = alignment - remainder;
+  if (value > std::numeric_limits<size_t>::max() - increment) {
+    throw std::overflow_error("GPUNetIO aligned size overflows size_t");
+  }
+  return value + increment;
+}
+
+size_t checked_add(const size_t left, const size_t right, const char* what) {
+  if (left > std::numeric_limits<size_t>::max() - right) {
+    throw std::overflow_error(std::string(what) + " size overflows size_t");
+  }
+  return left + right;
+}
+
+uint32_t checked_u32_count(const size_t count, const char* what) {
+  if (count > std::numeric_limits<uint32_t>::max()) {
+    throw std::overflow_error(std::string(what) + " exceeds u32");
+  }
+  return static_cast<uint32_t>(count);
 }
 
 uint32_t byte_swap32(uint32_t value) {
@@ -106,7 +130,14 @@ void exchange_qp_info(Context& channel_context, QueuePair& channel_qp, const QPI
   channel_qp.post_receive(region);
   channel_qp.post_send_inlined(&local_info, sizeof(local_info), IBV_WR_SEND);
   channel_context.poll_send_cq_until_completion();
-  channel_context.receive();
+  const ReceiveInfo receive_info = channel_context.receive();
+  if (receive_info.bytes_written != sizeof(QPInfo)) {
+    throw std::runtime_error("GPUNetIO QPInfo receive length mismatch");
+  }
+  if (!remote_info.wire_valid()) {
+    throw std::runtime_error(
+      "GPUNetIO received invalid or incompatible QPInfo wire record");
+  }
 }
 
 char* gpu_pci_address(const uint32_t gpu_device, char (&bus_id)[32]) {
@@ -141,7 +172,10 @@ private:
   uint32_t count_{};
 };
 
-void qp_modify_to_init(doca_verbs_qp* qp) {
+void qp_modify_to_init(doca_verbs_qp* qp, u8 device_port) {
+  if (device_port == 0) {
+    throw std::runtime_error("GPUNetIO device port must be positive");
+  }
   doca_verbs_qp_attr* attr = nullptr;
   check_doca("doca_verbs_qp_attr_create", doca_verbs_qp_attr_create(&attr));
   check_doca("doca_verbs_qp_attr_set_next_state", doca_verbs_qp_attr_set_next_state(attr, DOCA_VERBS_QP_STATE_INIT));
@@ -149,7 +183,7 @@ void qp_modify_to_init(doca_verbs_qp* qp) {
   check_doca("doca_verbs_qp_attr_set_allow_remote_read", doca_verbs_qp_attr_set_allow_remote_read(attr, 1));
   check_doca("doca_verbs_qp_attr_set_atomic_mode", doca_verbs_qp_attr_set_atomic_mode(attr, DOCA_VERBS_QP_ATOMIC_MODE_IB_SPEC));
   check_doca("doca_verbs_qp_attr_set_pkey_index", doca_verbs_qp_attr_set_pkey_index(attr, 0));
-  check_doca("doca_verbs_qp_attr_set_port_num", doca_verbs_qp_attr_set_port_num(attr, 1));
+  check_doca("doca_verbs_qp_attr_set_port_num", doca_verbs_qp_attr_set_port_num(attr, device_port));
   check_doca("doca_verbs_qp_modify",
              doca_verbs_qp_modify(qp,
                                   attr,
@@ -159,7 +193,28 @@ void qp_modify_to_init(doca_verbs_qp* qp) {
   check_doca("doca_verbs_qp_attr_destroy", doca_verbs_qp_attr_destroy(attr));
 }
 
-void qp_modify_to_rtr(doca_verbs_context* verbs_context, doca_verbs_qp* qp, const QPInfo& remote_info) {
+enum doca_mtu_size doca_mtu_from_ibv(enum ibv_mtu mtu) {
+  switch (mtu) {
+    case IBV_MTU_256: return DOCA_MTU_SIZE_256_BYTES;
+    case IBV_MTU_512: return DOCA_MTU_SIZE_512_BYTES;
+    case IBV_MTU_1024: return DOCA_MTU_SIZE_1K_BYTES;
+    case IBV_MTU_2048: return DOCA_MTU_SIZE_2K_BYTES;
+    case IBV_MTU_4096: return DOCA_MTU_SIZE_4K_BYTES;
+    default: throw std::runtime_error("Unsupported negotiated RDMA path MTU");
+  }
+}
+
+void qp_modify_to_rtr(doca_verbs_context* verbs_context,
+                      doca_verbs_qp* qp,
+                      enum ibv_mtu local_active_mtu,
+                      u8 local_max_qp_rd_atom,
+                      const QPInfo& remote_info) {
+  if (!remote_info.wire_valid() ||
+      !QPInfo::mtu_valid(static_cast<u8>(local_active_mtu)) ||
+      local_max_qp_rd_atom == 0) {
+    throw std::runtime_error(
+      "Cannot configure GPUNetIO QP from invalid QPInfo/active MTU");
+  }
   doca_verbs_qp_attr* attr = nullptr;
   doca_verbs_ah_attr* ah_attr = nullptr;
   check_doca("doca_verbs_qp_attr_create", doca_verbs_qp_attr_create(&attr));
@@ -169,10 +224,14 @@ void qp_modify_to_rtr(doca_verbs_context* verbs_context, doca_verbs_qp* qp, cons
   check_doca("doca_verbs_ah_attr_set_dlid", doca_verbs_ah_attr_set_dlid(ah_attr, remote_info.lid));
   check_doca("doca_verbs_ah_attr_set_sl", doca_verbs_ah_attr_set_sl(ah_attr, 0));
   check_doca("doca_verbs_qp_attr_set_next_state", doca_verbs_qp_attr_set_next_state(attr, DOCA_VERBS_QP_STATE_RTR));
-  check_doca("doca_verbs_qp_attr_set_path_mtu", doca_verbs_qp_attr_set_path_mtu(attr, DOCA_MTU_SIZE_4K_BYTES));
+  check_doca("doca_verbs_qp_attr_set_path_mtu", doca_verbs_qp_attr_set_path_mtu(
+               attr, doca_mtu_from_ibv(
+                 remote_info.negotiated_mtu(local_active_mtu))));
   check_doca("doca_verbs_qp_attr_set_dest_qp_num", doca_verbs_qp_attr_set_dest_qp_num(attr, remote_info.qp_number));
   check_doca("doca_verbs_qp_attr_set_rq_psn", doca_verbs_qp_attr_set_rq_psn(attr, 0));
-  check_doca("doca_verbs_qp_attr_set_max_dest_rd_atomic", doca_verbs_qp_attr_set_max_dest_rd_atomic(attr, 16));
+  check_doca("doca_verbs_qp_attr_set_max_dest_rd_atomic", doca_verbs_qp_attr_set_max_dest_rd_atomic(
+               attr, remote_info.negotiated_max_qp_rd_atom(
+                 local_max_qp_rd_atom)));
   check_doca("doca_verbs_qp_attr_set_min_rnr_timer", doca_verbs_qp_attr_set_min_rnr_timer(attr, 12));
   check_doca("doca_verbs_qp_attr_set_ah_attr", doca_verbs_qp_attr_set_ah_attr(attr, ah_attr));
   check_doca("doca_verbs_qp_modify",
@@ -186,7 +245,13 @@ void qp_modify_to_rtr(doca_verbs_context* verbs_context, doca_verbs_qp* qp, cons
   check_doca("doca_verbs_qp_attr_destroy", doca_verbs_qp_attr_destroy(attr));
 }
 
-void qp_modify_to_rts(doca_verbs_qp* qp) {
+void qp_modify_to_rts(doca_verbs_qp* qp,
+                      u8 local_max_qp_init_rd_atom,
+                      const QPInfo& remote_info) {
+  if (!remote_info.wire_valid() || local_max_qp_init_rd_atom == 0) {
+    throw std::runtime_error(
+      "Cannot configure GPUNetIO RTS from invalid QPInfo/atomic limit");
+  }
   doca_verbs_qp_attr* attr = nullptr;
   check_doca("doca_verbs_qp_attr_create", doca_verbs_qp_attr_create(&attr));
   check_doca("doca_verbs_qp_attr_set_next_state", doca_verbs_qp_attr_set_next_state(attr, DOCA_VERBS_QP_STATE_RTS));
@@ -194,7 +259,9 @@ void qp_modify_to_rts(doca_verbs_qp* qp) {
   check_doca("doca_verbs_qp_attr_set_ack_timeout", doca_verbs_qp_attr_set_ack_timeout(attr, 14));
   check_doca("doca_verbs_qp_attr_set_retry_cnt", doca_verbs_qp_attr_set_retry_cnt(attr, 7));
   check_doca("doca_verbs_qp_attr_set_rnr_retry", doca_verbs_qp_attr_set_rnr_retry(attr, 7));
-  check_doca("doca_verbs_qp_attr_set_max_rd_atomic", doca_verbs_qp_attr_set_max_rd_atomic(attr, 16));
+  check_doca("doca_verbs_qp_attr_set_max_rd_atomic", doca_verbs_qp_attr_set_max_rd_atomic(
+               attr, remote_info.negotiated_max_qp_init_rd_atom(
+                 local_max_qp_init_rd_atom)));
   check_doca("doca_verbs_qp_modify",
              doca_verbs_qp_modify(qp,
                                   attr,
@@ -212,11 +279,40 @@ struct GpuNetioPersistentTransport::Impl {
        Context& context,
        ClientConnectionManager& cm,
        const MemoryRegionTokens& remote_regions)
-      : qps_per_node(std::max<u32>(1, config.gpu_rdma_qps)),
-        remote_region_count(static_cast<uint32_t>(remote_regions.size())) {
+      : cuda_device(static_cast<int>(config.gpu_device)),
+        qps_per_node(std::max<u32>(1, config.gpu_rdma_qps)),
+        remote_region_count(
+          checked_u32_count(remote_regions.size(), "GPUNetIO remote region count")) {
     if (data_bytes == 0 || remote_regions.empty()) {
-      throw std::invalid_argument("GPUNetIO transport requires non-empty data and remote regions");
+      throw std::invalid_argument(
+        "GPUNetIO transport requires non-empty data and remote regions");
     }
+    if (cm.server_qps.size() != remote_regions.size()) {
+      throw std::invalid_argument(
+        "GPUNetIO remote-region and storage-connection counts differ");
+    }
+    if (qps_per_node >
+        std::numeric_limits<uint32_t>::max() / remote_region_count) {
+      throw std::overflow_error("GPUNetIO total QP count exceeds u32");
+    }
+    for (size_t index = 0; index < remote_regions.size(); ++index) {
+      if (cm.server_qps[index] == nullptr || remote_regions[index] == nullptr ||
+          !remote_regions[index]->address_range_valid() ||
+          remote_regions[index]->bytes < sizeof(uint64_t)) {
+        throw std::invalid_argument(
+          "GPUNetIO received an invalid remote memory region at index " +
+          std::to_string(index));
+      }
+    }
+
+    const size_t control_bytes =
+      2 * sizeof(uint64_t) + sizeof(int) +
+      kGpuNetioProbeDebugValueCount * sizeof(uint64_t) + 256;
+    const size_t guarded_control_bytes = checked_add(
+      control_bytes, kGpuPageSize, "GPUNetIO control allocation");
+    const size_t registered_bytes = checked_add(
+      align_up(guarded_control_bytes, kGpuPageSize),
+      align_up(data_bytes, kGpuPageSize), "GPUNetIO registered allocation");
 
     char pci_bus_id[32] = {0};
     const char* ibdev_name = ibv_get_device_name(context.get_raw_context()->device);
@@ -389,12 +485,24 @@ struct GpuNetioPersistentTransport::Impl {
           "GPUNetIO exported a CPU-proxy QP; the GPU-only query engine requires GPU doorbells");
       }
 
-      qp_modify_to_init(qp);
-      const QPInfo local_info{context.get_lid(), doca_verbs_qp_get_qpn(qp)};
+      qp_modify_to_init(
+        qp, static_cast<u8>(context.get_config().device_port));
+      const QPInfo local_info{context.get_lid(),
+                                  doca_verbs_qp_get_qpn(qp),
+                                  0,
+                                  context.get_active_mtu(),
+                                  static_cast<u8>(context.max_qp_read_atomic()),
+                                  static_cast<u8>(context.max_qp_dest_read_atomic())};
       QPInfo remote_info{};
       exchange_qp_info(context, *cm.server_qps[server], local_info, remote_info);
-      qp_modify_to_rtr(verbs_context, qp, remote_info);
-      qp_modify_to_rts(qp);
+      qp_modify_to_rtr(
+        verbs_context,
+        qp,
+        context.get_active_mtu(),
+        static_cast<u8>(context.max_qp_dest_read_atomic()),
+        remote_info);
+      qp_modify_to_rts(
+        qp, static_cast<u8>(context.max_qp_read_atomic()), remote_info);
 
       gpu_qps.push_back(gpu_qp);
       gpu_qp_devices_host.push_back(gpu_qp_dev);
@@ -412,13 +520,6 @@ struct GpuNetioPersistentTransport::Impl {
       }
     }
 
-
-    const size_t control_bytes =
-      2 * sizeof(uint64_t) + sizeof(int) +
-      kGpuNetioProbeDebugValueCount * sizeof(uint64_t) + 256;
-    const size_t registered_bytes =
-      align_up(control_bytes + kGpuPageSize, kGpuPageSize) +
-      align_up(data_bytes, kGpuPageSize);
 
     check_doca("doca_gpu_mem_alloc",
                doca_gpu_mem_alloc(
@@ -458,6 +559,10 @@ struct GpuNetioPersistentTransport::Impl {
     size_t offset = 0;
     auto allocate = [&](const size_t bytes, const size_t alignment) -> void* {
       offset = align_up(offset, alignment);
+      if (offset > registered_bytes || bytes > registered_bytes - offset) {
+        throw std::logic_error(
+          "GPUNetIO registered allocation layout overflows its memory region");
+      }
       auto* pointer = static_cast<unsigned char*>(registered_base) + offset;
       offset += bytes;
       return pointer;
@@ -485,6 +590,7 @@ struct GpuNetioPersistentTransport::Impl {
         .address = remote_regions[i]->address,
         .rkey = byte_swap32(remote_regions[i]->rkey),
         .reserved = remote_regions[i]->rkey,
+        .bytes = remote_regions[i]->bytes,
       };
     }
     check_cuda("cudaMalloc(remote_regions)", cudaMalloc(&d_remote_regions, remote_regions_host.size() * sizeof(GpuNetioRemoteMemoryRegion)));
@@ -582,6 +688,7 @@ struct GpuNetioPersistentTransport::Impl {
   }
 
   ~Impl() {
+    if (cuda_device >= 0) (void)cudaSetDevice(cuda_device);
     if (stream != nullptr) {
       cudaStreamDestroy(stream);
     }
@@ -652,6 +759,7 @@ struct GpuNetioPersistentTransport::Impl {
     }
   }
 
+  int cuda_device{-1};
   u32 qps_per_node{};
   uint32_t remote_region_count{};
   doca_verbs_context* verbs_context{nullptr};

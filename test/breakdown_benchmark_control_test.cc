@@ -4,6 +4,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "tools/breakdown_benchmark/args.hh"
@@ -17,6 +18,68 @@ tools::breakdown_benchmark::Args parse(std::vector<std::string> values) {
   for (auto& value : values) argv.push_back(value.data());
   return tools::breakdown_benchmark::parse_args(
     static_cast<int>(argv.size()), argv.data());
+}
+
+bool parse_rejected(std::vector<std::string> values) {
+  try {
+    (void)parse(std::move(values));
+  } catch (const std::runtime_error&) {
+    return true;
+  }
+  return false;
+}
+
+void test_strict_numeric_args(const std::string& config_path) {
+  const auto prefix = std::vector<std::string>{
+    "benchmark", "--service-config", config_path,
+    "--workload", "insert", "--report-json", "report.json",
+  };
+  auto with_option = [&](const std::string& option,
+                         const std::string& value) {
+    auto values = prefix;
+    values.push_back(option);
+    values.push_back(value);
+    return values;
+  };
+  assert(parse_rejected(with_option("--client-threads", "-1")));
+  assert(parse_rejected(with_option("--client-threads", "8threads")));
+  assert(parse_rejected(with_option(
+    "--client-threads", "184467440737095516160")));
+  assert(parse_rejected(with_option("--read-ratio", "nan")));
+  assert(parse_rejected(with_option("--read-ratio", "0.5tail")));
+}
+
+void test_strict_service_config() {
+  const auto duplicate_path = std::filesystem::temp_directory_path() /
+    "dvstor_breakdown_duplicate_config.ini";
+  {
+    std::ofstream config(duplicate_path, std::ios::trunc);
+    config << "port = 1234\nport = 1235\n";
+  }
+  bool rejected = false;
+  try {
+    (void)tools::breakdown_benchmark::read_config(duplicate_path.string());
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+  std::filesystem::remove(duplicate_path);
+
+  const auto boolean_path = std::filesystem::temp_directory_path() /
+    "dvstor_breakdown_boolean_config.ini";
+  {
+    std::ofstream config(boolean_path, std::ios::trunc);
+    config << "initiator = perhaps\n";
+  }
+  rejected = false;
+  try {
+    (void)tools::breakdown_benchmark::build_service_argv(
+      boolean_path.string());
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+  std::filesystem::remove(boolean_path);
 }
 
 void test_rate_limited_args(const std::string& config_path) {
@@ -225,6 +288,8 @@ int main() {
   test_write_rate_limited_args(config_path.string());
   test_removed_threshold_args_are_rejected(config_path.string());
   test_base_only_recall_args(config_path.string());
+  test_strict_numeric_args(config_path.string());
+  test_strict_service_config();
   test_paced_dispatcher();
   test_progress_deadline_records_zero_tail_and_excludes_drain();
   std::filesystem::remove(config_path);

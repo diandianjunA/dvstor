@@ -1,26 +1,29 @@
-#include "gpu_search/persistent_engine/impl.hh"
 #include "gpu_search/persistent_engine/cuda_helpers.hh"
+#include "gpu_search/persistent_engine/impl.hh"
 
 namespace gpu_search {
 
 using namespace persistent_engine_detail;
 
 service::QueryResult PersistentSearchEngine::Impl::search(
-    VectorDType query_dtype, const byte_t* query_data, u32 k) {
+  VectorDType query_dtype, const byte_t* query_data, u32 k) {
   if (!accepting.load(std::memory_order_acquire)) {
     throw std::runtime_error("persistent GPU search engine is stopping");
   }
   if (!healthy.load(std::memory_order_acquire)) {
     throw std::runtime_error(unhealthy_message());
   }
-  if (query_data == nullptr || static_cast<u32>(query_dtype) > 2 ||
-      k == 0 || k > result_capacity) {
+  if (query_data == nullptr || static_cast<u32>(query_dtype) > 2 || k == 0 ||
+      k > result_capacity) {
     throw std::invalid_argument("invalid persistent GPU query");
   }
   if (query_dtype == VectorDType::float32) {
-    const auto* components = reinterpret_cast<const f32*>(query_data);
     for (u32 dimension = 0; dimension < config.dim; ++dimension) {
-      if (!floating_value_is_finite(components[dimension])) {
+      f32 component = 0.0f;
+      std::memcpy(&component,
+                  query_data + static_cast<size_t>(dimension) * sizeof(f32),
+                  sizeof(component));
+      if (!floating_value_is_finite(component)) {
         throw std::invalid_argument(
           "persistent GPU query components must be finite");
       }
@@ -49,10 +52,9 @@ service::QueryResult PersistentSearchEngine::Impl::search(
     // preparing phase so fail-stop can no longer miss this slot generation.
     if (query_stop.load(std::memory_order_acquire)) {
       reject_query_slot(slot);
-      throw std::runtime_error(
-        healthy.load(std::memory_order_acquire)
-          ? "persistent GPU search engine stopped"
-          : unhealthy_message());
+      throw std::runtime_error(healthy.load(std::memory_order_acquire)
+                                 ? "persistent GPU search engine stopped"
+                                 : unhealthy_message());
     }
     const u64 request_id =
       next_request_id.fetch_add(1, std::memory_order_relaxed);
@@ -82,10 +84,9 @@ service::QueryResult PersistentSearchEngine::Impl::search(
     if (!state.phase.compare_exchange_strong(
           expected, static_cast<u32>(QuerySlotPhase::pending),
           std::memory_order_release, std::memory_order_acquire)) {
-      throw std::runtime_error(
-        healthy.load(std::memory_order_acquire)
-          ? "persistent GPU search engine stopped"
-          : unhealthy_message());
+      throw std::runtime_error(healthy.load(std::memory_order_acquire)
+                                 ? "persistent GPU search engine stopped"
+                                 : unhealthy_message());
     }
 
     const PendingSubmission submission{
@@ -95,8 +96,8 @@ service::QueryResult PersistentSearchEngine::Impl::search(
     if (!admission_queue->push_wait(submission, query_stop)) {
       reject_query_slot(slot);
     } else {
-      engine.telemetry_.queries_submitted.fetch_add(
-        1, std::memory_order_relaxed);
+      engine.telemetry_.queries_submitted.fetch_add(1,
+                                                    std::memory_order_relaxed);
     }
 
     u32 phase = state.phase.load(std::memory_order_acquire);
@@ -162,7 +163,8 @@ void PersistentSearchEngine::Impl::admission_loop() {
         if (query_stop.load(std::memory_order_acquire)) return;
         const QueryDescriptor& descriptor = submission.descriptor;
         if (descriptor.query_slot >= query_slots) {
-          throw std::runtime_error("GPU admission received an invalid query slot");
+          throw std::runtime_error(
+            "GPU admission received an invalid query slot");
         }
         QuerySlotState& state = query_slot_states[descriptor.query_slot];
         if (state.phase.load(std::memory_order_acquire) !=
@@ -175,14 +177,15 @@ void PersistentSearchEngine::Impl::admission_loop() {
           std::this_thread::yield();
         }
         ++submitted;
-        wait_ns += static_cast<u64>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-            admitted_at - submission.enqueued_at).count());
+        wait_ns +=
+          static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             admitted_at - submission.enqueued_at)
+                             .count());
       }
       if (submitted != 0) {
         engine.telemetry_.batches.fetch_add(1, std::memory_order_relaxed);
-        engine.telemetry_.batch_queries.fetch_add(
-          submitted, std::memory_order_relaxed);
+        engine.telemetry_.batch_queries.fetch_add(submitted,
+                                                  std::memory_order_relaxed);
         engine.telemetry_.submission_wait_ns.fetch_add(
           wait_ns, std::memory_order_relaxed);
       }

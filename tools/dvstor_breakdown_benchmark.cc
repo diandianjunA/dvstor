@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
     auto service_argv = make_argv(service_args);
     configuration::IndexConfiguration config(
       static_cast<int>(service_argv.size()), service_argv.data());
+    preflight_workload_inputs(config, args);
     ComputeService service(config);
     (void)run_benchmark(service, args);
   } catch (const std::exception& e) {

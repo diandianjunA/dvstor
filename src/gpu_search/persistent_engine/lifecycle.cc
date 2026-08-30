@@ -1,28 +1,90 @@
-#include "gpu_search/persistent_engine/impl.hh"
-#include "gpu_search/persistent_engine/cuda_helpers.hh"
-
 #include <algorithm>
+#include <limits>
+
+#include "gpu_search/persistent_engine/cuda_helpers.hh"
+#include "gpu_search/persistent_engine/impl.hh"
 
 namespace gpu_search {
 
 using namespace persistent_engine_detail;
-void PersistentSearchEngine::Impl::stream_codes_to_gpu(NavigationBootstrapper& source) {
-  const u64 window_bytes = static_cast<u64>(config.gpu_bootstrap_window_mb) << 20;
+void PersistentSearchEngine::Impl::stream_codes_to_gpu(
+  NavigationBootstrapper& source) {
+  const auto checked_product = [](u64 left, u64 right, const char* what) {
+    u64 result = 0;
+    if (!memory_budget::checked_multiply(left, right, result)) {
+      throw std::overflow_error(std::string(what) + " overflows u64");
+    }
+    return result;
+  };
+  const auto checked_sum = [](u64 left, u64 right, const char* what) {
+    u64 result = 0;
+    if (!memory_budget::checked_add(left, right, result)) {
+      throw std::overflow_error(std::string(what) + " overflows u64");
+    }
+    return result;
+  };
+
+  const u64 expected = checked_product(
+    index.layout.num_nodes, code_bytes, "GPU PQ resident byte count");
+  if (d_pq_codes == nullptr || d_exact_records == nullptr || expected == 0 ||
+      expected > std::numeric_limits<size_t>::max() ||
+      node_record_stride < code_bytes) {
+    throw std::logic_error("GPU PQ bootstrap has invalid resident geometry");
+  }
+  const u64 window_bytes = static_cast<u64>(config.gpu_bootstrap_window_mb)
+                           << 20;
+  if (window_bytes == 0 || config.gpu_bootstrap_windows == 0) {
+    throw std::invalid_argument(
+      "GPU PQ bootstrap window size and count must be positive");
+  }
+
   std::vector<NavigationRead> requests;
   std::vector<i32> statuses;
   requests.reserve(config.gpu_bootstrap_windows);
   u64 streamed = 0;
+  u64 next_ordinal = 0;
   for (const format::ShardRegion& shard : index.shards) {
+    const u64 shard_bytes = checked_product(
+      shard.node_count, code_bytes, "GPU PQ shard byte count");
+    const u64 shard_end = checked_sum(
+      shard.ordinal_base, shard.node_count, "GPU PQ shard ordinal end");
+    const u64 shard_base = checked_product(
+      shard.ordinal_base, code_bytes, "GPU PQ shard base");
+    if (shard.memory_node > std::numeric_limits<u16>::max() ||
+        shard.ordinal_base != next_ordinal ||
+        shard_bytes != shard.code_bytes ||
+        shard_end > index.layout.num_nodes || shard_base > expected ||
+        shard.code_bytes > expected - shard_base) {
+      throw std::runtime_error(
+        "GPU PQ shard geometry exceeds the resident code allocation");
+    }
+    next_ordinal = shard_end;
+
     for (u64 offset = 0; offset < shard.code_bytes;) {
       requests.clear();
-      for (u32 window = 0; window < config.gpu_bootstrap_windows &&
-           offset < shard.code_bytes; ++window) {
+      for (u32 window = 0;
+           window < config.gpu_bootstrap_windows && offset < shard.code_bytes;
+           ++window) {
         const u32 bytes = static_cast<u32>(std::min<u64>(
-          window_bytes, shard.code_bytes - offset));
+          std::min<u64>(window_bytes, shard.code_bytes - offset),
+          std::numeric_limits<u32>::max()));
+        if (bytes == 0) {
+          throw std::logic_error("GPU PQ bootstrap made no forward progress");
+        }
+        const u64 remote_offset = checked_sum(
+          shard.code_remote_offset, offset,
+          "GPU PQ bootstrap remote offset");
+        const u64 destination_offset = checked_sum(
+          shard_base, offset, "GPU PQ bootstrap destination offset");
+        if (destination_offset > expected ||
+            bytes > expected - destination_offset) {
+          throw std::out_of_range(
+            "GPU PQ bootstrap write exceeds resident allocation");
+        }
         requests.push_back(NavigationRead{
-          .remote_offset = shard.code_remote_offset + offset,
-          .destination_address = reinterpret_cast<u64>(d_pq_codes +
-            shard.ordinal_base * code_bytes + offset),
+          .remote_offset = remote_offset,
+          .destination_address = reinterpret_cast<u64>(
+            d_pq_codes + static_cast<size_t>(destination_offset)),
           .bytes = bytes,
           .memory_node = static_cast<u16>(shard.memory_node),
         });
@@ -30,85 +92,118 @@ void PersistentSearchEngine::Impl::stream_codes_to_gpu(NavigationBootstrapper& s
       }
       statuses.assign(requests.size(), -EIO);
       source.read(requests, statuses);
-      for (size_t request_index = 0; request_index < statuses.size(); ++request_index) {
+      for (size_t request_index = 0; request_index < statuses.size();
+           ++request_index) {
         if (statuses[request_index] <= 0) {
           const NavigationRead& request = requests[request_index];
           throw std::runtime_error(
             "RDMA PQ code bootstrap failed: status=" +
-            std::to_string(statuses[request_index]) + " shard=" +
-            std::to_string(request.memory_node) + " remote_offset=" +
-            std::to_string(request.remote_offset) + " bytes=" +
-            std::to_string(request.bytes) + " destination=" +
-            std::to_string(request.destination_address));
+            std::to_string(statuses[request_index]) +
+            " shard=" + std::to_string(request.memory_node) +
+            " remote_offset=" + std::to_string(request.remote_offset) +
+            " bytes=" + std::to_string(request.bytes) +
+            " destination=" + std::to_string(request.destination_address));
         }
       }
-      for (const NavigationRead& request : requests) streamed += request.bytes;
+      for (const NavigationRead& request : requests) {
+        if (streamed > expected || request.bytes > expected - streamed) {
+          throw std::overflow_error("GPU PQ bootstrap byte count overflow");
+        }
+        streamed += request.bytes;
+      }
     }
   }
-  const u64 expected = index.layout.num_nodes * code_bytes;
-  if (streamed != expected) throw std::runtime_error("GPU PQ code bootstrap size mismatch");
-  check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(GPU PQ bootstrap)");
+  if (next_ordinal != index.layout.num_nodes || streamed != expected) {
+    throw std::runtime_error("GPU PQ code bootstrap size mismatch");
+  }
+  check_cuda(cudaDeviceSynchronize(),
+             "cudaDeviceSynchronize(GPU PQ bootstrap)");
 
   struct AuditSample {
-    u32 shard{};
+    size_t shard_index{};
     u64 slot{};
     u64 ordinal{};
   };
   std::vector<AuditSample> samples;
-  samples.reserve(index.shards.size() * 3);
-  for (const format::ShardRegion& shard : index.shards) {
-    const std::array<u64, 3> shard_slots{0, shard.node_count / 2, shard.node_count - 1};
-    for (size_t sample_index = 0; sample_index < shard_slots.size(); ++sample_index) {
-      if (sample_index != 0 && shard_slots[sample_index] == shard_slots[sample_index - 1]) {
+  if (index.shards.size() > std::numeric_limits<size_t>::max() / 3u) {
+    throw std::overflow_error("GPU PQ audit sample count overflows size_t");
+  }
+  samples.reserve(index.shards.size() * 3u);
+  for (size_t shard_index = 0; shard_index < index.shards.size();
+       ++shard_index) {
+    const format::ShardRegion& shard = index.shards[shard_index];
+    if (shard.node_count == 0) continue;
+    const std::array<u64, 3> shard_slots{
+      0, shard.node_count / 2, shard.node_count - 1};
+    for (size_t sample_index = 0; sample_index < shard_slots.size();
+         ++sample_index) {
+      if (sample_index != 0 &&
+          shard_slots[sample_index] == shard_slots[sample_index - 1]) {
         continue;
       }
       const u64 slot = shard_slots[sample_index];
       samples.push_back(AuditSample{
-        .shard = shard.memory_node,
+        .shard_index = shard_index,
         .slot = slot,
-        .ordinal = shard.ordinal_base + slot,
+        .ordinal = checked_sum(
+          shard.ordinal_base, slot, "GPU PQ audit ordinal"),
       });
     }
   }
+
   std::vector<byte_t> authoritative(code_bytes);
   std::vector<byte_t> resident(code_bytes);
   for (size_t sample_index = 0; sample_index < samples.size(); ++sample_index) {
     const AuditSample& sample = samples[sample_index];
-    const format::ShardRegion& shard = index.shards[sample.shard];
-    requests.assign(1, NavigationRead{
-      .remote_offset = shard.code_remote_offset + sample.slot * code_bytes,
-      .destination_address = reinterpret_cast<u64>(d_exact_records),
-      .bytes = code_bytes,
-      .memory_node = static_cast<u16>(sample.shard),
-    });
+    const format::ShardRegion& shard = index.shards[sample.shard_index];
+    const u64 slot_offset = checked_product(
+      sample.slot, code_bytes, "GPU PQ audit slot offset");
+    const u64 remote_offset = checked_sum(
+      shard.code_remote_offset, slot_offset,
+      "GPU PQ audit remote offset");
+    const u64 resident_offset = checked_product(
+      sample.ordinal, code_bytes, "GPU PQ audit resident offset");
+    if (resident_offset > expected ||
+        code_bytes > expected - resident_offset) {
+      throw std::out_of_range(
+        "GPU PQ audit read exceeds resident allocation");
+    }
+    requests.assign(
+      1, NavigationRead{
+           .remote_offset = remote_offset,
+           .destination_address = reinterpret_cast<u64>(d_exact_records),
+           .bytes = code_bytes,
+           .memory_node = static_cast<u16>(shard.memory_node),
+         });
     statuses.assign(1, -EIO);
     source.read(requests, statuses);
     if (statuses.front() <= 0) {
       throw std::runtime_error(
         "GPU PQ ordinal audit RDMA read failed: shard=" +
-        std::to_string(sample.shard) + " slot=" +
-        std::to_string(sample.slot) + " status=" +
-        std::to_string(statuses.front()));
+        std::to_string(shard.memory_node) +
+        " slot=" + std::to_string(sample.slot) +
+        " status=" + std::to_string(statuses.front()));
     }
-    check_cuda(cudaMemcpy(authoritative.data(), d_exact_records, authoritative.size(),
-                          cudaMemcpyDeviceToHost),
+    check_cuda(cudaMemcpy(authoritative.data(), d_exact_records,
+                          authoritative.size(), cudaMemcpyDeviceToHost),
                "cudaMemcpy(GPU PQ audit source)");
-    check_cuda(cudaMemcpy(
-      resident.data(),
-      d_pq_codes + sample.ordinal * code_bytes,
-      resident.size(), cudaMemcpyDeviceToHost),
+    check_cuda(
+      cudaMemcpy(resident.data(),
+                 d_pq_codes + static_cast<size_t>(resident_offset),
+                 resident.size(), cudaMemcpyDeviceToHost),
       "cudaMemcpy(GPU PQ audit resident)");
     if (!std::equal(resident.begin(), resident.end(), authoritative.begin())) {
       throw std::runtime_error(
         "GPU PQ ordinal mapping mismatch: shard=" +
-        std::to_string(sample.shard) + " slot=" +
-        std::to_string(sample.slot) + " ordinal=" +
-        std::to_string(sample.ordinal));
+        std::to_string(shard.memory_node) +
+        " slot=" + std::to_string(sample.slot) +
+        " ordinal=" + std::to_string(sample.ordinal));
     }
   }
-  std::cerr << "[gpu-search] streamed " << streamed
-            << " PQ bytes directly into final GPU storage; ordinal audit passed for "
-            << samples.size() << " entries\n";
+  std::cerr
+    << "[gpu-search] streamed " << streamed
+    << " PQ bytes directly into final GPU storage; ordinal audit passed for "
+    << samples.size() << " entries\n";
 }
 
 void PersistentSearchEngine::Impl::start_persistent_kernel() {
@@ -119,28 +214,6 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
       kernel_params.issue_width < kernel_params.commit_width) {
     throw std::logic_error(
       "exact-frontier progression requires issue width >= commit width");
-  }
-  if (decoupled_search_progression) {
-    // The ASFE specialization has an out-of-line Stable-Run/CUB call chain.
-    // Its linked device frame is slightly larger than CUDA's common 1-KiB
-    // default, so an undersized per-thread stack can corrupt the generic
-    // shared-memory pointer passed to BlockRadixSort. Set a context-local
-    // floor; this does not allocate any per-query buffer or alter occupancy.
-    constexpr size_t kAsfeDeviceStackFloor = 2u * 1024u;
-    size_t device_stack_limit = 0;
-    check_cuda(cudaDeviceGetLimit(
-                 &device_stack_limit, cudaLimitStackSize),
-               "cudaDeviceGetLimit(cudaLimitStackSize)");
-    if (device_stack_limit < kAsfeDeviceStackFloor) {
-      check_cuda(cudaDeviceSetLimit(
-                   cudaLimitStackSize, kAsfeDeviceStackFloor),
-                 "cudaDeviceSetLimit(cudaLimitStackSize)");
-      check_cuda(cudaDeviceGetLimit(
-                   &device_stack_limit, cudaLimitStackSize),
-                 "cudaDeviceGetLimit(cudaLimitStackSize adjusted)");
-    }
-    std::cerr << "[gpu-search] ASFE device stack bytes/thread="
-              << device_stack_limit << '\n';
   }
   *stop_host = 0;
   *direct_disabled_host = 0;
@@ -155,10 +228,9 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
   std::fill_n(direct_owner_phases_host, direct_batch_queue_count, 0u);
   std::fill_n(direct_owner_progress_host, direct_batch_queue_count,
               DirectOwnerProgress{});
-  check_cuda(cudaMemset(
-               d_direct_owner_progress, 0,
-               static_cast<size_t>(direct_batch_queue_count) *
-                 sizeof(DirectOwnerProgress)),
+  check_cuda(cudaMemset(d_direct_owner_progress, 0,
+                        static_cast<size_t>(direct_batch_queue_count) *
+                          sizeof(DirectOwnerProgress)),
              "cudaMemset(GPUNetIO owner watchdog progress)");
   *query_kernel_ready_host = 0;
   *dispatcher_kernel_ready_host = 0;
@@ -175,8 +247,8 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
   if (kernel_threads != selected.threads ||
       owner_kernel_blocks != selected.owner_blocks ||
       kernel_blocks != selected.query_blocks ||
-      total_blocks != owner_kernel_blocks + kernel_blocks +
-                        kPersistentControlBlocks ||
+      total_blocks !=
+        owner_kernel_blocks + kernel_blocks + kPersistentControlBlocks ||
       total_blocks > selected.grid_capacity) {
     throw std::logic_error("persistent GPU grid plan changed before launch");
   }
@@ -184,17 +256,14 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
        persistent_grid_plan.candidates) {
     std::cerr << "[gpu-search] persistent occupancy candidate threads="
               << candidate.threads
-              << " hardware_blocks_per_sm="
-              << candidate.hardware_blocks_per_sm
-              << " configured_cap="
-              << config.gpu_persistent_blocks_per_sm
+              << " hardware_blocks_per_sm=" << candidate.hardware_blocks_per_sm
+              << " configured_cap=" << config.gpu_persistent_blocks_per_sm
               << " effective_blocks_per_sm="
               << candidate.effective_blocks_per_sm
               << " grid_capacity=" << candidate.grid_capacity
               << " owner_blocks=" << candidate.owner_blocks
               << " query_blocks=" << candidate.query_blocks
-              << " resident_query_warps="
-              << candidate.resident_query_warps
+              << " resident_query_warps=" << candidate.resident_query_warps
               << " selected=" << std::boolalpha
               << (candidate.threads == kernel_threads) << '\n';
   }
@@ -202,22 +271,42 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
             << persistent_kernel_occupancy.registers_per_thread
             << " static_shared_bytes="
             << persistent_kernel_occupancy.static_shared_bytes
+            << " local_bytes/thread="
+            << persistent_kernel_occupancy.local_bytes_per_thread
             << " max_threads/block="
             << persistent_kernel_occupancy.max_threads_per_block << '\n';
-  launch_persistent_search(kernel_stream, launch_params,
-                           total_blocks, kernel_threads,
-                           decoupled_search_progression);
-  check_cuda(cudaGetLastError(), "launch_persistent_search(unified navigation)");
+  launch_persistent_search(kernel_stream, launch_params, total_blocks,
+                           kernel_threads, decoupled_search_progression);
+  check_cuda(cudaGetLastError(),
+             "launch_persistent_search(unified navigation)");
+  // From this point on the kernel may still dereference every pointer in
+  // kernel_params. Mark it before the readiness loop so any exception causes
+  // teardown to stop and synchronize it before those allocations are freed.
+  kernel_running = true;
 
-  const auto ready_deadline = std::chrono::steady_clock::now() +
-    std::chrono::seconds(3);
+  const auto ready_deadline =
+    std::chrono::steady_clock::now() + std::chrono::seconds(3);
   u32 ready_owners = 0;
   for (;;) {
+    const cudaError_t kernel_status = cudaStreamQuery(kernel_stream);
+    if (kernel_status != cudaErrorNotReady) {
+      const std::string reason =
+        kernel_status == cudaSuccess
+          ? "persistent kernel terminated before readiness"
+          : std::string("persistent kernel failed during readiness: ") +
+              cudaGetErrorString(kernel_status);
+      *stop_host = 1;
+      (void)cudaMemcpyAsync(stop_device, stop_host, sizeof(u32),
+                            cudaMemcpyHostToDevice, rdma_stream);
+      (void)cudaStreamSynchronize(rdma_stream);
+      throw std::runtime_error(reason);
+    }
     ready_owners = 0;
     for (u32 qp = 0; qp < direct_batch_queue_count; ++qp) {
       ready_owners +=
         *reinterpret_cast<volatile u32*>(direct_owner_phases_host + qp) == 1
-          ? 1u : 0u;
+          ? 1u
+          : 0u;
     }
     const u32 ready_queries =
       *reinterpret_cast<volatile u32*>(query_kernel_ready_host);
@@ -244,23 +333,26 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
       (void)cudaMemcpyAsync(stop_device, stop_host, sizeof(u32),
                             cudaMemcpyHostToDevice, rdma_stream);
       (void)cudaStreamSynchronize(rdma_stream);
-      (void)cudaStreamSynchronize(kernel_stream);
+      const cudaError_t timeout_kernel_status =
+        cudaStreamSynchronize(kernel_stream);
+      if (timeout_kernel_status != cudaSuccess) {
+        throw std::runtime_error(
+          std::string("persistent kernel failed while readiness timed out: ") +
+          cudaGetErrorString(timeout_kernel_status));
+      }
       throw std::runtime_error(
         "unified GPU grid did not become fully resident: owners=" +
         std::to_string(ready_owners) + "/" +
-        std::to_string(direct_batch_queue_count) +
-        " queries=" + std::to_string(ready_queries) + "/" +
-        std::to_string(kernel_blocks) +
+        std::to_string(direct_batch_queue_count) + " queries=" +
+        std::to_string(ready_queries) + "/" + std::to_string(kernel_blocks) +
         " dispatcher=" + std::to_string(ready_dispatchers) + "/1" +
         " control=" + std::to_string(ready_controls) + "/1" +
         " first_owner_phase=" + std::to_string(first_owner_phase));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  kernel_running = true;
   std::cerr << "[gpu-search] unified persistent CTAs=" << owner_kernel_blocks
-            << "-owner+" << kernel_blocks
-            << "-query+1-dispatch+1-control"
+            << "-owner+" << kernel_blocks << "-query+1-dispatch+1-control"
             << " QP-owner-warps=" << direct_batch_queue_count
             << " threads/CTA=" << kernel_threads
             << " query_slots=" << query_slots
@@ -287,7 +379,8 @@ void PersistentSearchEngine::Impl::stop_persistent_kernel() {
 }
 
 PersistentSearchEngine::Impl::~Impl() {
-  const cudaError_t device_status = cudaSetDevice(static_cast<int>(config.gpu_device));
+  const cudaError_t device_status =
+    cudaSetDevice(static_cast<int>(config.gpu_device));
   if (device_status != cudaSuccess) {
     std::cerr << "[gpu-search] failed to bind CUDA device during teardown: "
               << cudaGetErrorString(device_status) << '\n';
@@ -304,9 +397,11 @@ PersistentSearchEngine::Impl::~Impl() {
   if (admission_queue != nullptr) admission_queue->notify_all();
   if (admission_thread.joinable()) admission_thread.join();
   if (completion_thread.joinable()) completion_thread.join();
-  const auto drain_deadline = std::chrono::steady_clock::now() +
+  const auto drain_deadline =
+    std::chrono::steady_clock::now() +
     std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
   const auto has_owned_query_slot = [&] {
+    if (query_slot_states == nullptr) return false;
     for (u32 slot = 0; slot < query_slots; ++slot) {
       if (query_slot_states[slot].phase.load(std::memory_order_acquire) !=
           static_cast<u32>(QuerySlotPhase::free)) {
@@ -336,11 +431,13 @@ PersistentSearchEngine::Impl::~Impl() {
   if (kernel_stream != nullptr) cudaStreamDestroy(kernel_stream);
   if (direct_disabled_host != nullptr) cudaFreeHost(direct_disabled_host);
   if (direct_error_host != nullptr) cudaFreeHost(direct_error_host);
-  if (direct_owner_phases_host != nullptr) cudaFreeHost(direct_owner_phases_host);
+  if (direct_owner_phases_host != nullptr)
+    cudaFreeHost(direct_owner_phases_host);
   if (direct_owner_progress_host != nullptr) {
     cudaFreeHost(direct_owner_progress_host);
   }
-  if (control_kernel_ready_host != nullptr) cudaFreeHost(control_kernel_ready_host);
+  if (control_kernel_ready_host != nullptr)
+    cudaFreeHost(control_kernel_ready_host);
   if (dispatcher_kernel_ready_host != nullptr) {
     cudaFreeHost(dispatcher_kernel_ready_host);
   }

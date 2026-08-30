@@ -1,5 +1,8 @@
 #include "service/compute_service/detail.hh"
 
+#include "common/index_path.hh"
+#include "gpu_search/pq_index.hh"
+
 using namespace compute_service_detail;
 
 ComputeService::Status ComputeService::status() const {
@@ -46,7 +49,13 @@ void ComputeService::receive_remote_access_tokens() {
     MRT& token = remote_access_tokens_[memory_node];
     LocalMemoryRegion token_region{context_, token.get(), sizeof(MemoryRegionToken)};
     qp->post_receive(token_region);
-    context_.receive();
+    const ReceiveInfo received = context_.receive();
+    lib_assert(received.bytes_written == MemoryRegionToken::kWireBytes,
+               "storage node returned an incompatible RDMA token wire size");
+    lib_assert(token->address_range_valid(),
+               "storage node returned an invalid RDMA memory-region token; "
+               "rebuild and restart every storage and compute binary from "
+               "the same revision");
   }
 }
 
@@ -136,6 +145,8 @@ bool ComputeService::validate_index_metadata(
       metadata.navigation_format != "opq_pq_graph_v1" ||
       metadata.navigation_code_bytes == 0 ||
       metadata.navigation_code_bytes != metadata.pq_subquantizers ||
+      (config_.gpu_rdma_search_progression_mode != "coupled" &&
+       metadata.pq_subquantizers > kMaxPersistentSubquantizers) ||
       metadata.pq_bits != 8 || metadata.navigation_model_checksum == 0 ||
       metadata.index_build_fingerprint == 0 ||
       metadata.shard_build_fingerprints.size() != num_servers_ ||
@@ -150,6 +161,23 @@ bool ComputeService::validate_index_metadata(
     }
     return false;
   }
+  gpu_search::pq::Model pq_model;
+  std::string pq_error;
+  if (!gpu_search::pq::read_model(
+        index_path::navigation_model_file(
+          index_prefix, metadata.pq_subquantizers),
+        pq_model, &pq_error) ||
+      pq_model.dim != metadata.dim ||
+      pq_model.subquantizers != metadata.pq_subquantizers ||
+      pq_model.bits_per_code != metadata.pq_bits ||
+      pq_model.code_bytes() != metadata.navigation_code_bytes ||
+      pq_model.checksum() != metadata.navigation_model_checksum) {
+    if (error_message != nullptr) {
+      *error_message = "PQ model is missing, corrupt, or incompatible: " +
+        pq_error;
+    }
+    return false;
+  }
   if (config_.vector_data_type != "auto" &&
       config_.resolved_vector_dtype() != metadata.vector_dtype) {
     if (error_message != nullptr) *error_message = "index vector dtype mismatch";
@@ -158,6 +186,14 @@ bool ComputeService::validate_index_metadata(
   config_.vector_data_type = vector_dtype_name(metadata.vector_dtype);
   VamanaNode::disable_hot_graph();
   VamanaNode::init_static_storage(config_.dim, config_.R, metadata.vector_dtype);
+  const u64 dynamic_graph_end =
+    static_cast<u64>(metadata.hot_graph_dynamic_hot_offset) +
+    metadata.hot_graph_entry_size;
+  const u64 dynamic_code_end =
+    static_cast<u64>(metadata.dynamic_navigation_code_offset) +
+    metadata.dynamic_navigation_code_validation_bytes +
+    metadata.navigation_code_bytes +
+    metadata.dynamic_navigation_code_checksum_bytes;
   if (metadata.vector_component_size != VamanaNode::vector_component_size() ||
       metadata.vector_bytes != VamanaNode::vector_bytes() ||
       metadata.node_size != VamanaNode::total_size() ||
@@ -176,20 +212,14 @@ bool ComputeService::validate_index_metadata(
       metadata.dynamic_node_base_offsets.size() != num_servers_ ||
       metadata.navigation_code_remote_offsets.size() != num_servers_ ||
       metadata.navigation_code_region_bytes.size() != num_servers_ ||
-      metadata.hot_graph_dynamic_record_bytes <
-        metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size ||
+      metadata.hot_graph_dynamic_record_bytes < dynamic_graph_end ||
       metadata.hot_graph_dynamic_hot_offset < VamanaNode::total_size() ||
-      metadata.dynamic_navigation_code_offset !=
-        metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size ||
+      metadata.dynamic_navigation_code_offset != dynamic_graph_end ||
       metadata.dynamic_navigation_code_validation_bytes !=
         VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES ||
       metadata.dynamic_navigation_code_checksum_bytes !=
         VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES ||
-      metadata.hot_graph_dynamic_record_bytes <
-        metadata.dynamic_navigation_code_offset +
-          metadata.dynamic_navigation_code_validation_bytes +
-          metadata.navigation_code_bytes +
-          metadata.dynamic_navigation_code_checksum_bytes) {
+      metadata.hot_graph_dynamic_record_bytes < dynamic_code_end) {
     if (error_message != nullptr) *error_message = "index storage layout mismatch";
     return false;
   }

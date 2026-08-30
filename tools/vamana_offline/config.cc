@@ -75,6 +75,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
   if (config.num_memory_nodes == 0) lib_failure("--memory-nodes must be > 0");
   if (config.num_memory_nodes > RemotePtr::MEMORY_NODE_MASK + 1)
     lib_failure("--memory-nodes exceeds the 64-shard tagged pointer limit");
+  if (config.threads > 32)
+    lib_failure("--threads must be zero (automatic) or at most 32");
   if (config.R == 0) lib_failure("--R must be > 0");
   if (config.beam_width == 0) lib_failure("--beam-width must be > 0");
   if (!std::isfinite(config.alpha) || config.alpha < 1.0)

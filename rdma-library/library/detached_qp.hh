@@ -18,19 +18,24 @@ public:
 
   // ctor with own completion queues
   explicit DetachedQP(Context& context) : owns_cqs_(true) {
-    send_cq_ = ibv_create_cq(context.get_raw_context(),
-                             context.get_config().max_send_queue_wr,
-                             nullptr,
-                             nullptr,
-                             0);
-    recv_cq_ = ibv_create_cq(context.get_raw_context(),
-                             context.get_config().max_recv_queue_wr,
-                             nullptr,
-                             nullptr,
-                             0);
-    lib_assert(send_cq_ && recv_cq_, "Cannot create completion queues");
+    try {
+      send_cq_ = ibv_create_cq(context.get_raw_context(),
+                               context.get_config().max_send_queue_wr,
+                               nullptr, nullptr, 0);
+      recv_cq_ = ibv_create_cq(context.get_raw_context(),
+                               context.get_config().max_recv_queue_wr,
+                               nullptr, nullptr, 0);
+      lib_assert(send_cq_ && recv_cq_, "Cannot create completion queues");
 
-    qp = std::make_unique<QueuePair>(&context, send_cq_, recv_cq_);
+      qp = std::make_unique<QueuePair>(&context, send_cq_, recv_cq_);
+    } catch (...) {
+      qp.reset();
+      if (recv_cq_ != nullptr) (void)ibv_destroy_cq(recv_cq_);
+      if (send_cq_ != nullptr) (void)ibv_destroy_cq(send_cq_);
+      recv_cq_ = nullptr;
+      send_cq_ = nullptr;
+      throw;
+    }
   }
 
   ~DetachedQP() {
@@ -60,7 +65,13 @@ public:
   // channel_context is the context we use for communication
   // (the context to which other_qp belongs to)
   void connect(Context& channel_context, u16 lid, QP& other_qp) const {
-    QPInfo send_buffer{lid, qp->get_qp_num()}, receive_buffer{};
+    QPInfo send_buffer{lid,
+                       qp->get_qp_num(),
+                       0,
+                       qp->active_mtu(),
+                       qp->max_qp_read_atomic(),
+                       qp->max_qp_dest_read_atomic()},
+      receive_buffer{};
     LocalMemoryRegion region{channel_context, &receive_buffer, sizeof(QPInfo)};
 
     // other_qp is the qp we use to exchange information
@@ -68,13 +79,17 @@ public:
     other_qp->post_send_inlined(&send_buffer, sizeof(QPInfo), IBV_WR_SEND);
 
     channel_context.poll_send_cq_until_completion();
-    channel_context.receive();
+    const ReceiveInfo receive_info = channel_context.receive();
+    lib_assert(receive_info.bytes_written == sizeof(QPInfo),
+               "Detached QPInfo receive length mismatch");
+    lib_assert(receive_buffer.wire_valid(),
+               "Detached QP received invalid or incompatible QPInfo");
 
     std::cerr << "pairing: " << qp->get_qp_num() << " -- "
               << receive_buffer.qp_number << std::endl;
 
     qp->transition_to_rtr(receive_buffer);
-    qp->transition_to_rts();
+    qp->transition_to_rts(receive_buffer);
   }
 
 public:

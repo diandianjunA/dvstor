@@ -10,6 +10,22 @@ ComputeService::ComputeService(const Configuration& config)
       context_(config_),
       cm_(context_, config_),
       num_servers_(config_.num_server_nodes()) {
+  // Select and validate the configured device before any storage connection or
+  // startup protocol side effect. Invalid ordinals now fail locally.
+  const cudaError_t cuda_status =
+    cudaSetDevice(static_cast<int>(config_.gpu_device));
+  lib_assert(cuda_status == cudaSuccess,
+             str{"failed to select GPU: "} + cudaGetErrorString(cuda_status));
+
+  str metadata_error;
+  const filepath_t startup_prefix = config_.resolved_index_prefix();
+  lib_assert(validate_index_metadata(startup_prefix, &metadata_error),
+             metadata_error);
+  service::index_metadata::Metadata metadata;
+  lib_assert(service::index_metadata::load_metadata(
+               startup_prefix, metadata, &metadata_error),
+             metadata_error);
+
   init_remote_tokens();
   cm_.connect();
 
@@ -32,13 +48,6 @@ ComputeService::ComputeService(const Configuration& config)
 
   receive_remote_access_tokens();
 
-  str metadata_error;
-  const filepath_t startup_prefix = config_.resolved_index_prefix();
-  lib_assert(validate_index_metadata(startup_prefix, &metadata_error), metadata_error);
-
-  service::index_metadata::Metadata metadata;
-  lib_assert(service::index_metadata::load_metadata(
-               startup_prefix, metadata, &metadata_error), metadata_error);
   if (config_.enable_updates) {
     print_status(
       "storage-owner authority: deterministic ID shard; "
@@ -47,9 +56,6 @@ ComputeService::ComputeService(const Configuration& config)
     print_status("compute updates disabled: update executor is not started");
   }
 
-  const cudaError_t cuda_status = cudaSetDevice(static_cast<int>(config_.gpu_device));
-  lib_assert(cuda_status == cudaSuccess,
-             str{"failed to select GPU: "} + cudaGetErrorString(cuda_status));
   if (config_.gpu_rdma_search_progression_mode == "coupled") {
     print_status("search: CPU-orchestrated schema-v16 OPQ/PQ" +
                  std::to_string(metadata.pq_subquantizers) +

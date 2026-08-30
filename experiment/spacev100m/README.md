@@ -29,12 +29,10 @@ Motivation 实验所需的数据准备、schema-16 索引构建、运行 profile
 
 ## 2. 准备 benchmark 输入
 
-原数据只有一份 query。动态 motivation 同时需要 recall、性能查询和插入向量，脚本会
-流式切为互不重叠的三段，不复制 10 GB base：
+原始 query 的 `[0,10000)` 默认用于 recall query，并同步切出对应 top-100 GT。性能查询和插入默认使用从官方 SPACEV1B base 提取、且未进入 100M 索引的两段：
 
-- `[0,10000)`：recall query，并同步切出对应 top-100 GT；
-- `[10000,20000)`：性能 query；
-- `[20000,29316)`：insert。
+- `[100000000,110000000)`：`spacev100m_to_110m_query.i8bin`；
+- `[110000000,120000000)`：`spacev110m_to_120m_insert.i8bin`。
 
 ```bash
 ./experiment/spacev100m/prepare_spacev100m_data.sh

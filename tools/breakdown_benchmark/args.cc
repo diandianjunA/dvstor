@@ -8,9 +8,47 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace tools::breakdown_benchmark {
+namespace {
+
+template <typename T>
+T parse_unsigned_argument(const std::string& text, const char* option) {
+  static_assert(std::is_unsigned_v<T>);
+  if (text.empty() || text.front() == static_cast<char>(45)) {
+    throw std::runtime_error(std::string(option) + " must be a non-negative integer");
+  }
+  size_t parsed = 0;
+  unsigned long long value = 0;
+  try {
+    value = std::stoull(text, &parsed, 10);
+  } catch (const std::exception&) {
+    throw std::runtime_error(std::string(option) + " has an invalid integer value: " + text);
+  }
+  if (parsed != text.size() || value > std::numeric_limits<T>::max()) {
+    throw std::runtime_error(std::string(option) + " is outside its supported integer range: " + text);
+  }
+  return static_cast<T>(value);
+}
+
+double parse_double_argument(const std::string& text, const char* option) {
+  size_t parsed = 0;
+  double value = 0.0;
+  try {
+    value = std::stod(text, &parsed);
+  } catch (const std::exception&) {
+    throw std::runtime_error(std::string(option) + " has an invalid numeric value: " + text);
+  }
+  if (parsed != text.size() || !std::isfinite(value)) {
+    throw std::runtime_error(std::string(option) + " must be a finite number: " + text);
+  }
+  return value;
+}
+
+}  // namespace
+
 
 std::string trim(std::string value) {
   auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
@@ -27,7 +65,9 @@ ConfigMap read_config(const std::string& path) {
 
   ConfigMap config;
   std::string line;
+  size_t line_number = 0;
   while (std::getline(input, line)) {
+    ++line_number;
     const auto comment_pos = line.find_first_of("#;");
     if (comment_pos != std::string::npos) {
       line.erase(comment_pos);
@@ -39,12 +79,23 @@ ConfigMap read_config(const std::string& path) {
 
     const auto eq_pos = line.find('=');
     if (eq_pos == std::string::npos) {
-      continue;
+      throw std::runtime_error(
+        "malformed config line " + std::to_string(line_number) +
+        " (expected key=value): " + path);
     }
     auto key = trim(line.substr(0, eq_pos));
     auto value = trim(line.substr(eq_pos + 1));
-    if (!key.empty()) {
-      config[std::move(key)] = std::move(value);
+    if (key.empty()) {
+      throw std::runtime_error(
+        "empty config key on line " + std::to_string(line_number) +
+        ": " + path);
+    }
+    const auto [position, inserted] =
+      config.emplace(std::move(key), std::move(value));
+    if (!inserted) {
+      throw std::runtime_error(
+        "duplicate config key on line " + std::to_string(line_number) +
+        ": " + position->first);
     }
   }
   return config;
@@ -52,6 +103,10 @@ ConfigMap read_config(const std::string& path) {
 
 bool is_truthy(const std::string& value) {
   return value == "1" || value == "true" || value == "on" || value == "yes";
+}
+
+bool is_falsey(const std::string& value) {
+  return value == "0" || value == "false" || value == "off" || value == "no";
 }
 
 std::vector<std::string> split_tokens(const std::string& value) {
@@ -94,6 +149,9 @@ std::vector<std::string> build_service_argv(const std::string& service_config_pa
     if (std::find(flag_keys.begin(), flag_keys.end(), key) != flag_keys.end()) {
       if (is_truthy(value)) {
         args.push_back(option);
+      } else if (!is_falsey(value)) {
+        throw std::runtime_error(
+          "invalid boolean value for " + option + ": " + value);
       }
       continue;
     }
@@ -134,25 +192,25 @@ Args parse_args(int argc, char** argv) {
     } else if (flag == "--workload") {
       args.workload = require_value("--workload");
     } else if (flag == "--warmup-ops") {
-      args.warmup_ops = std::stoull(require_value("--warmup-ops"));
+      args.warmup_ops = parse_unsigned_argument<size_t>(require_value("--warmup-ops"), "--warmup-ops");
     } else if (flag == "--measure-ops") {
-      args.measure_ops = std::stoull(require_value("--measure-ops"));
+      args.measure_ops = parse_unsigned_argument<size_t>(require_value("--measure-ops"), "--measure-ops");
     } else if (flag == "--warmup-seconds") {
-      args.warmup_seconds = std::stoull(require_value("--warmup-seconds"));
+      args.warmup_seconds = parse_unsigned_argument<size_t>(require_value("--warmup-seconds"), "--warmup-seconds");
     } else if (flag == "--measure-seconds") {
-      args.measure_seconds = std::stoull(require_value("--measure-seconds"));
+      args.measure_seconds = parse_unsigned_argument<size_t>(require_value("--measure-seconds"), "--measure-seconds");
     } else if (flag == "--client-threads") {
-      args.client_threads = std::stoull(require_value("--client-threads"));
+      args.client_threads = parse_unsigned_argument<size_t>(require_value("--client-threads"), "--client-threads");
     } else if (flag == "--read-ratio") {
-      args.read_ratio = std::stod(require_value("--read-ratio"));
+      args.read_ratio = parse_double_argument(require_value("--read-ratio"), "--read-ratio");
     } else if (flag == "--mixed-mode") {
       args.mixed_mode = require_value("--mixed-mode");
     } else if (flag == "--write-threads") {
-      args.write_threads = std::stoull(require_value("--write-threads"));
+      args.write_threads = parse_unsigned_argument<size_t>(require_value("--write-threads"), "--write-threads");
     } else if (flag == "--target-query-qps") {
-      args.target_query_qps = std::stod(require_value("--target-query-qps"));
+      args.target_query_qps = parse_double_argument(require_value("--target-query-qps"), "--target-query-qps");
     } else if (flag == "--target-write-qps" || flag == "--target-insert-qps") {
-      args.target_write_qps = std::stod(require_value(flag.c_str()));
+      args.target_write_qps = parse_double_argument(require_value(flag.c_str()), flag.c_str());
     } else if (flag == "--recall-query-file") {
       if (!args.recall_query_file.empty()) {
         throw std::runtime_error("--recall-query-file was specified more than once");
@@ -173,17 +231,15 @@ Args parse_args(int argc, char** argv) {
     } else if (flag == "--groundtruth-file") {
       args.groundtruth_file = require_value("--groundtruth-file");
     } else if (flag == "--recall-queries") {
-      args.recall_queries = std::stoull(require_value("--recall-queries"));
+      args.recall_queries = parse_unsigned_argument<size_t>(require_value("--recall-queries"), "--recall-queries");
     } else if (flag == "--recall-k") {
-      args.recall_k = static_cast<uint32_t>(std::stoul(require_value("--recall-k")));
+      args.recall_k = parse_unsigned_argument<uint32_t>(require_value("--recall-k"), "--recall-k");
     } else if (flag == "--recall-mode") {
       args.recall_mode = require_value("--recall-mode");
     } else if (flag == "--recall-base-id-limit") {
-      const auto value = std::stoull(require_value("--recall-base-id-limit"));
-      if (value > std::numeric_limits<uint32_t>::max()) {
-        throw std::runtime_error("--recall-base-id-limit exceeds uint32_t");
-      }
-      args.recall_base_id_limit = static_cast<uint32_t>(value);
+      args.recall_base_id_limit = parse_unsigned_argument<uint32_t>(
+        require_value("--recall-base-id-limit"),
+        "--recall-base-id-limit");
     } else if (flag == "--storage-maintenance-log") {
       args.storage_maintenance_logs.push_back(
         require_value("--storage-maintenance-log"));
@@ -196,13 +252,13 @@ Args parse_args(int argc, char** argv) {
     } else if (flag == "--report-text") {
       args.report_text_path = require_value("--report-text");
     } else if (flag == "--insert-start-id") {
-      args.insert_start_id = static_cast<uint32_t>(std::stoul(require_value("--insert-start-id")));
+      args.insert_start_id = parse_unsigned_argument<uint32_t>(require_value("--insert-start-id"), "--insert-start-id");
     } else if (flag == "--write-insert-ratio") {
-      args.write_insert_ratio = std::stod(require_value("--write-insert-ratio"));
+      args.write_insert_ratio = parse_double_argument(require_value("--write-insert-ratio"), "--write-insert-ratio");
     } else if (flag == "--write-upsert-ratio") {
-      args.write_upsert_ratio = std::stod(require_value("--write-upsert-ratio"));
+      args.write_upsert_ratio = parse_double_argument(require_value("--write-upsert-ratio"), "--write-upsert-ratio");
     } else if (flag == "--write-delete-ratio") {
-      args.write_delete_ratio = std::stod(require_value("--write-delete-ratio"));
+      args.write_delete_ratio = parse_double_argument(require_value("--write-delete-ratio"), "--write-delete-ratio");
     } else {
       throw std::runtime_error("unknown argument: " + flag);
     }
@@ -312,7 +368,7 @@ Args parse_args(int argc, char** argv) {
       it = service_config.find("write-id-base");
     }
     if (it != service_config.end() && !it->second.empty()) {
-      args.insert_start_id = static_cast<uint32_t>(std::stoul(it->second));
+      args.insert_start_id = parse_unsigned_argument<uint32_t>(it->second, "insert-start-id in service config");
     }
   }
   const bool use_time_mode = args.warmup_seconds > 0 || args.measure_seconds > 0;

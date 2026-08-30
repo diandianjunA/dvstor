@@ -29,20 +29,20 @@
 #include "common/bounded_queue.hh"
 #include "common/constants.hh"
 #include "common/index_path.hh"
-#include "gpu_search/centroid_route_poll_policy.hh"
-#include "gpu_search/persistent_engine.hh"
 #include "gpu_search/centroid_home_selector.hh"
+#include "gpu_search/centroid_route_poll_policy.hh"
 #include "gpu_search/navigation_bootstrapper.hh"
+#include "gpu_search/persistent_engine.hh"
 #ifdef DVSTOR_HAVE_GPUNETIO
 #include "gpu/gpunetio_transport.hh"
 #endif
 #include "gpu_search/index_format.hh"
 #include "gpu_search/mapped_ring.hh"
 #include "gpu_search/memory_budget.hh"
-#include "gpu_search/pq_index.hh"
 #include "gpu_search/persistent_grid_plan.hh"
 #include "gpu_search/persistent_kernel.hh"
 #include "gpu_search/persistent_owner_watchdog.hh"
+#include "gpu_search/pq_index.hh"
 #include "vamana/vamana_node.hh"
 
 namespace gpu_search {
@@ -80,8 +80,8 @@ struct PersistentSearchEngine::Impl {
     // Canonical route representation shared by CPU update routing and GPU
     // query routing. Storage-side centroid maintenance still uses FP64 sums.
     std::vector<f32> centroid;
-    std::array<DeviceCentroidRouteEntry,
-               kCentroidRouteMaxLiveEntries> entries{};
+    std::array<DeviceCentroidRouteEntry, kCentroidRouteMaxLiveEntries>
+      entries{};
     u32 live_entry_count{};
   };
 
@@ -98,10 +98,10 @@ struct PersistentSearchEngine::Impl {
   };
 
   Impl(PersistentSearchEngine& owner,
-       configuration::IndexConfiguration& config_in,
-       Context& channel_context,
-       ClientConnectionManager& connection_manager,
-       const MemoryRegionTokens& remote_regions);
+       configuration::IndexConfiguration& config_in);
+  void initialize(Context& channel_context,
+                  ClientConnectionManager& connection_manager,
+                  const MemoryRegionTokens& remote_regions);
   ~Impl();
 
   std::string unhealthy_message();
@@ -112,13 +112,13 @@ struct PersistentSearchEngine::Impl {
   void bind_cuda_device(const char* operation) const;
 
   void stream_codes_to_gpu(NavigationBootstrapper& source);
+  void start();
   void start_persistent_kernel();
   void stop_persistent_kernel();
 
-  service::QueryResult search(VectorDType query_dtype,
-                              const byte_t* query_data, u32 k);
-  std::optional<u32> select_centroid_home(
-    std::span<const f32> vector) const;
+  service::QueryResult search(VectorDType query_dtype, const byte_t* query_data,
+                              u32 k);
+  std::optional<u32> select_centroid_home(std::span<const f32> vector) const;
   void admission_loop();
   void report_direct_path_failure();
   void completion_loop();
@@ -131,15 +131,13 @@ struct PersistentSearchEngine::Impl {
                                 size_t shard) const;
   std::vector<format::StorageControlBlock> read_storage_controls();
   std::vector<std::optional<maintenance_telemetry::Snapshot>>
-    read_maintenance_telemetry();
-  CentroidRouteReadResult
-    read_storage_centroid_route_publications();
+  read_maintenance_telemetry();
+  CentroidRouteReadResult read_storage_centroid_route_publications();
   StorageRouteSyncResult synchronize_storage_routes();
-  bool wait_for_maintenance(
-    std::span<const u64> target_sequences,
-    std::chrono::milliseconds timeout,
-    std::vector<u64>* durable_sequences,
-    std::vector<u64>* effective_target_sequences);
+  bool wait_for_maintenance(std::span<const u64> target_sequences,
+                            std::chrono::milliseconds timeout,
+                            std::vector<u64>* durable_sequences,
+                            std::vector<u64>* effective_target_sequences);
   void initialize_storage_route_descriptors();
   void maintenance_loop();
 
@@ -181,6 +179,7 @@ struct PersistentSearchEngine::Impl {
   u32 exact_width{};
   u32 code_bytes{};
   u32 dynamic_code_record_bytes{};
+  u32 dynamic_code_record_stride{};
   u64 dynamic_code_arena_capacity{};
   u32 visited_capacity{};
   u32 node_record_bytes{};
@@ -244,8 +243,7 @@ struct PersistentSearchEngine::Impl {
   u64* d_direct_speculative_batch_dequeue{};
   u64* d_direct_speculative_batch_sequences{};
   DirectBatchDescriptor* d_direct_speculative_batch_entries{};
-  DeviceRingView<DirectBatchDescriptor>*
-    d_direct_speculative_batch_queues{};
+  DeviceRingView<DirectBatchDescriptor>* d_direct_speculative_batch_queues{};
   i32* d_direct_batch_statuses{};
   u64* d_direct_batch_completion_timestamps_ns{};
   i32* d_core_batch_statuses{};
@@ -307,6 +305,9 @@ struct PersistentSearchEngine::Impl {
   u32 kernel_threads{};
   u32 owner_kernel_blocks{};
   u32 kernel_blocks{};
+  bool initialization_complete{};
+  // Teardown-ownership flag: true immediately after a successful launch,
+  // before readiness, so startup exceptions cannot race resource release.
   bool kernel_running{};
   std::atomic<bool> direct_failure_logged{false};
   std::atomic<u32> slow_query_logs{0};
@@ -328,7 +329,6 @@ struct PersistentSearchEngine::Impl {
   std::mutex storage_control_read_mutex;
   std::condition_variable maintenance_cv;
   std::thread maintenance_thread;
-
 };
 
 }  // namespace gpu_search

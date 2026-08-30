@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 struct CUstream_st;
 using cudaStream_t = CUstream_st*;
@@ -14,7 +15,16 @@ struct GpuNetioRemoteMemoryRegion {
   uint64_t address;
   uint32_t rkey;
   uint32_t reserved;
+  uint64_t bytes;
 };
+
+static_assert(sizeof(GpuNetioRemoteMemoryRegion) == 24);
+static_assert(std::is_standard_layout_v<GpuNetioRemoteMemoryRegion>);
+static_assert(std::is_trivially_copyable_v<GpuNetioRemoteMemoryRegion>);
+static_assert(offsetof(GpuNetioRemoteMemoryRegion, address) == 0);
+static_assert(offsetof(GpuNetioRemoteMemoryRegion, rkey) == 8);
+static_assert(offsetof(GpuNetioRemoteMemoryRegion, reserved) == 12);
+static_assert(offsetof(GpuNetioRemoteMemoryRegion, bytes) == 16);
 
 struct GpuNetioReadProbeParams {
   uint32_t local_mkey;
@@ -30,6 +40,9 @@ struct GpuNetioReadProbeParams {
   int* status_code;
   uint64_t* debug_values;
 };
+
+static_assert(std::is_standard_layout_v<GpuNetioReadProbeParams>);
+static_assert(std::is_trivially_copyable_v<GpuNetioReadProbeParams>);
 
 void launch_gpunetio_read_probe(
   cudaStream_t stream, const GpuNetioReadProbeParams& params);
@@ -63,6 +76,9 @@ struct GpuNetioPayloadProbeParams {
   uint32_t* dump_wqe_flags;
   uint64_t* batch_latency_ns;
 };
+
+static_assert(std::is_standard_layout_v<GpuNetioPayloadProbeParams>);
+static_assert(std::is_trivially_copyable_v<GpuNetioPayloadProbeParams>);
 
 void launch_gpunetio_payload_probe(
   cudaStream_t stream, const GpuNetioPayloadProbeParams& params);

@@ -890,48 +890,105 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
 
   file.unsetf(std::ios::skipws);
   file.seekg(0, std::ios::end);
-  const size_t file_size = file.tellg();
+  const std::streamoff file_end = file.tellg();
+  if (file_end < 0 ||
+      static_cast<u64>(file_end) >
+        static_cast<u64>(std::numeric_limits<size_t>::max()) ||
+      static_cast<u64>(file_end) >
+        static_cast<u64>(std::numeric_limits<std::streamsize>::max())) {
+    return {false, "cannot determine a supported index file size for " + path};
+  }
+  const size_t file_size = static_cast<size_t>(file_end);
   file.seekg(0, std::ios::beg);
 
-  if (file_size > index_buffer_.buffer_size) {
+  if (file_size < gpu_search::format::kNodeBaseOffset ||
+      file_size > index_buffer_.buffer_size) {
     return {false, "buffer too small for index file"};
   }
 
-  print_status("loading index (" + std::to_string(file_size) + " Bytes) from " + path);
-  auto t_read = timing_.create_enroll("read_index_buffer");
-  t_read->start();
-  file.read(reinterpret_cast<char*>(index_buffer_.get_full_buffer()), file_size);
-  t_read->stop();
-
-  if (!file) {
-    return {false, "read failed for " + path};
-  }
+  // Reject a truncated shard, a shard from another data set/build, or a
+  // malformed layout header before spending minutes reading the full file.
   if (!gpu_stream_layout_ || gpu_static_node_count_ == 0 ||
       gpu_static_dynamic_base_ == 0) {
     return {false, "GPU storage metadata cannot materialize the PQ stream"};
   }
-  const u64 persisted_free_pointer =
-    *reinterpret_cast<const u64*>(index_buffer_.get_full_buffer());
-  if (persisted_free_pointer != gpu_static_dynamic_base_) {
-    return {false, "GPU navigation requires a compacted static shard before startup"};
-  }
-  const u64 persisted_shard_fingerprint = *reinterpret_cast<const u64*>(
-    index_buffer_.get_full_buffer() +
-      vamana::centroid_state::kShardFingerprintOffset);
-  if (persisted_shard_fingerprint == 0 ||
-      persisted_shard_fingerprint != gpu_shard_build_fingerprint_) {
-    return {false, "index shard does not belong to the loaded metadata build"};
+  const u64 node_size = VamanaNode::total_size();
+  if (gpu_static_dynamic_base_ < gpu_search::format::kNodeBaseOffset ||
+      node_size == 0 ||
+      gpu_static_node_count_ >
+        (gpu_static_dynamic_base_ - gpu_search::format::kNodeBaseOffset) /
+          node_size) {
+    return {false, "GPU storage fixed-node range overflows its shard layout"};
   }
   const u64 fixed_nodes_end = gpu_search::format::kNodeBaseOffset +
-    gpu_static_node_count_ * VamanaNode::total_size();
+    gpu_static_node_count_ * node_size;
   if (fixed_nodes_end > gpu_static_dynamic_base_ ||
-      gpu_static_dynamic_base_ > file_size) {
-    return {false, "GPU storage shard is truncated or has inconsistent static metadata"};
+      gpu_static_dynamic_base_ != file_size) {
+    return {false,
+            "GPU storage shard size does not exactly match its metadata"};
   }
 
+  u64 persisted_free_pointer = 0;
+  u64 persisted_shard_fingerprint = 0;
+  file.read(reinterpret_cast<char*>(&persisted_free_pointer),
+            sizeof(persisted_free_pointer));
+  file.read(reinterpret_cast<char*>(&persisted_shard_fingerprint),
+            sizeof(persisted_shard_fingerprint));
+  if (file.gcount() !=
+        static_cast<std::streamsize>(sizeof(persisted_shard_fingerprint)) ||
+      persisted_free_pointer != gpu_static_dynamic_base_ ||
+      persisted_shard_fingerprint == 0 ||
+      persisted_shard_fingerprint != gpu_shard_build_fingerprint_) {
+    return {false,
+            "index shard identity does not match the loaded metadata build"};
+  }
+
+  const u64 graph_offset =
+    VamanaNode::HOT_GRAPH_ENTRY_OFFSETS[storage_id_];
+  if (graph_offset < sizeof(vamana::hot_graph::Header) ||
+      graph_offset > file_size ||
+      sizeof(vamana::hot_graph::Header) >
+        file_size - (graph_offset - sizeof(vamana::hot_graph::Header))) {
+    return {false, "index shard graph header range is invalid"};
+  }
+  vamana::hot_graph::Header graph_header;
+  file.seekg(static_cast<std::streamoff>(
+    graph_offset - sizeof(vamana::hot_graph::Header)));
+  file.read(reinterpret_cast<char*>(&graph_header), sizeof(graph_header));
+  if (file.gcount() != static_cast<std::streamsize>(sizeof(graph_header)) ||
+      graph_header.magic != vamana::hot_graph::kMagic ||
+      graph_header.version != vamana::hot_graph::kVersion3 ||
+      graph_header.header_bytes != sizeof(graph_header) ||
+      graph_header.entry_bytes != VamanaNode::hot_graph_entry_size() ||
+      graph_header.max_degree != VamanaNode::R ||
+      graph_header.compact_pointer_bytes !=
+        vamana::hot_graph::kCompactPointerBytes ||
+      graph_header.compact_pointer_shard_bits !=
+        VamanaNode::HOT_GRAPH_SHARD_BITS ||
+      graph_header.flags != 0 ||
+      graph_header.entry_count != gpu_static_node_count_ ||
+      graph_header.node_base_offset != gpu_search::format::kNodeBaseOffset ||
+      graph_header.reserved0 != gpu_static_dynamic_base_ ||
+      // The graph header is committed at schema 15. PQ indexing upgrades the
+      // runtime allocation record in metadata without rewriting the large
+      // shard, so reserved1 remains the graph-only dynamic record width.
+      graph_header.reserved1 != VamanaNode::dynamic_record_size() ||
+      graph_header.reserved2 != VamanaNode::total_size()) {
+    return {false, "index shard compact-graph header is incompatible"};
+  }
+
+  if (gpu_storage_control_offset_ >
+        std::numeric_limits<u64>::max() -
+          gpu_search::format::kStorageControlBytes ||
+      gpu_navigation_code_bytes_ == 0 ||
+      gpu_static_node_count_ >
+        std::numeric_limits<u64>::max() / gpu_navigation_code_bytes_) {
+    return {false, "GPU PQ stream layout overflows"};
+  }
   const u64 remote_offset = gpu_storage_control_offset_ +
     gpu_search::format::kStorageControlBytes;
-  const u64 payload_bytes = gpu_static_node_count_ * gpu_navigation_code_bytes_;
+  const u64 payload_bytes =
+    gpu_static_node_count_ * gpu_navigation_code_bytes_;
   if (remote_offset == 0 || remote_offset > index_buffer_.buffer_size ||
       payload_bytes > index_buffer_.buffer_size - remote_offset) {
     return {false, "buffer too small for GPU PQ stream"};
@@ -953,8 +1010,25 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
       header.entry_count != gpu_static_node_count_ ||
       header.remote_offset != remote_offset ||
       header.payload_bytes != payload_bytes) {
-    return {false, error.empty() ? "incompatible GPU PQ sidecar " + code_path.string()
-                                 : error};
+    return {false, error.empty()
+      ? "incompatible GPU PQ sidecar " + code_path.string()
+      : error};
+  }
+
+  file.clear();
+  file.seekg(0, std::ios::beg);
+  if (!file.good()) {
+    return {false, "failed to rewind index shard after preflight: " + path};
+  }
+
+  print_status("loading index (" + std::to_string(file_size) + " Bytes) from " + path);
+  auto t_read = timing_.create_enroll("read_index_buffer");
+  t_read->start();
+  file.read(reinterpret_cast<char*>(index_buffer_.get_full_buffer()), file_size);
+  t_read->stop();
+
+  if (!file) {
+    return {false, "read failed for " + path};
   }
   std::ifstream codes{code_path, std::ios::binary};
   codes.seekg(static_cast<std::streamoff>(sizeof(header)));
@@ -1077,7 +1151,13 @@ void MemoryNode::initialize_storage_centroid_route() {
   const u64 expected_payload_bytes =
     vamana::centroid_state::payload_bytes(
       header.dim, header.entry_count);
-  const u64 file_bytes = std::filesystem::file_size(path);
+  std::error_code file_error;
+  const std::uintmax_t raw_file_bytes =
+    std::filesystem::file_size(path, file_error);
+  lib_assert(!file_error &&
+               raw_file_bytes <= std::numeric_limits<u64>::max(),
+             "cannot size physical centroid sidecar: " + path.string());
+  const u64 file_bytes = static_cast<u64>(raw_file_bytes);
   lib_assert(header.build_fingerprint == gpu_index_build_fingerprint_ &&
                header.shard_fingerprint == gpu_shard_build_fingerprint_ &&
                header.shard_fingerprint == shard_fingerprint &&

@@ -36,6 +36,11 @@ void Configuration::create_rdma_options() {
   // configuration options
   desc.add_options()(
     "port", po::value<u32>(&port)->default_value(port), "TCP port")(
+    "qp-handshake-timeout-ms",
+    po::value<u32>(&qp_handshake_timeout_ms)->default_value(
+      qp_handshake_timeout_ms),
+    "Timeout for the versioned TCP QP handshake")(
+
     "ib-device",
     po::value<str>(&ib_device),
     "InfiniBand/RDMA device name, for example mlx5_0. Empty selects the first device.")(
@@ -44,7 +49,7 @@ void Configuration::create_rdma_options() {
     "Port of infiniband device")(
     "max-poll-cqes",
     po::value<i32>(&max_poll_cqes)->default_value(max_poll_cqes),
-    "Number of outstanding RDMA operations allowed (hardware-specific)")(
+    "Maximum number of CQEs requested in one polling call")(
     "max-send-wrs",
     po::value<i32>(&max_send_queue_wr)->default_value(max_send_queue_wr),
     "Maximum number of outstanding send work requests")(
@@ -85,6 +90,13 @@ void Configuration::process_program_options(int argc, char** argv) {
     if (!is_initiator && !client_nodes.empty()) {
       std::cerr << "[ERROR]: --clients <arg-list> is only required by the "
                    "initiating client"
+                << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (!rdma_limits_valid()) {
+      std::cerr << "[ERROR]: num-clients, TCP/IB ports, CQ polling, and "
+                   "QP handshake timeout, and send/receive queue depths must be in valid ranges"
                 << std::endl;
       exit_with_help_message(argv);
     }
@@ -130,6 +142,8 @@ std::ostream& operator<<(std::ostream& os, const Configuration& config) {
        << std::endl;
   }
   os << std::setw(width) << "TCP port: " << config.port << std::endl
+     << std::setw(width) << "QP handshake timeout (ms): "
+     << config.qp_handshake_timeout_ms << std::endl
      << std::setw(width) << "IB device: "
      << (config.ib_device.empty() ? str{"<auto>"} : config.ib_device) << std::endl
      << std::setw(width) << "IB port: " << config.device_port << std::endl

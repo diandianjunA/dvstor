@@ -45,12 +45,77 @@ void test_vector_file_reader() {
   }
 
   const auto rows = tools::breakdown_benchmark::read_vector_rows(path.string(), true);
+  const auto ambiguous_path = std::filesystem::temp_directory_path() /
+    "dvstor_breakdown_benchmark_support_test.bin";
+  std::filesystem::copy_file(
+    path, ambiguous_path, std::filesystem::copy_options::overwrite_existing);
+  bool rejected_ambiguous = false;
+  try {
+    (void)tools::breakdown_benchmark::read_vector_rows(
+      ambiguous_path.string(), false);
+  } catch (const std::runtime_error&) {
+    rejected_ambiguous = true;
+  }
+  assert(rejected_ambiguous);
+  std::filesystem::remove(ambiguous_path);
+  {
+    std::ofstream output(path, std::ios::binary | std::ios::app);
+    const uint8_t trailing = 0xff;
+    output.write(reinterpret_cast<const char*>(&trailing), sizeof(trailing));
+  }
+  bool rejected_trailing = false;
+  try {
+    (void)tools::breakdown_benchmark::read_vector_rows(path.string(), false);
+  } catch (const std::runtime_error&) {
+    rejected_trailing = true;
+  }
+  assert(rejected_trailing);
+  std::filesystem::resize_file(path, 2 * sizeof(uint32_t) + 5);
+  bool rejected_truncated = false;
+  try {
+    (void)tools::breakdown_benchmark::read_vector_rows(path.string(), false);
+  } catch (const std::runtime_error&) {
+    rejected_truncated = true;
+  }
+  assert(rejected_truncated);
   std::filesystem::remove(path);
   assert(rows.dtype == VectorDType::uint8);
   assert(rows.count == 2);
   assert(rows.dim == 3);
   assert(rows.vector_bytes == 3);
   assert(rows.decoded == std::vector<float>({1, 2, 3, 4, 5, 6}));
+}
+
+void test_groundtruth_file_reader_rejects_size_mismatch() {
+  const auto path = std::filesystem::temp_directory_path() /
+    "dvstor_breakdown_groundtruth_size_test.bin";
+  {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    const uint32_t rows = 2;
+    const uint32_t top_k = 2;
+    const std::array<uint32_t, 4> ids{1, 2, 3, 4};
+    output.write(reinterpret_cast<const char*>(&rows), sizeof(rows));
+    output.write(reinterpret_cast<const char*>(&top_k), sizeof(top_k));
+    output.write(reinterpret_cast<const char*>(ids.data()),
+                 ids.size() * sizeof(uint32_t));
+  }
+  const auto truth =
+    tools::breakdown_benchmark::read_groundtruth_bin(path.string());
+  assert(truth.rows == 2 && truth.top_k == 2);
+  assert(truth.row(1)[1] == 4);
+  {
+    std::ofstream output(path, std::ios::binary | std::ios::app);
+    const uint8_t trailing = 0xff;
+    output.write(reinterpret_cast<const char*>(&trailing), sizeof(trailing));
+  }
+  bool rejected = false;
+  try {
+    (void)tools::breakdown_benchmark::read_groundtruth_bin(path.string());
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+  std::filesystem::remove(path);
 }
 
 void test_single_pass_stream() {
@@ -871,6 +936,7 @@ void test_in_band_maintenance_snapshot_window() {
 int main() {
   test_deterministic_dataset();
   test_vector_file_reader();
+  test_groundtruth_file_reader_rejects_size_mismatch();
   test_single_pass_stream();
   test_recall_and_report_formatting();
   test_dynamic_cache_telemetry_reset_preserves_lifetime_gauges();

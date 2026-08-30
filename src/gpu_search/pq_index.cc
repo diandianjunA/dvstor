@@ -130,15 +130,29 @@ bool read_model(const std::filesystem::path& path, Model& model,
   ModelHeader header;
   if (!read_exact(input, &header, sizeof(header)) || header.magic != kModelMagic ||
       header.version != kModelVersion || header.header_bytes != sizeof(ModelHeader) ||
-      header.endian_marker != kEndianMarker || header.bits_per_code != kBitsPerCode ||
+      header.endian_marker != kEndianMarker || header.dim == 0 ||
+      header.subquantizers == 0 || header.bits_per_code != kBitsPerCode ||
       header.code_bytes != header.subquantizers || header.subvector_dim == 0 ||
-      header.dim != header.subquantizers * header.subvector_dim ||
+      static_cast<u64>(header.subquantizers) * header.subvector_dim !=
+        header.dim ||
+      (header.flags & ~kFlagHasRotation) != 0 || header.reserved0 != 0 ||
+      std::any_of(header.reserved.begin(), header.reserved.end(),
+                  [](u64 value) { return value != 0; }) ||
       header.rotation_offset != sizeof(ModelHeader) ||
+      header.rotation_bytes >
+        std::numeric_limits<u64>::max() - header.rotation_offset ||
       header.centroids_offset != header.rotation_offset + header.rotation_bytes ||
+      header.centroids_bytes >
+        std::numeric_limits<u64>::max() - header.centroids_offset ||
       header.file_bytes != header.centroids_offset + header.centroids_bytes) {
     return fail(error, "invalid PQ model header: " + path.string());
   }
   const bool has_rotation = (header.flags & kFlagHasRotation) != 0;
+  if (has_rotation &&
+      static_cast<u64>(header.dim) >
+        std::numeric_limits<u64>::max() / header.dim / sizeof(f32)) {
+    return fail(error, "PQ model rotation shape overflows: " + path.string());
+  }
   const u64 expected_rotation_bytes = has_rotation
     ? static_cast<u64>(header.dim) * header.dim * sizeof(f32) : 0;
   const u64 expected_centroid_bytes = static_cast<u64>(header.subquantizers) *
@@ -147,8 +161,19 @@ bool read_model(const std::filesystem::path& path, Model& model,
       header.centroids_bytes != expected_centroid_bytes) {
     return fail(error, "invalid PQ model payload shape: " + path.string());
   }
+  const u64 maximum_readable_bytes = std::min<u64>(
+    std::numeric_limits<size_t>::max(),
+    static_cast<u64>(std::numeric_limits<std::streamsize>::max()));
+  if (header.rotation_bytes > maximum_readable_bytes ||
+      header.centroids_bytes > maximum_readable_bytes) {
+    return fail(error, "PQ model payload exceeds host address space: " +
+                       path.string());
+  }
   input.seekg(0, std::ios::end);
-  if (static_cast<u64>(input.tellg()) != header.file_bytes) {
+  const std::streampos file_end = input.tellg();
+  if (file_end == std::streampos(-1) ||
+      static_cast<u64>(static_cast<std::streamoff>(file_end)) !=
+        header.file_bytes) {
     return fail(error, "truncated PQ model: " + path.string());
   }
   input.seekg(static_cast<std::streamoff>(header.rotation_offset));

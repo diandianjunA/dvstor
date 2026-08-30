@@ -20,6 +20,13 @@ struct ReceiveInfo {
   u32 bytes_written{};
 };
 
+struct CompletionPollContract {
+  static constexpr i32 batch_size(i32 remaining, i32 configured_cap) {
+    if (remaining <= 0 || configured_cap <= 0) return 0;
+    return std::min(remaining, configured_cap);
+  }
+};
+
 class Context {
 public:
   using IBDeviceList = ibv_device**;
@@ -41,15 +48,16 @@ public:
   ibv_srq* get_shared_receive_cq() { return shared_receive_cq_; }
   Configuration& get_config() const { return config_; }
   u16 get_lid() const { return port_attributes_.lid; }
+  enum ibv_mtu get_active_mtu() const { return port_attributes_.active_mtu; }
   u32 max_qp_read_atomic() const {
-    return std::max<u32>(1, std::min<u32>(16, device_attributes_.max_qp_init_rd_atom));
+    return std::min<u32>(16, device_attributes_.max_qp_init_rd_atom);
   }
   u32 max_qp_dest_read_atomic() const {
-    return std::max<u32>(1, std::min<u32>(16, device_attributes_.max_qp_rd_atom));
+    return std::min<u32>(16, device_attributes_.max_qp_rd_atom);
   }
 
   void bind_to_port(u32 tcp_port);
-  void close_server_socket() const;
+  void close_server_socket();
   std::pair<u_ptr<QueuePair>, u32> wait_for_connection();
   u_ptr<QueuePair> connect_to_server(const str& address,
                                      u32 tcp_port,

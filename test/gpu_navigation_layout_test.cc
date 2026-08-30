@@ -26,16 +26,16 @@ void test_dynamic_pq_arena_mapping_and_incarnation_order() {
     .dynamic_arena_slot_count = 3,
   };
   u64 slot = 0;
-  assert(gpu_search::dynamic_code_arena_slot_from_offset(
-    shard, 4096, 703, slot));
+  assert(
+    gpu_search::dynamic_code_arena_slot_from_offset(shard, 4096, 703, slot));
   assert(slot == 700);
-  assert(gpu_search::dynamic_code_arena_slot_from_offset(
-    shard, 4096 + 2 * 1040, 703, slot));
+  assert(gpu_search::dynamic_code_arena_slot_from_offset(shard, 4096 + 2 * 1040,
+                                                         703, slot));
   assert(slot == 702);
-  assert(!gpu_search::dynamic_code_arena_slot_from_offset(
-    shard, 4095, 703, slot));
-  assert(!gpu_search::dynamic_code_arena_slot_from_offset(
-    shard, 4097, 703, slot));
+  assert(
+    !gpu_search::dynamic_code_arena_slot_from_offset(shard, 4095, 703, slot));
+  assert(
+    !gpu_search::dynamic_code_arena_slot_from_offset(shard, 4097, 703, slot));
   assert(!gpu_search::dynamic_code_arena_slot_from_offset(
     shard, 4096 + 3 * 1040, 703, slot));
 
@@ -51,10 +51,8 @@ void test_dynamic_pq_arena_mapping_and_incarnation_order() {
   assert(!gpu_search::dynamic_code_arena_read_stable(
     tag, gpu_search::kPersistentDynamicCodeArenaBusy | tag, incarnation));
   assert(!gpu_search::dynamic_code_arena_read_stable(
-    tag, gpu_search::make_dynamic_code_tag(incarnation + 1, 1),
-    incarnation));
-  assert(gpu_search::dynamic_code_tag_extent_class(
-           0xff000000u | incarnation) ==
+    tag, gpu_search::make_dynamic_code_tag(incarnation + 1, 1), incarnation));
+  assert(gpu_search::dynamic_code_tag_extent_class(0xff000000u | incarnation) ==
          gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
 
   assert(gpu_search::dynamic_code_arena_can_publish(0, 1));
@@ -72,8 +70,8 @@ void test_dynamic_pq_arena_mapping_and_incarnation_order() {
     gpu_search::kPersistentDynamicCodeArenaBusy | tag));
 
   u32 promoted = 0;
-  assert(gpu_search::dynamic_code_arena_promoted_extent_state(
-    tag, incarnation, 11, promoted));
+  assert(gpu_search::dynamic_code_arena_promoted_extent_state(tag, incarnation,
+                                                              11, promoted));
   assert(gpu_search::dynamic_code_tag_incarnation(promoted) == incarnation);
   assert(gpu_search::dynamic_code_tag_extent_class(promoted) == 11);
   assert(!gpu_search::dynamic_code_arena_promoted_extent_state(
@@ -107,8 +105,8 @@ void test_dynamic_pq_arena_mapping_and_incarnation_order() {
 
   u32 demoted = 0;
   assert(gpu_search::dynamic_code_arena_guarded_demoted_extent_state(
-    promoted = gpu_search::make_dynamic_code_tag(incarnation, 11),
-    incarnation, 7, demoted));
+    promoted = gpu_search::make_dynamic_code_tag(incarnation, 11), incarnation,
+    7, demoted));
   assert(gpu_search::dynamic_code_tag_extent_class(demoted) == 8);
   assert(!gpu_search::dynamic_code_arena_guarded_demoted_extent_state(
     demoted, incarnation, 7, demoted));
@@ -124,37 +122,34 @@ void test_dynamic_navigation_code_width_semantics() {
   VamanaNode::init_static_storage(dim, degree, VectorDType::uint8);
 
   for (u32 payload_bytes : {16u, 32u, 64u}) {
-    const u32 dynamic_hot_offset =
-      static_cast<u32>(VamanaNode::total_size());
+    const u32 dynamic_hot_offset = static_cast<u32>(VamanaNode::total_size());
     const u32 graph_entry_bytes =
       static_cast<u32>(VamanaNode::hot_graph_entry_size());
-    const u32 dynamic_code_offset =
-      dynamic_hot_offset + graph_entry_bytes;
-    const u32 dynamic_record_bytes = static_cast<u32>(
-      VamanaNode::align_compact(
-        dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
-          payload_bytes + VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES));
+    const u32 dynamic_code_offset = dynamic_hot_offset + graph_entry_bytes;
+    const u32 dynamic_record_bytes = static_cast<u32>(VamanaNode::align_compact(
+      dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+      payload_bytes + VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES));
     if (payload_bytes == 32) {
       const u32 old_stride = static_cast<u32>(VamanaNode::align_compact(
         dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
-          payload_bytes));
+        payload_bytes));
       assert(dynamic_code_offset == 992);
       assert(old_stride == 1040);
       assert(dynamic_record_bytes == old_stride);
       assert(VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + payload_bytes +
-               VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES == 40);
+               VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES ==
+             40);
     }
 
-    VamanaNode::configure_hot_graph(
-      {4096}, {1}, graph_entry_bytes, 0, {8192}, dynamic_record_bytes,
-      dynamic_hot_offset, dynamic_code_offset, payload_bytes);
+    VamanaNode::configure_hot_graph({4096}, {1}, graph_entry_bytes, 0, {8192},
+                                    dynamic_record_bytes, dynamic_hot_offset,
+                                    dynamic_code_offset, payload_bytes);
     assert(VamanaNode::HAS_HOT_GRAPH);
     assert(VamanaNode::HOT_GRAPH_DYNAMIC_CODE_BYTES == payload_bytes);
     assert(VamanaNode::dynamic_navigation_code_payload_bytes() ==
            payload_bytes);
-    assert(dynamic_code_offset +
-             VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + payload_bytes +
-             VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES <=
+    assert(dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+             payload_bytes + VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES <=
            VamanaNode::allocation_size());
 
     std::vector<u8> payload(payload_bytes);
@@ -164,18 +159,17 @@ void test_dynamic_navigation_code_width_semantics() {
     const u32 tag = VamanaNode::pack_dynamic_navigation_tag(19, 2);
     std::array<u8, VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES> checksum{};
     vamana::dynamic_navigation_code::store_u32_le(
-      checksum.data(),
-      vamana::dynamic_navigation_code::checksum(
-        tag, payload.data(), payload_bytes));
+      checksum.data(), vamana::dynamic_navigation_code::checksum(
+                         tag, payload.data(), payload_bytes));
     assert(vamana::dynamic_navigation_code::validate(
       tag, payload.data(), payload_bytes, checksum.data()));
     // Extent is advisory and may change independently of the immutable PQ.
     assert(vamana::dynamic_navigation_code::validate(
-      VamanaNode::pack_dynamic_navigation_tag(19, 9),
-      payload.data(), payload_bytes, checksum.data()));
+      VamanaNode::pack_dynamic_navigation_tag(19, 9), payload.data(),
+      payload_bytes, checksum.data()));
     assert(!vamana::dynamic_navigation_code::validate(
-      VamanaNode::pack_dynamic_navigation_tag(20, 2),
-      payload.data(), payload_bytes, checksum.data()));
+      VamanaNode::pack_dynamic_navigation_tag(20, 2), payload.data(),
+      payload_bytes, checksum.data()));
     payload[payload_bytes / 2] ^= 1u;
     assert(!vamana::dynamic_navigation_code::validate(
       tag, payload.data(), payload_bytes, checksum.data()));
@@ -193,13 +187,12 @@ void test_dynamic_navigation_code_width_semantics() {
     // GPU read a different address, so reject it even when the padded record
     // is otherwise large enough for the complete PQ payload.
     const u32 padded_code_offset = dynamic_code_offset + 16;
-    const u32 padded_record_bytes = static_cast<u32>(
-      VamanaNode::align_compact(
-        padded_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
-          payload_bytes + VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES));
-    VamanaNode::configure_hot_graph(
-      {4096}, {1}, graph_entry_bytes, 0, {8192}, padded_record_bytes,
-      dynamic_hot_offset, padded_code_offset, payload_bytes);
+    const u32 padded_record_bytes = static_cast<u32>(VamanaNode::align_compact(
+      padded_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+      payload_bytes + VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES));
+    VamanaNode::configure_hot_graph({4096}, {1}, graph_entry_bytes, 0, {8192},
+                                    padded_record_bytes, dynamic_hot_offset,
+                                    padded_code_offset, payload_bytes);
     assert(!VamanaNode::HAS_HOT_GRAPH);
 
     // A record that fits the prefix and PQ payload but omits the checksum must
@@ -208,8 +201,7 @@ void test_dynamic_navigation_code_width_semantics() {
       {4096}, {1}, graph_entry_bytes, 0, {8192},
       dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
         payload_bytes,
-      dynamic_hot_offset,
-      dynamic_code_offset, payload_bytes);
+      dynamic_hot_offset, dynamic_code_offset, payload_bytes);
     assert(!VamanaNode::HAS_HOT_GRAPH);
   }
   VamanaNode::disable_hot_graph();
@@ -217,13 +209,13 @@ void test_dynamic_navigation_code_width_semantics() {
 
 void test_dynamic_navigation_code_torn_snapshot_detection() {
   constexpr u32 payload_bytes = 32;
-  constexpr u32 record_bytes =
-    VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + payload_bytes +
-      VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES;
+  constexpr u32 record_bytes = VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+                               payload_bytes +
+                               VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES;
   const auto make_record = [](u32 incarnation, u8 extent, u8 seed) {
     std::array<u8, record_bytes> record{};
-    const u32 tag = VamanaNode::pack_dynamic_navigation_tag(
-      incarnation, extent);
+    const u32 tag =
+      VamanaNode::pack_dynamic_navigation_tag(incarnation, extent);
     vamana::dynamic_navigation_code::store_u32_le(record.data(), tag);
     for (u32 byte = 0; byte < payload_bytes; ++byte) {
       record[VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + byte] =
@@ -234,21 +226,18 @@ void test_dynamic_navigation_code_torn_snapshot_detection() {
     vamana::dynamic_navigation_code::store_u32_le(
       record.data() + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
         payload_bytes,
-      vamana::dynamic_navigation_code::checksum(
-        tag, payload, payload_bytes));
+      vamana::dynamic_navigation_code::checksum(tag, payload, payload_bytes));
     return record;
   };
   const auto accepted = [](const std::array<u8, record_bytes>& record,
                            u32 incarnation) {
-    const u32 tag =
-      vamana::dynamic_navigation_code::load_u32_le(record.data());
+    const u32 tag = vamana::dynamic_navigation_code::load_u32_le(record.data());
     const u8* payload =
       record.data() + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES;
     const u8* checksum = payload + payload_bytes;
-    return VamanaNode::dynamic_navigation_tag_incarnation(tag) ==
-             incarnation &&
-      vamana::dynamic_navigation_code::validate(
-        tag, payload, payload_bytes, checksum);
+    return VamanaNode::dynamic_navigation_tag_incarnation(tag) == incarnation &&
+           vamana::dynamic_navigation_code::validate(tag, payload,
+                                                     payload_bytes, checksum);
   };
 
   const auto old_record = make_record(41, 2, 7);
@@ -325,11 +314,9 @@ void test_supported_gpu_layout_limits() {
 
 void test_tagged_remote_pointer() {
   const RemotePtr static_node{63, RemotePtr::BYTE_OFFSET_CAPACITY - 16};
-  const RemotePtr first_dynamic{
-    63, RemotePtr::BYTE_OFFSET_CAPACITY - 16, 1};
-  const RemotePtr last_dynamic{
-    63, RemotePtr::BYTE_OFFSET_CAPACITY - 16,
-    RemotePtr::MAX_INCARNATION};
+  const RemotePtr first_dynamic{63, RemotePtr::BYTE_OFFSET_CAPACITY - 16, 1};
+  const RemotePtr last_dynamic{63, RemotePtr::BYTE_OFFSET_CAPACITY - 16,
+                               RemotePtr::MAX_INCARNATION};
   assert(static_node.memory_node() == 63);
   assert(static_node.byte_offset() == RemotePtr::BYTE_OFFSET_CAPACITY - 16);
   assert(static_node.incarnation() == 0);
@@ -339,8 +326,7 @@ void test_tagged_remote_pointer() {
   assert(last_dynamic.incarnation() == RemotePtr::MAX_INCARNATION);
   assert(RemotePtr{last_dynamic.raw_address} == last_dynamic);
   std::array<byte_t, vamana::hot_graph::kTaggedPointerBytes> encoded{};
-  assert(vamana::hot_graph::encode_remote_ptr(
-    last_dynamic, 0, encoded.data()));
+  assert(vamana::hot_graph::encode_remote_ptr(last_dynamic, 0, encoded.data()));
   assert(vamana::hot_graph::decode_remote_ptr(encoded.data(), 0) ==
          last_dynamic);
 
@@ -377,8 +363,8 @@ void test_graph_record_stale_incarnation_is_not_transport_failure() {
   store_u32(8, 12);
   store_u32(12, 0);
   const auto seal = [&]() {
-    const u16 checksum = validation::checksum16(
-      record.data(), static_cast<u32>(record.size()));
+    const u16 checksum =
+      validation::checksum16(record.data(), static_cast<u32>(record.size()));
     record[2] = static_cast<byte_t>(checksum);
     record[3] = static_cast<byte_t>(checksum >> 8);
   };
@@ -401,22 +387,21 @@ void test_graph_record_stale_incarnation_is_not_transport_failure() {
 
   // Static slots never recycle, and a torn record must not be mistaken for a
   // benign stale dynamic handle merely because its incarnation bytes differ.
-  assert(validation::classify_snapshot(
-           record.data(), record.size(), graph_degree, graph_capacity, 0) ==
+  assert(validation::classify_snapshot(record.data(), record.size(),
+                                       graph_degree, graph_capacity, 0) ==
          validation::SnapshotState::invalid);
   record[16] ^= 1;
-  assert(validation::classify_snapshot(
-           record.data(), record.size(), graph_degree, graph_capacity, 11) ==
+  assert(validation::classify_snapshot(record.data(), record.size(),
+                                       graph_degree, graph_capacity, 11) ==
          validation::SnapshotState::invalid);
-  assert(validation::decide_read_action(
-           true, validation::SnapshotState::invalid, true) ==
-         validation::ReadAction::retry);
-  assert(validation::decide_read_action(
-           true, validation::SnapshotState::invalid, false) ==
-         validation::ReadAction::fail);
-  assert(validation::decide_read_action(
-           false, validation::SnapshotState::valid, true) ==
-         validation::ReadAction::fail);
+  assert(validation::decide_read_action(true,
+                                        validation::SnapshotState::invalid,
+                                        true) == validation::ReadAction::retry);
+  assert(validation::decide_read_action(true,
+                                        validation::SnapshotState::invalid,
+                                        false) == validation::ReadAction::fail);
+  assert(validation::decide_read_action(false, validation::SnapshotState::valid,
+                                        true) == validation::ReadAction::fail);
 }
 
 void test_graph_live_extent_reconstructs_canonical_record() {
@@ -434,50 +419,48 @@ void test_graph_live_extent_reconstructs_canonical_record() {
     assert(validation::fnv1a_prime_power(exponent) == repeated);
   }
 
-  assert(validation::graph_extent_bytes_for_class(
-           0, record_bytes, graph_capacity) == 16);
-  assert(validation::graph_extent_bytes_for_class(
-           1, record_bytes, graph_capacity) == 80);
-  assert(validation::graph_extent_bytes_for_class(
-           7, record_bytes, graph_capacity) == 464);
+  assert(validation::graph_extent_bytes_for_class(0, record_bytes,
+                                                  graph_capacity) == 16);
+  assert(validation::graph_extent_bytes_for_class(1, record_bytes,
+                                                  graph_capacity) == 80);
+  assert(validation::graph_extent_bytes_for_class(7, record_bytes,
+                                                  graph_capacity) == 464);
   assert(validation::graph_extent_bytes_for_class(
            13, record_bytes, graph_capacity) == record_bytes);
   assert(validation::graph_extent_bytes_for_class(
-           validation::kGraphExtentClassUnknown,
-           record_bytes, graph_capacity) == record_bytes);
-  assert(validation::graph_extent_class_for_required_bytes(
-           16, graph_capacity) == 0);
+           validation::kGraphExtentClassUnknown, record_bytes,
+           graph_capacity) == record_bytes);
+  assert(
+    validation::graph_extent_class_for_required_bytes(16, graph_capacity) == 0);
   assert(validation::graph_extent_class_for_required_bytes(
            16 + 8 * sizeof(u64), graph_capacity) == 1);
   assert(validation::graph_extent_class_for_required_bytes(
            16 + 9 * sizeof(u64), graph_capacity) == 2);
   assert(validation::graph_extent_class_for_required_bytes(
-           17, graph_capacity) ==
-         validation::kGraphExtentClassUnknown);
+           17, graph_capacity) == validation::kGraphExtentClassUnknown);
   assert(validation::graph_extent_class_for_required_bytes(
            record_bytes + sizeof(u64), graph_capacity) ==
          validation::kGraphExtentClassUnknown);
 
   const u32 packed_classes =
-    3u | (7u << 8) | (validation::kGraphExtentClassUnknown << 16) |
-      (9u << 24);
+    3u | (7u << 8) | (validation::kGraphExtentClassUnknown << 16) | (9u << 24);
   assert(validation::packed_graph_extent_class(packed_classes, 0) == 3);
   assert(validation::packed_graph_extent_class(packed_classes, 1) == 7);
   assert(validation::packed_graph_extent_class(packed_classes, 2) ==
          validation::kGraphExtentClassUnknown);
   assert(validation::packed_graph_extent_class(packed_classes, 3) == 9);
   u32 promoted_word = 0;
-  assert(validation::promoted_graph_extent_word(
-    packed_classes, 1, 8, promoted_word));
+  assert(validation::promoted_graph_extent_word(packed_classes, 1, 8,
+                                                promoted_word));
   assert(validation::packed_graph_extent_class(promoted_word, 0) == 3);
   assert(validation::packed_graph_extent_class(promoted_word, 1) == 8);
   assert(validation::packed_graph_extent_class(promoted_word, 2) ==
          validation::kGraphExtentClassUnknown);
   assert(validation::packed_graph_extent_class(promoted_word, 3) == 9);
-  assert(!validation::promoted_graph_extent_word(
-    promoted_word, 1, 7, promoted_word));
-  assert(!validation::promoted_graph_extent_word(
-    promoted_word, 2, 12, promoted_word));
+  assert(!validation::promoted_graph_extent_word(promoted_word, 1, 7,
+                                                 promoted_word));
+  assert(!validation::promoted_graph_extent_word(promoted_word, 2, 12,
+                                                 promoted_word));
   // The optimistic hint is not charged against the legacy three full-record
   // snapshot attempts. Fixed/full: attempts 0,1 may retry and 2 is final.
   assert(validation::snapshot_retry_available(0, false, false, 3, 3));
@@ -492,31 +475,28 @@ void test_graph_live_extent_reconstructs_canonical_record() {
   // R=128 plus eight provisional slots requires 17 classes; a four-bit
   // encoding would silently truncate this supported layout.
   assert(validation::graph_extent_bytes_for_class(
-           17, 16 + 136 * sizeof(u64), 136) ==
-         16 + 136 * sizeof(u64));
+           17, 16 + 136 * sizeof(u64), 136) == 16 + 136 * sizeof(u64));
 
   std::array<byte_t, record_bytes> authoritative{};
   authoritative[0] = 47;
   authoritative[1] = static_cast<byte_t>(2u << 4);
   for (u32 edge = 0; edge < 49; ++edge) {
-    const u64 handle = RemotePtr{
-      edge % 4, 16 + static_cast<u64>(edge) * 64}.raw_address;
-    std::memcpy(
-      authoritative.data() + validation::kGraphRecordHeaderBytes +
-        static_cast<size_t>(edge) * sizeof(handle),
-      &handle, sizeof(handle));
+    const u64 handle =
+      RemotePtr{edge % 4, 16 + static_cast<u64>(edge) * 64}.raw_address;
+    std::memcpy(authoritative.data() + validation::kGraphRecordHeaderBytes +
+                  static_cast<size_t>(edge) * sizeof(handle),
+                &handle, sizeof(handle));
   }
-  const u16 checksum = validation::checksum16(
-    authoritative.data(), authoritative.size());
+  const u16 checksum =
+    validation::checksum16(authoritative.data(), authoritative.size());
   authoritative[2] = static_cast<byte_t>(checksum);
   authoritative[3] = static_cast<byte_t>(checksum >> 8);
   assert(validation::classify_snapshot(
-           authoritative.data(), authoritative.size(),
-           graph_degree, graph_capacity, 0) ==
-         validation::SnapshotState::valid);
+           authoritative.data(), authoritative.size(), graph_degree,
+           graph_capacity, 0) == validation::SnapshotState::valid);
 
-  const u32 extent_bytes = validation::graph_extent_bytes_for_class(
-    7, record_bytes, graph_capacity);
+  const u32 extent_bytes =
+    validation::graph_extent_bytes_for_class(7, record_bytes, graph_capacity);
   assert(validation::checksum16_zero_extended_prefix(
            authoritative.data(), extent_bytes, authoritative.size()) ==
          checksum);
@@ -525,8 +505,7 @@ void test_graph_live_extent_reconstructs_canonical_record() {
   // neither read nor clear it: it hashes the transferred prefix and advances
   // the canonical zero suffix algebraically.
   reconstructed.fill(0xa5);
-  std::memcpy(
-    reconstructed.data(), authoritative.data(), extent_bytes);
+  std::memcpy(reconstructed.data(), authoritative.data(), extent_bytes);
   u32 required_bytes = 0;
   assert(validation::required_live_extent_bytes(
     reconstructed.data(), extent_bytes, graph_degree, graph_capacity,
@@ -540,8 +519,8 @@ void test_graph_live_extent_reconstructs_canonical_record() {
   reconstructed[required_bytes + 3] = 0x4b;
   assert(validation::classify_zero_extended_snapshot(
            reconstructed.data(), extent_bytes, reconstructed.size(),
-           graph_degree, graph_capacity, 0) ==
-         validation::SnapshotState::valid);
+           graph_degree, graph_capacity,
+           0) == validation::SnapshotState::valid);
 
   // Canonical records in several extent classes must produce exactly the
   // existing full-record checksum without touching the unread scratch bytes.
@@ -549,20 +528,19 @@ void test_graph_live_extent_reconstructs_canonical_record() {
     std::array<byte_t, record_bytes> record{};
     record[0] = static_cast<byte_t>(live_edges);
     for (u32 edge = 0; edge < live_edges; ++edge) {
-      const u64 handle = RemotePtr{
-        edge % 4, 16 + static_cast<u64>(edge) * 64}.raw_address;
-      std::memcpy(
-        record.data() + validation::kGraphRecordHeaderBytes +
-          static_cast<size_t>(edge) * sizeof(handle),
-        &handle, sizeof(handle));
+      const u64 handle =
+        RemotePtr{edge % 4, 16 + static_cast<u64>(edge) * 64}.raw_address;
+      std::memcpy(record.data() + validation::kGraphRecordHeaderBytes +
+                    static_cast<size_t>(edge) * sizeof(handle),
+                  &handle, sizeof(handle));
     }
     const u16 full_checksum =
       validation::checksum16(record.data(), record.size());
     record[2] = static_cast<byte_t>(full_checksum);
     record[3] = static_cast<byte_t>(full_checksum >> 8);
-    const u8 extent_class = static_cast<u8>(
-      (live_edges + validation::kGraphExtentEdgesPerClass - 1) /
-      validation::kGraphExtentEdgesPerClass);
+    const u8 extent_class =
+      static_cast<u8>((live_edges + validation::kGraphExtentEdgesPerClass - 1) /
+                      validation::kGraphExtentEdgesPerClass);
     const u32 transferred = validation::graph_extent_bytes_for_class(
       extent_class, record_bytes, graph_capacity);
     assert(transferred < record_bytes);
@@ -579,14 +557,14 @@ void test_graph_live_extent_reconstructs_canonical_record() {
     }
     assert(validation::classify_zero_extended_snapshot(
              poisoned_scratch.data(), transferred, poisoned_scratch.size(),
-             graph_degree, graph_capacity, 0) ==
-           validation::SnapshotState::valid);
+             graph_degree, graph_capacity,
+             0) == validation::SnapshotState::valid);
   }
 
   // A build-time hint that is now one class too small must be detected from
   // the returned header before checksum acceptance or neighbor decoding.
-  const u32 stale_extent_bytes = validation::graph_extent_bytes_for_class(
-    6, record_bytes, graph_capacity);
+  const u32 stale_extent_bytes =
+    validation::graph_extent_bytes_for_class(6, record_bytes, graph_capacity);
   assert(stale_extent_bytes < required_bytes);
   assert(validation::required_live_extent_bytes(
     reconstructed.data(), stale_extent_bytes, graph_degree, graph_capacity,
@@ -604,46 +582,44 @@ void test_graph_live_extent_reconstructs_canonical_record() {
   nonzero_unread_suffix[2] = static_cast<byte_t>(nonzero_checksum);
   nonzero_unread_suffix[3] = static_cast<byte_t>(nonzero_checksum >> 8);
   reconstructed.fill(0xa5);
-  std::memcpy(
-    reconstructed.data(), nonzero_unread_suffix.data(), extent_bytes);
+  std::memcpy(reconstructed.data(), nonzero_unread_suffix.data(), extent_bytes);
   const auto short_nonzero = validation::classify_zero_extended_snapshot(
-    reconstructed.data(), extent_bytes, reconstructed.size(),
-    graph_degree, graph_capacity, 0);
+    reconstructed.data(), extent_bytes, reconstructed.size(), graph_degree,
+    graph_capacity, 0);
   assert(short_nonzero == validation::SnapshotState::invalid);
   assert(validation::decide_read_action(true, short_nonzero, true) ==
          validation::ReadAction::retry);
-  assert(validation::classify_snapshot(
-           nonzero_unread_suffix.data(), nonzero_unread_suffix.size(),
-           graph_degree, graph_capacity, 0) ==
-         validation::SnapshotState::valid);
+  assert(validation::classify_snapshot(nonzero_unread_suffix.data(),
+                                       nonzero_unread_suffix.size(),
+                                       graph_degree, graph_capacity,
+                                       0) == validation::SnapshotState::valid);
 
   reconstructed.fill(0xa5);
-  std::memcpy(
-    reconstructed.data(), authoritative.data(), extent_bytes);
+  std::memcpy(reconstructed.data(), authoritative.data(), extent_bytes);
   reconstructed[32] ^= 1;
   assert(validation::classify_zero_extended_snapshot(
            reconstructed.data(), extent_bytes, reconstructed.size(),
-           graph_degree, graph_capacity, 0) ==
-         validation::SnapshotState::invalid);
+           graph_degree, graph_capacity,
+           0) == validation::SnapshotState::invalid);
 }
 
 void test_centroid_route_publication(
-    gpu_search::format::CentroidScalarType scalar_type, u32 dim) {
+  gpu_search::format::CentroidScalarType scalar_type, u32 dim) {
   namespace format = gpu_search::format;
   constexpr u32 shard = 1;
   constexpr u32 shard_count = 3;
   constexpr u32 entry_capacity = format::kStorageCentroidRouteMaxLiveEntries;
   const u64 publication_bytes =
-    format::storage_centroid_route_publication_bytes(
-      dim, scalar_type, entry_capacity);
+    format::storage_centroid_route_publication_bytes(dim, scalar_type,
+                                                     entry_capacity);
   assert(publication_bytes != 0);
   assert(publication_bytes % 64 == 0);
 
-  void* allocation = std::aligned_alloc(
-    64, static_cast<size_t>(publication_bytes));
+  void* allocation =
+    std::aligned_alloc(64, static_cast<size_t>(publication_bytes));
   assert(allocation != nullptr);
-  span<byte_t> publication{
-    static_cast<byte_t*>(allocation), static_cast<size_t>(publication_bytes)};
+  span<byte_t> publication{static_cast<byte_t*>(allocation),
+                           static_cast<size_t>(publication_bytes)};
 
   format::StorageCentroidRouteDescriptor descriptor{
     .remote_offset = 64 * 1024,
@@ -676,29 +652,31 @@ void test_centroid_route_publication(
   }
   const std::array<format::StorageCentroidRouteEntry, entry_capacity>
     entry_storage{{
-    {.remote_node = RemotePtr{shard, 64}.raw_address,
-     .generation = 7,
-     .flags = format::kStorageCentroidRouteLive},
-    {.remote_node = RemotePtr{shard, 128}.raw_address,
-     .generation = 8,
-     .flags = format::kStorageCentroidRouteLive},
-    // Poison immediately follows the logical span. A capacity-sized memcpy
-    // would copy these records and is caught even without an ASan build.
-    {.remote_node = ~u64{0}, .generation = ~u32{0}, .flags = ~u32{0}},
-    {.remote_node = ~u64{0}, .generation = ~u32{0}, .flags = ~u32{0}},
-  }};
+      {.remote_node = RemotePtr{shard, 64}.raw_address,
+       .generation = 7,
+       .flags = format::kStorageCentroidRouteLive},
+      {.remote_node = RemotePtr{shard, 128}.raw_address,
+       .generation = 8,
+       .flags = format::kStorageCentroidRouteLive},
+      // Poison immediately follows the logical span. A capacity-sized
+      // memcpy would copy these records and is caught even without an ASan
+      // build.
+      {.remote_node = ~u64{0}, .generation = ~u32{0}, .flags = ~u32{0}},
+      {.remote_node = ~u64{0}, .generation = ~u32{0}, .flags = ~u32{0}},
+    }};
   const span<const format::StorageCentroidRouteEntry> entries{
     entry_storage.data(), 2};
   assert(format::prepare_storage_centroid_route_publication(
-    publication, shard, dim, scalar_type, entry_capacity,
-    17, 1234, centroid_data, entries, &error));
+    publication, shard, dim, scalar_type, entry_capacity, 17, 1234,
+    centroid_data, entries, &error));
   if (!format::validate_storage_centroid_route_publication(
         publication, descriptor, shard, &error)) {
     throw std::runtime_error(error);
   }
 
-  auto* header = reinterpret_cast<
-    format::StorageCentroidRoutePublicationHeader*>(publication.data());
+  auto* header =
+    reinterpret_cast<format::StorageCentroidRoutePublicationHeader*>(
+      publication.data());
   assert(header->sequence == 2);
   assert(header->total_bytes == publication_bytes);
   assert(header->shard_version == 17);
@@ -709,8 +687,8 @@ void test_centroid_route_publication(
   assert(decoded_entries.size() == entries.size());
   assert(std::memcmp(decoded_entries.data(), entries.data(),
                      entries.size() * sizeof(entries[0])) == 0);
-  const auto* capacity_entries = reinterpret_cast<const
-    format::StorageCentroidRouteEntry*>(
+  const auto* capacity_entries =
+    reinterpret_cast<const format::StorageCentroidRouteEntry*>(
       publication.data() + header->entries_offset);
   for (size_t index = entries.size(); index < entry_capacity; ++index) {
     assert(capacity_entries[index].remote_node == 0);
@@ -719,8 +697,8 @@ void test_centroid_route_publication(
   }
   const void* decoded_centroid = format::storage_centroid_route_centroid_data(
     span<const byte_t>{publication.data(), publication.size()});
-  const size_t centroid_bytes = static_cast<size_t>(dim) *
-    format::centroid_scalar_bytes(scalar_type);
+  const size_t centroid_bytes =
+    static_cast<size_t>(dim) * format::centroid_scalar_bytes(scalar_type);
   assert(decoded_centroid != nullptr);
   assert(std::memcmp(decoded_centroid, centroid_data, centroid_bytes) == 0);
 
@@ -757,14 +735,33 @@ void test_exact_record_trailer_alignment() {
   static_assert(gpu_search::exact_record_trailer_offset(sift_record_bytes) ==
                 sift_record_bytes);
   static_assert(gpu_search::exact_record_trailer_offset(spacev_record_bytes) %
-                    alignof(u64) ==
+                  alignof(u64) ==
                 0u);
   static_assert(gpu_search::exact_record_trailer_offset(spacev_record_bytes) +
-                    sizeof(u64) ==
+                  sizeof(u64) ==
                 136u);
+
+  static_assert(gpu_search::exact_snapshot_local_layout_matches(
+    4096u, 4096u + 128u, spacev_record_bytes));
+  static_assert(gpu_search::exact_snapshot_local_layout_matches(
+    4096u, 4096u + 408u, deep_record_bytes));
+  static_assert(gpu_search::exact_snapshot_local_layout_matches(
+    4096u, 4096u + 152u, sift_record_bytes));
+  static_assert(
+    gpu_search::exact_snapshot_local_layout_matches(4096u, 4096u + 128u, 125u));
+  static_assert(!gpu_search::exact_snapshot_local_layout_matches(
+    4096u, 4096u + spacev_record_bytes, spacev_record_bytes));
+
+  static_assert(gpu_search::dynamic_code_scratch_stride(23u) == 24u);
+  static_assert(gpu_search::dynamic_code_scratch_stride(28u) == 28u);
+  static_assert(gpu_search::dynamic_code_scratch_stride(38u) == 40u);
+  static_assert(gpu_search::dynamic_code_scratch_stride(40u) == 40u);
+  static_assert((4096u + gpu_search::dynamic_code_scratch_stride(23u)) %
+                  alignof(u32) ==
+                0u);
 }
 
-} // namespace
+}  // namespace
 
 int main() {
   namespace format = gpu_search::format;
@@ -790,18 +787,32 @@ int main() {
   view.layout.graph_shard_bits = 1;
   view.layout.num_nodes = 4;
   view.shards = {
-    {.ordinal_base = 0, .node_count = 2, .node_base_offset = 16,
-     .node_stride = 64, .graph_base_offset = 4096,
-     .dynamic_base_offset = 16384, .control_remote_offset = 8192,
+    {.ordinal_base = 0,
+     .node_count = 2,
+     .node_base_offset = 16,
+     .node_stride = 64,
+     .graph_base_offset = 4096,
+     .dynamic_base_offset = 16384,
+     .control_remote_offset = 8192,
      .code_remote_offset = 12288,
-     .code_bytes = 32, .memory_node = 0, .dynamic_record_bytes = 128,
-     .dynamic_hot_offset = 64, .dynamic_code_offset = 104},
-    {.ordinal_base = 2, .node_count = 2, .node_base_offset = 16,
-     .node_stride = 64, .graph_base_offset = 4096,
-     .dynamic_base_offset = 16384, .control_remote_offset = 8192,
+     .code_bytes = 32,
+     .memory_node = 0,
+     .dynamic_record_bytes = 128,
+     .dynamic_hot_offset = 64,
+     .dynamic_code_offset = 104},
+    {.ordinal_base = 2,
+     .node_count = 2,
+     .node_base_offset = 16,
+     .node_stride = 64,
+     .graph_base_offset = 4096,
+     .dynamic_base_offset = 16384,
+     .control_remote_offset = 8192,
      .code_remote_offset = 12288,
-     .code_bytes = 32, .memory_node = 1, .dynamic_record_bytes = 128,
-     .dynamic_hot_offset = 64, .dynamic_code_offset = 104},
+     .code_bytes = 32,
+     .memory_node = 1,
+     .dynamic_record_bytes = 128,
+     .dynamic_hot_offset = 64,
+     .dynamic_code_offset = 104},
   };
   std::string error;
   assert(format::validate_view(view, &error));
@@ -814,10 +825,8 @@ int main() {
   assert(sizeof(format::StorageControlBlock) <= format::kStorageControlBytes);
   assert(control.reserved0 == 0);
   assert(control.reserved1 == 0);
-  test_centroid_route_publication(
-    format::CentroidScalarType::float32, 257);
-  test_centroid_route_publication(
-    format::CentroidScalarType::float64, 1024);
+  test_centroid_route_publication(format::CentroidScalarType::float32, 257);
+  test_centroid_route_publication(format::CentroidScalarType::float64, 1024);
   assert(format::storage_centroid_route_publication_bytes(
            1024, format::CentroidScalarType::float64,
            format::kStorageCentroidRouteMaxLiveEntries) >
@@ -843,6 +852,10 @@ int main() {
   malformed.shards[0].dynamic_code_offset += 8;
   malformed.shards[0].dynamic_record_bytes += 16;
   assert(!format::validate_view(malformed, &error));
+  malformed = view;
+  malformed.shards[0].dynamic_base_offset =
+    RemotePtr::BYTE_OFFSET_CAPACITY - 64;
+  assert(!format::validate_view(malformed, &error));
 
   const auto code_path =
     std::filesystem::temp_directory_path() / "dvstor-pq16-codes.bin";
@@ -856,13 +869,15 @@ int main() {
   code_header.remote_offset = 12288;
   code_header.payload_bytes = payload.size();
   code_header.model_checksum = view.layout.model_checksum;
-  code_header.payload_checksum = format::checksum64(payload.data(), payload.size());
+  code_header.payload_checksum =
+    format::checksum64(payload.data(), payload.size());
   code_header.build_fingerprint = 0x123456789abcdef0ULL;
   code_header.shard_fingerprint = 0x0fedcba987654321ULL;
   {
     std::ofstream output(code_path, std::ios::binary | std::ios::trunc);
     format::CodeHeader placeholder;
-    output.write(reinterpret_cast<const char*>(&placeholder), sizeof(placeholder));
+    output.write(reinterpret_cast<const char*>(&placeholder),
+                 sizeof(placeholder));
     output.write(reinterpret_cast<const char*>(payload.data()), payload.size());
     assert(format::write_code_header(output, code_header, &error));
   }
@@ -889,7 +904,8 @@ int main() {
   // Header identity is checksum-covered. A sidecar renamed from another build
   // cannot have its build fingerprint edited to look local.
   {
-    std::fstream codes(code_path, std::ios::binary | std::ios::in | std::ios::out);
+    std::fstream codes(code_path,
+                       std::ios::binary | std::ios::in | std::ios::out);
     codes.seekg(static_cast<std::streamoff>(
       offsetof(format::CodeHeader, build_fingerprint)));
     char byte = 0;
@@ -903,7 +919,8 @@ int main() {
   format::CodeHeader tampered_code;
   assert(!format::read_code_header(code_path, tampered_code, &error));
   {
-    std::fstream codes(code_path, std::ios::binary | std::ios::in | std::ios::out);
+    std::fstream codes(code_path,
+                       std::ios::binary | std::ios::in | std::ios::out);
     codes.seekg(static_cast<std::streamoff>(
       offsetof(format::CodeHeader, build_fingerprint)));
     char byte = 0;
@@ -917,7 +934,8 @@ int main() {
   assert(format::read_code_header(code_path, tampered_code, &error));
 
   {
-    std::fstream codes(code_path, std::ios::binary | std::ios::in | std::ios::out);
+    std::fstream codes(code_path,
+                       std::ios::binary | std::ios::in | std::ios::out);
     codes.seekg(static_cast<std::streamoff>(sizeof(format::CodeHeader)));
     char byte = 0;
     codes.read(&byte, 1);
@@ -938,8 +956,10 @@ int main() {
   const auto metadata_path =
     std::filesystem::path{metadata_prefix.string() + ".meta.json"};
   const std::vector<u64> counts{100, 100, 100, 100, 100};
-  const std::vector<u64> dynamic_offsets{196608, 196608, 196608, 196608, 196608};
-  const std::vector<u64> control_offsets{196608, 196608, 196608, 196608, 196608};
+  const std::vector<u64> dynamic_offsets{196608, 196608, 196608, 196608,
+                                         196608};
+  const std::vector<u64> control_offsets{196608, 196608, 196608, 196608,
+                                         196608};
   const std::vector<u64> code_offsets{
     196608 + format::kStorageControlBytes,
     196608 + format::kStorageControlBytes,
@@ -959,8 +979,7 @@ int main() {
     {"remote_ptr_format", "tagged_inc24_shard6_off34x16_v1"},
     {"centroid_state_format", "physical_shard_centroid_v2_bound"},
     {"index_build_fingerprint", 0x123456789abcdef0ull},
-    {"shard_build_fingerprints",
-     std::vector<u64>{11, 12, 13, 14, 15}},
+    {"shard_build_fingerprints", std::vector<u64>{11, 12, 13, 14, 15}},
     {"slot_incarnation_offset", 16},
     {"navigation_quantizer", "opq_pq"},
     {"navigation_format", "opq_pq_graph_v1"},
@@ -998,8 +1017,8 @@ int main() {
     output << metadata;
   }
   format::View synthesized;
-  if (!format::synthesize_distributed_view(
-        metadata_prefix, synthesized, &error)) {
+  if (!format::synthesize_distributed_view(metadata_prefix, synthesized,
+                                           &error)) {
     throw std::runtime_error(error);
   }
   assert(synthesized.layout.num_nodes == 500);
@@ -1012,8 +1031,8 @@ int main() {
     std::ofstream output(metadata_path, std::ios::trunc);
     output << metadata;
   }
-  assert(!format::synthesize_distributed_view(
-    metadata_prefix, synthesized, &error));
+  assert(
+    !format::synthesize_distributed_view(metadata_prefix, synthesized, &error));
 
   std::filesystem::remove(code_path);
   std::filesystem::remove(metadata_path);

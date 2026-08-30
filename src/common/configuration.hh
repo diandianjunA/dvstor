@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -84,6 +85,10 @@ public:
   // a latency target: transport errors still fail immediately.
   u32 gpu_direct_timeout_ms{250};
   u32 gpu_persistent_blocks_per_sm{4};
+  // Per-thread device stack floor for the out-of-line ASFE/CUB call chain.
+  // Keep this explicit so a toolkit-specific requirement is diagnosable and
+  // adjustable without changing kernel code.
+  u32 gpu_device_stack_bytes{4096};
   // Compute-side mutation support is optional for query-only deployments.
   // Keep it enabled by default so existing service configurations preserve
   // their insert/upsert/erase behavior.
@@ -433,6 +438,9 @@ private:
       ("gpu-persistent-blocks-per-sm",
        po::value<u32>(&gpu_persistent_blocks_per_sm)->default_value(gpu_persistent_blocks_per_sm),
        "Maximum unified persistent CTAs per GPU SM; hardware occupancy may be lower.")
+      ("gpu-device-stack-bytes",
+       po::value<u32>(&gpu_device_stack_bytes)->default_value(gpu_device_stack_bytes),
+       "Minimum per-thread CUDA stack for the ASFE persistent kernel.")
       ("enable-updates",
        po::value<bool>(&enable_updates)->default_value(enable_updates),
        "Enable compute-side insert, upsert, and erase submission.")
@@ -525,6 +533,13 @@ private:
     }
 
     if (index_prefix.empty()) fail("--index-prefix is required");
+    if (num_server_nodes() == 0 || num_server_nodes() > kMaxStorageShards) {
+      fail("--servers must list between 1 and " +
+           std::to_string(kMaxStorageShards) + " storage nodes");
+    }
+    if (mn_memory_gb > kMaxStorageRegionGiB) {
+      fail("--mn-memory exceeds the tagged RemotePtr 256 GiB shard limit");
+    }
     if (num_threads == 0 || dim == 0 || max_vectors == 0 || k == 0 ||
         R == 0 || beam_width_construction == 0 || mn_memory_gb == 0) {
       fail("threads, dim, max-vectors, k, R, beam-width-construction, and mn-memory must be > 0");
@@ -534,6 +549,12 @@ private:
     }
     if (R > kMaxSupportedGraphDegree) {
       fail("--R must be <= " + std::to_string(kMaxSupportedGraphDegree));
+    }
+    if (!std::isfinite(alpha) || alpha < 1.0) {
+      fail("--alpha must be finite and >= 1.0");
+    }
+    if (gpu_device > static_cast<u32>(std::numeric_limits<int>::max())) {
+      fail("--gpu-device exceeds the CUDA runtime device-ordinal range");
     }
     if (k > gpu_final_rerank_width) {
       fail("--k must not exceed --gpu-final-rerank-width");
@@ -574,6 +595,11 @@ private:
       fail("--gpu-rdma-search-progression-mode must be coupled, decoupled, "
            "or manual");
     }
+    if (gpu_rdma_search_progression_mode != "coupled" &&
+        gpu_traversal_beam_width > kMaxPersistentTraversalBeam) {
+      fail("persistent GPU traversal beam exceeds the supported maximum " +
+           std::to_string(kMaxPersistentTraversalBeam));
+    }
     if (gpu_query_beam_merge_policy != "legacy" &&
         gpu_query_beam_merge_policy != "stable-run") {
       fail("--gpu-query-beam-merge-policy must be legacy or stable-run");
@@ -586,7 +612,10 @@ private:
     if (gpu_query_slots == 0 || gpu_query_slots > 4096 ||
         gpu_memory_limit_gb == 0 ||
         gpu_memory_reserve_gb >= gpu_memory_limit_gb ||
-        gpu_bootstrap_window_mb == 0 || gpu_bootstrap_windows == 0 ||
+        gpu_bootstrap_window_mb == 0 ||
+        gpu_bootstrap_window_mb >
+          (std::numeric_limits<u32>::max() >> 20u) ||
+        gpu_bootstrap_windows == 0 ||
         gpu_bootstrap_windows > 16 ||
         gpu_graph_prefetch_depth == 0 ||
         gpu_graph_prefetch_depth > 32 ||
@@ -601,7 +630,10 @@ private:
         gpu_rdma_qps == 0 || gpu_rdma_qps > 32 ||
         gpu_direct_timeout_ms < 20 || gpu_direct_timeout_ms > 5'000 ||
         gpu_persistent_blocks_per_sm == 0 ||
-        gpu_persistent_blocks_per_sm > 16) {
+        gpu_persistent_blocks_per_sm > 16 ||
+        gpu_device_stack_bytes < 2048 ||
+        gpu_device_stack_bytes > 65'536 ||
+        gpu_device_stack_bytes % 256 != 0) {
       fail("invalid persistent GPU query configuration");
     }
 
@@ -680,6 +712,8 @@ public:
              << config.gpu_final_rerank_width << '\n';
       output << std::setw(width) << "GPU max expansions: "
              << config.gpu_max_expansions << '\n';
+      output << std::setw(width) << "GPU device stack bytes/thread: "
+             << config.gpu_device_stack_bytes << '\n';
       output << std::setw(width) << "GPU graph commit/issue width: "
              << config.gpu_graph_commit_width << "/"
              << config.gpu_graph_issue_width << '\n';

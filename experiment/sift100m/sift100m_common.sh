@@ -19,7 +19,7 @@ LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 PID_DIR="${PID_DIR:-$SCRIPT_DIR/pids}"
 
 SHARDS="${SHARDS:-5}"
-PARTITION_STRATEGY="${PARTITION_STRATEGY:-metis}"
+PARTITION_STRATEGY="${PARTITION_STRATEGY:-balanced}"
 PARTITION_IMBALANCE="${PARTITION_IMBALANCE:-1.03}"
 R="${R:-96}"
 BUILD_BEAM="${BUILD_BEAM:-128}"
@@ -27,7 +27,22 @@ ALPHA="${ALPHA:-1.2}"
 K="${K:-10}"
 DIM="${DIM:-128}"
 VECTOR_DATA_TYPE="${VECTOR_DATA_TYPE:-uint8}"
-BUILD_THREADS="${BUILD_THREADS:-112}"
+BUILD_THREAD_LIMIT=32
+BUILD_JOBS="${BUILD_JOBS:-16}"
+BUILD_THREADS="${BUILD_THREADS:-16}"
+
+validate_build_thread_limits() {
+  local name value
+  for name in BUILD_JOBS BUILD_THREADS; do
+    value="${!name}"
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]] ||
+        ((value > BUILD_THREAD_LIMIT)); then
+      echo "$name must be an integer in [1,$BUILD_THREAD_LIMIT]: $value" >&2
+      return 1
+    fi
+  done
+}
+validate_build_thread_limits
 SERVICE_THREADS="${SERVICE_THREADS:-64}"
 GPU_DEVICE="${GPU_DEVICE:-1}"
 PQ_SUBQUANTIZERS="${PQ_SUBQUANTIZERS:-32}"
@@ -185,8 +200,8 @@ def fallback_layout(shards, max_vectors, dim, degree, dtype, code_bytes,
     component_sizes = {'uint8': 1, 'int8': 1, 'float32': 4, 'auto': 4}
     if dtype not in component_sizes:
         fail(f'unsupported VECTOR_DATA_TYPE={dtype!r}')
-    if degree > 255:
-        fail(f'R exceeds the one-byte graph-degree format: {degree}')
+    if degree > 128:
+        fail(f'R exceeds the GPU/runtime limit of 128: {degree}')
     if shards > 64:
         fail(f'SHARDS exceeds tagged RemotePtr capacity: {shards}')
     if code_bytes > dim:
@@ -262,7 +277,7 @@ def main():
 
     limiting_shard = max(range(shards), key=required_by_shard.__getitem__)
     print(
-        f'[mn-memory] auto={estimated_gib} GiB source={source} '
+        f'[mn-memory] required={estimated_gib} GiB source={source} '
         f'policy={policy} limiting_shard={limiting_shard + 1} '
         f'dynamic_slots={headroom_slots[limiting_shard]} '
         f'record_bytes={record_bytes}',
@@ -279,12 +294,18 @@ PY_MN_MEMORY
 }
 
 resolve_mn_memory_gb() {
+  local required_mn_memory_gb
+  required_mn_memory_gb="$(estimate_mn_memory_gb)" || return 1
   if [[ -z "${MN_MEMORY_GB:-}" ]]; then
-    MN_MEMORY_GB="$(estimate_mn_memory_gb)"
+    MN_MEMORY_GB="$required_mn_memory_gb"
   fi
   if [[ ! "$MN_MEMORY_GB" =~ ^[1-9][0-9]*$ ]] ||
       ((MN_MEMORY_GB > 256)); then
     echo "MN_MEMORY_GB must be an integer in [1,256]: $MN_MEMORY_GB" >&2
+    return 1
+  fi
+  if ((MN_MEMORY_GB < required_mn_memory_gb)); then
+    echo "MN_MEMORY_GB=$MN_MEMORY_GB is smaller than the index-required minimum $required_mn_memory_gb GiB" >&2
     return 1
   fi
 }
@@ -346,19 +367,23 @@ validate_index_metadata() {
     return 1
   fi
 
-  python3 - "$metadata" "$INDEX_PREFIX" "$R" "$BUILD_BEAM" "$DIM" \
+  python3 - "$metadata" "$INDEX_PREFIX" "$(base_bin)" "$R" "$BUILD_BEAM" "$DIM" \
     "$MAX_VECTORS" "$SHARDS" "$VECTOR_DATA_TYPE" "$PQ_SUBQUANTIZERS" \
-    "$PARTITION_STRATEGY" "${PARTITION_MAX_DEGREE:-32}" <<'PY_VALIDATE'
+    "$PARTITION_STRATEGY" "${PARTITION_MAX_DEGREE:-32}" "$ALPHA" \
+    "$PARTITION_IMBALANCE" <<'PY_VALIDATE' || return 1
 import json
+import math
 import sys
 
-path, prefix, degree, build_beam, dim, vectors, shards, dtype, subquantizers, \
-    partition_strategy, partition_max_degree = sys.argv[1:]
+path, prefix, data_file, degree, build_beam, dim, vectors, shards, dtype, \
+    subquantizers, partition_strategy, partition_max_degree, alpha, \
+    partition_imbalance = sys.argv[1:]
 with open(path, 'r', encoding='utf-8') as stream:
     metadata = json.load(stream)
 
 expected = {
     'output_prefix': prefix,
+    'data_file': data_file,
     'schema_version': 16,
     'distance': 'l2',
     'node_layout': 'plain',
@@ -384,6 +409,16 @@ errors = [
     f'{key}: metadata={metadata.get(key)!r}, expected={value!r}'
     for key, value in expected.items() if metadata.get(key) != value
 ]
+for key, expected_value in (
+        ('alpha', float(alpha)),
+        ('partition_imbalance', float(partition_imbalance))):
+    actual = metadata.get(key)
+    if (not isinstance(actual, (int, float)) or isinstance(actual, bool) or
+            not math.isfinite(actual) or
+            not math.isclose(float(actual), expected_value,
+                             rel_tol=1e-12, abs_tol=1e-12)):
+        errors.append(
+            f'{key}: metadata={actual!r}, expected={expected_value!r}')
 if metadata.get('navigation_quantizer') != 'opq_pq':
     errors.append('navigation_quantizer must be opq_pq')
 if metadata.get('navigation_format') != 'opq_pq_graph_v1':
@@ -456,7 +491,7 @@ PY_VALIDATE
       return 1
     fi
     if [[ "$require_graph_extent" == true ]]; then
-      python3 - "$(graph_extent_file)" "$metadata" <<'PY_EXTENT_VALIDATE'
+      python3 - "$(graph_extent_file)" "$metadata" <<'PY_EXTENT_VALIDATE' || return 1
 import json
 import os
 import struct
@@ -604,7 +639,7 @@ ensure_built() {
     echo "build directory is not configured: $BUILD_DIR" >&2
     return 1
   fi
-  cmake --build "$BUILD_DIR" -j --target "$@"
+  cmake --build "$BUILD_DIR" -j "$BUILD_JOBS" --target "$@"
 }
 
 write_service_config() {

@@ -22,9 +22,19 @@ public:
     device_to_host,
   };
 
-  MappedRing(u32 requested_capacity, Direction direction)
-      : capacity_(normalize_capacity(requested_capacity)) {
+  MappedRing() = default;
+
+  MappedRing(u32 requested_capacity, Direction direction) {
+    initialize(requested_capacity, direction);
+  }
+
+  void initialize(u32 requested_capacity, Direction direction) {
+    if (initialized_) {
+      throw std::logic_error("mapped CUDA ring is already initialized");
+    }
+    capacity_ = normalize_capacity(requested_capacity);
     try {
+      check_cuda(cudaGetDevice(&cuda_device_), "cudaGetDevice(ring allocation)");
       allocate_mapped(&enqueue_host_, 1, "cudaHostAlloc(ring enqueue)");
       allocate_mapped(&dequeue_host_, 1, "cudaHostAlloc(ring dequeue)");
       allocate_mapped(&sequences_host_, capacity_, "cudaHostAlloc(ring sequences)");
@@ -60,6 +70,7 @@ public:
         .capacity = capacity_,
         .mask = capacity_ - 1,
       };
+      initialized_ = true;
     } catch (...) {
       release();
       throw;
@@ -72,6 +83,7 @@ public:
   MappedRing& operator=(const MappedRing&) = delete;
 
   bool try_push(const T& value) {
+    require_initialized();
     std::atomic_ref<u64> enqueue(*enqueue_host_);
     const u64 position = enqueue.load(std::memory_order_relaxed);
     const u32 slot = static_cast<u32>(position) & (capacity_ - 1);
@@ -84,6 +96,7 @@ public:
   }
 
   bool try_pop(T& value) {
+    require_initialized();
     std::atomic_ref<u64> dequeue(*dequeue_host_);
     const u64 position = dequeue.load(std::memory_order_relaxed);
     const u32 slot = static_cast<u32>(position) & (capacity_ - 1);
@@ -95,20 +108,39 @@ public:
     return true;
   }
 
-  DeviceRingView<T> device_view() const { return device_view_; }
+  DeviceRingView<T> device_view() const {
+    require_initialized();
+    return device_view_;
+  }
 
 private:
+  void require_initialized() const {
+    if (!initialized_) {
+      throw std::logic_error("mapped CUDA ring is not initialized");
+    }
+  }
+
   void release() noexcept {
+    int previous_device = -1;
+    const bool restore_device = cuda_device_ >= 0 &&
+      cudaGetDevice(&previous_device) == cudaSuccess &&
+      previous_device != cuda_device_ &&
+      cudaSetDevice(cuda_device_) == cudaSuccess;
     if (device_owned_position_ != nullptr) cudaFree(device_owned_position_);
     if (entries_host_ != nullptr) cudaFreeHost(entries_host_);
     if (sequences_host_ != nullptr) cudaFreeHost(sequences_host_);
     if (dequeue_host_ != nullptr) cudaFreeHost(dequeue_host_);
     if (enqueue_host_ != nullptr) cudaFreeHost(enqueue_host_);
+    if (restore_device) (void)cudaSetDevice(previous_device);
     device_owned_position_ = nullptr;
     entries_host_ = nullptr;
     sequences_host_ = nullptr;
     dequeue_host_ = nullptr;
     enqueue_host_ = nullptr;
+    device_view_ = {};
+    capacity_ = 0;
+    initialized_ = false;
+    cuda_device_ = -1;
   }
 
   static u32 normalize_capacity(u32 requested) {
@@ -140,6 +172,8 @@ private:
   }
 
   u32 capacity_{};
+  bool initialized_{};
+  int cuda_device_{-1};
   u64* enqueue_host_{};
   u64* dequeue_host_{};
   u64* sequences_host_{};

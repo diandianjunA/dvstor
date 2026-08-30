@@ -148,7 +148,14 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
     peer_control_qp(peer_id)->post_receive(peer_token_region);
     peer_control_qp(peer_id)->post_send_inlined(&local_token, sizeof(local_token), IBV_WR_SEND);
     peer_context_->poll_send_cq_until_completion();
-    peer_context_->receive();
+    const ReceiveInfo received = peer_context_->receive();
+    lib_assert(received.bytes_written == MemoryRegionToken::kWireBytes,
+               "peer storage node returned an incompatible RDMA token wire size");
+    lib_assert(peer_remote_tokens_[peer_id]->address_range_valid() &&
+                 peer_remote_tokens_[peer_id]->bytes >= mn_memory_bytes_,
+               "peer storage node returned an invalid or undersized RDMA "
+               "memory-region token; restart all storage nodes from the "
+               "same revision");
   }
 
   const size_t scratch_bytes = std::max<size_t>(64ull * 1024ull * 1024ull, align_up(VamanaNode::total_size() * 4));
@@ -1556,7 +1563,10 @@ void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, s
              "peer token is not initialized for shard " + std::to_string(shard_id));
   lib_assert(peer_remote_tokens_[shard_id]->address != 0 && peer_remote_tokens_[shard_id]->rkey != 0,
              "peer token is invalid for shard " + std::to_string(shard_id));
-  lib_assert(remote_offset + bytes <= mn_memory_bytes_,
+  lib_assert(bytes <= std::numeric_limits<u32>::max(),
+             "peer RDMA read exceeds the verbs 32-bit SGE length");
+  lib_assert(remote_offset <= mn_memory_bytes_ &&
+               bytes <= mn_memory_bytes_ - remote_offset,
              "peer RDMA read exceeds shard bounds: shard=" + std::to_string(shard_id) +
                " offset=" + std::to_string(remote_offset) +
                " bytes=" + std::to_string(bytes) +
@@ -1611,7 +1621,10 @@ void MemoryNode::remote_write_bytes(u32 shard_id, u64 remote_offset, const void*
              "peer token is not initialized for shard " + std::to_string(shard_id));
   lib_assert(peer_remote_tokens_[shard_id]->address != 0 && peer_remote_tokens_[shard_id]->rkey != 0,
              "peer token is invalid for shard " + std::to_string(shard_id));
-  lib_assert(remote_offset + bytes <= mn_memory_bytes_,
+  lib_assert(bytes <= std::numeric_limits<u32>::max(),
+             "peer RDMA write exceeds the verbs 32-bit SGE length");
+  lib_assert(remote_offset <= mn_memory_bytes_ &&
+               bytes <= mn_memory_bytes_ - remote_offset,
              "peer RDMA write exceeds shard bounds: shard=" + std::to_string(shard_id) +
                " offset=" + std::to_string(remote_offset) +
                " bytes=" + std::to_string(bytes) +
@@ -1664,7 +1677,8 @@ u64 MemoryNode::remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 exp
              "peer token is not initialized for shard " + std::to_string(shard_id));
   lib_assert(peer_remote_tokens_[shard_id]->address != 0 && peer_remote_tokens_[shard_id]->rkey != 0,
              "peer token is invalid for shard " + std::to_string(shard_id));
-  lib_assert(remote_offset + sizeof(u64) <= mn_memory_bytes_,
+  lib_assert(remote_offset <= mn_memory_bytes_ &&
+               sizeof(u64) <= mn_memory_bytes_ - remote_offset,
              "peer CAS exceeds shard bounds: shard=" + std::to_string(shard_id) +
                " offset=" + std::to_string(remote_offset) +
                " capacity=" + std::to_string(mn_memory_bytes_));
@@ -1723,7 +1737,8 @@ u64 MemoryNode::remote_fetch_add(u32 shard_id,
                peer_remote_tokens_[shard_id]->address != 0 &&
                peer_remote_tokens_[shard_id]->rkey != 0,
              "peer token is invalid for remote FAA");
-  lib_assert(remote_offset + sizeof(u64) <= mn_memory_bytes_,
+  lib_assert(remote_offset <= mn_memory_bytes_ &&
+               sizeof(u64) <= mn_memory_bytes_ - remote_offset,
              "peer FAA exceeds shard bounds");
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
   const auto exact_rdma_started = std::chrono::steady_clock::now();

@@ -2,6 +2,10 @@
 
 #include <cuda_runtime.h>
 
+#include <cerrno>
+#include <limits>
+#include <stdexcept>
+
 #ifndef IBV_WC_DRIVER1
 #define IBV_WC_DRIVER1 135
 #define IBV_WC_DRIVER2 136
@@ -50,7 +54,7 @@ __device__ inline int poll_cq_at_with_timeout(struct doca_gpu_dev_verbs_cq* cq,
       const uint8_t opcode = opown >> DOCA_GPUNETIO_VERBS_MLX5_CQE_OPCODE_SHIFT;
       doca_gpu_dev_verbs_fence_acquire<DOCA_GPUNETIO_VERBS_SYNC_SCOPE_SYS>();
       doca_gpu_dev_verbs_cq_update_dbrec<false>(cq, 1);
-      return opcode == MLX5_CQE_REQ_ERR ? -EIO : 0;
+      return opcode == MLX5_CQE_REQ ? 0 : -EIO;
     }
   }
 
@@ -87,7 +91,7 @@ __device__ inline int poll_payload_cq_at_with_timeout(
       doca_gpu_dev_verbs_fence_acquire<
         DOCA_GPUNETIO_VERBS_SYNC_SCOPE_SYS>();
       doca_gpu_dev_verbs_cq_update_dbrec<false>(cq, 1);
-      return opcode == MLX5_CQE_REQ_ERR ? -EIO : 0;
+      return opcode == MLX5_CQE_REQ ? 0 : -EIO;
     }
     if (probe_global_time_ns() - started >= timeout_ns) {
       return kPollTimeoutStatus;
@@ -98,7 +102,8 @@ __device__ inline int poll_payload_cq_at_with_timeout(
 
 __global__ void gpunetio_read_probe_kernel(GpuNetioReadProbeParams params) {
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
-  if (params.remote_region_count == 0 || params.qp_array == nullptr ||
+  if (params.remote_region_count == 0 || params.remote_regions == nullptr ||
+      params.qp_array == nullptr ||
       params.qp_index >= params.qp_count ||
       params.remote_region >= params.remote_region_count ||
       params.qp_array[params.qp_index] == nullptr) {
@@ -106,6 +111,12 @@ __global__ void gpunetio_read_probe_kernel(GpuNetioReadProbeParams params) {
     return;
   }
   const GpuNetioRemoteMemoryRegion& region = params.remote_regions[params.remote_region];
+  if (region.address == 0 || region.rkey == 0 ||
+      region.bytes < sizeof(uint64_t) ||
+      region.address > UINT64_MAX - (region.bytes - 1u)) {
+    *params.status_code = -ERANGE;
+    return;
+  }
   params.debug_values[0] = region.address;
   params.debug_values[1] = region.rkey;
   params.debug_values[2] = reinterpret_cast<uint64_t>(params.destination) - params.local_iova_base;
@@ -215,6 +226,9 @@ __global__ void gpunetio_payload_probe_kernel(
   const uint32_t warp_in_block = threadIdx.x / kWarpWidth;
   const uint32_t worker = blockIdx.x * warps_per_block + warp_in_block;
   if (worker >= params.active_qps) return;
+  const uint64_t combined_stage_bytes =
+    static_cast<uint64_t>(params.first_stage_bytes) +
+    params.second_stage_bytes;
 
   int status = 0;
   if (lane == 0) {
@@ -223,12 +237,13 @@ __global__ void gpunetio_payload_probe_kernel(
         params.qp_array[worker] == nullptr || params.destination == nullptr ||
         params.dump_ptr == nullptr || params.first_stage_bytes == 0 ||
         params.batch_reads == 0 || params.measured_batches == 0 ||
+        params.warmup_batches > UINT32_MAX - params.measured_batches ||
         params.destination_stride < params.first_stage_bytes ||
         (params.second_stage_bytes != 0 &&
-         params.destination_stride <
-           params.first_stage_bytes + params.second_stage_bytes) ||
-        params.remote_record_stride <
-          params.first_stage_bytes + params.second_stage_bytes ||
+         static_cast<uint64_t>(params.destination_stride) <
+           combined_stage_bytes) ||
+        static_cast<uint64_t>(params.remote_record_stride) <
+          combined_stage_bytes ||
         params.remote_span_bytes < params.remote_record_stride ||
         params.first_stage_bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE ||
         params.second_stage_bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE) {
@@ -244,6 +259,15 @@ __global__ void gpunetio_payload_probe_kernel(
   const uint32_t memory_node = worker % params.remote_region_count;
   const GpuNetioRemoteMemoryRegion region =
     params.remote_regions[memory_node];
+  if (lane == 0 &&
+      (region.address == 0 || region.rkey == 0 || region.bytes == 0 ||
+       region.address > UINT64_MAX - (region.bytes - 1u) ||
+       region.bytes < params.remote_span_bytes)) {
+    status = -ERANGE;
+    params.status_codes[worker] = status;
+  }
+  status = __shfl_sync(0xffffffffu, status, 0);
+  if (status != 0) return;
   auto* qp =
     reinterpret_cast<doca_gpu_dev_verbs_qp*>(params.qp_array[worker]);
   auto* cq = doca_gpu_dev_verbs_qp_get_cq_sq(qp);
@@ -251,7 +275,8 @@ __global__ void gpunetio_payload_probe_kernel(
   const uint32_t stage_count = params.second_stage_bytes == 0 ? 1u : 2u;
   if (lane == 0) {
     params.dump_wqe_flags[worker] = need_dump ? 1u : 0u;
-    if (params.batch_reads + (need_dump ? 1u : 0u) > qp->sq_wqe_num) {
+    if (static_cast<uint64_t>(params.batch_reads) +
+          (need_dump ? 1u : 0u) > qp->sq_wqe_num) {
       status = -E2BIG;
       params.status_codes[worker] = status;
     }
@@ -360,6 +385,22 @@ __global__ void gpunetio_payload_probe_kernel(
 
 void launch_gpunetio_read_probe(
     cudaStream_t stream, const GpuNetioReadProbeParams& params) {
+  const uint64_t destination = reinterpret_cast<uint64_t>(params.destination);
+  const uint64_t dump = reinterpret_cast<uint64_t>(params.dump_ptr);
+  if (params.remote_regions == nullptr || params.remote_region_count == 0 ||
+      params.qp_array == nullptr || params.qp_count == 0 ||
+      params.qp_index >= params.qp_count ||
+      params.remote_region >= params.remote_region_count ||
+      params.destination == nullptr || params.dump_ptr == nullptr ||
+      params.status_code == nullptr || params.debug_values == nullptr ||
+      destination < params.local_iova_base || dump < params.local_iova_base ||
+      reinterpret_cast<uintptr_t>(params.remote_regions) %
+          alignof(GpuNetioRemoteMemoryRegion) != 0 ||
+      reinterpret_cast<uintptr_t>(params.qp_array) % alignof(void*) != 0 ||
+      reinterpret_cast<uintptr_t>(params.status_code) % alignof(int) != 0 ||
+      reinterpret_cast<uintptr_t>(params.debug_values) % alignof(uint64_t) != 0) {
+    throw std::invalid_argument("invalid GPUNetIO read-probe parameters");
+  }
   gpunetio_read_probe_kernel<<<1, 1, 0, stream>>>(params);
 }
 
@@ -367,8 +408,62 @@ void launch_gpunetio_payload_probe(
     cudaStream_t stream, const GpuNetioPayloadProbeParams& params) {
   constexpr uint32_t kThreads = 128;
   constexpr uint32_t kWarpsPerBlock = kThreads / 32;
-  const uint32_t blocks =
-    (params.active_qps + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const uint64_t combined_stage_bytes =
+    static_cast<uint64_t>(params.first_stage_bytes) +
+    params.second_stage_bytes;
+  const uint64_t destination = reinterpret_cast<uint64_t>(params.destination);
+  const uint64_t dump = reinterpret_cast<uint64_t>(params.dump_ptr);
+  const uint64_t destination_bytes_per_worker =
+    static_cast<uint64_t>(params.batch_reads) * params.destination_stride;
+  const uint64_t latency_entries =
+    static_cast<uint64_t>(params.active_qps) * params.measured_batches;
+  const uint32_t stage_count = params.second_stage_bytes == 0 ? 1u : 2u;
+  const uint64_t reads_per_batch =
+    static_cast<uint64_t>(params.batch_reads) * stage_count;
+  if (params.remote_regions == nullptr || params.remote_region_count == 0 ||
+      params.qp_array == nullptr || params.qp_count == 0 ||
+      params.active_qps == 0 || params.active_qps > params.qp_count ||
+      params.destination == nullptr || params.dump_ptr == nullptr ||
+      params.status_codes == nullptr || params.completed_reads == nullptr ||
+      params.dump_wqe_flags == nullptr || params.batch_latency_ns == nullptr ||
+      params.first_stage_bytes == 0 || params.batch_reads == 0 ||
+      params.measured_batches == 0 || params.timeout_ns == 0 ||
+      params.warmup_batches >
+        std::numeric_limits<uint32_t>::max() - params.measured_batches ||
+      params.first_stage_bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE ||
+      params.second_stage_bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE ||
+      combined_stage_bytes > params.destination_stride ||
+      combined_stage_bytes > params.remote_record_stride ||
+      params.remote_span_bytes < params.remote_record_stride ||
+      destination < params.local_iova_base || dump < params.local_iova_base ||
+      destination_bytes_per_worker >
+        std::numeric_limits<size_t>::max() / params.active_qps ||
+      latency_entries >
+        std::numeric_limits<size_t>::max() / sizeof(uint64_t) ||
+      params.measured_batches >
+        std::numeric_limits<uint64_t>::max() / reads_per_batch ||
+      reinterpret_cast<uintptr_t>(params.remote_regions) %
+          alignof(GpuNetioRemoteMemoryRegion) != 0 ||
+      reinterpret_cast<uintptr_t>(params.qp_array) % alignof(void*) != 0 ||
+      reinterpret_cast<uintptr_t>(params.status_codes) % alignof(int) != 0 ||
+      reinterpret_cast<uintptr_t>(params.completed_reads) %
+          alignof(uint64_t) != 0 ||
+      reinterpret_cast<uintptr_t>(params.dump_wqe_flags) %
+          alignof(uint32_t) != 0 ||
+      reinterpret_cast<uintptr_t>(params.batch_latency_ns) %
+          alignof(uint64_t) != 0) {
+    throw std::invalid_argument("invalid GPUNetIO payload-probe parameters");
+  }
+  const uint64_t destination_span =
+    destination_bytes_per_worker * params.active_qps;
+  if (destination > std::numeric_limits<uintptr_t>::max() - destination_span ||
+      dump == std::numeric_limits<uintptr_t>::max()) {
+    throw std::overflow_error("GPUNetIO payload-probe pointer range overflows");
+  }
+  const uint64_t blocks_wide =
+    (static_cast<uint64_t>(params.active_qps) + kWarpsPerBlock - 1u) /
+    kWarpsPerBlock;
+  const uint32_t blocks = static_cast<uint32_t>(blocks_wide);
   gpunetio_payload_probe_kernel<<<blocks, kThreads, 0, stream>>>(params);
 }
 

@@ -53,7 +53,7 @@ inline std::optional<VectorDType> infer_vector_dtype_from_path(const filepath_t&
   if (ext == ".i8bin") {
     return VectorDType::int8;
   }
-  if (ext == ".fbin" || ext == ".bin") {
+  if (ext == ".fbin") {
     return VectorDType::float32;
   }
   return std::nullopt;
@@ -113,8 +113,11 @@ inline f32 saturate_squared_l2(f64 value) {
 
 inline float vector_component_as_float(const byte_t* data, VectorDType dtype, size_t index) {
   switch (dtype) {
-    case VectorDType::float32:
-      return reinterpret_cast<const float*>(data)[index];
+    case VectorDType::float32: {
+      float value = 0.0f;
+      std::memcpy(&value, data + index * sizeof(value), sizeof(value));
+      return value;
+    }
     case VectorDType::uint8:
       return static_cast<float>(reinterpret_cast<const u8*>(data)[index]);
     case VectorDType::int8:

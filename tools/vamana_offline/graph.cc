@@ -175,7 +175,8 @@ vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
   vec<std::pair<float, u32>> beam;
   const size_t expected_seen = std::max<size_t>(1024, static_cast<size_t>(beam_width) * graph.R + graph.R + 1);
   LocalIdSet visited(expected_seen);
-  LocalIdSet expanded(std::max<size_t>(1024, beam_width * 2));
+  LocalIdSet expanded(std::max<size_t>(
+    1024, static_cast<size_t>(beam_width) * 2));
 
   const float medoid_dist = dataset_distance(dataset, query_id, graph.medoid);
   beam.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
@@ -228,7 +229,8 @@ vec<std::pair<float, u32>> beam_search_float_query(VamanaGraph& graph,
   vec<std::pair<float, u32>> beam;
   const size_t expected_seen = std::max<size_t>(1024, static_cast<size_t>(beam_width) * graph.R + graph.R + 1);
   LocalIdSet visited(expected_seen);
-  LocalIdSet expanded(std::max<size_t>(1024, beam_width * 2));
+  LocalIdSet expanded(std::max<size_t>(
+    1024, static_cast<size_t>(beam_width) * 2));
 
   const float medoid_dist = dataset_distance_float_query(dataset, query, graph.medoid);
   beam.push_back({medoid_dist, static_cast<u32>(graph.medoid)});

@@ -24,6 +24,30 @@ struct TemporaryFile {
   }
 };
 
+void test_explicit_dtype_for_ambiguous_bin() {
+  TemporaryFile input{
+    std::filesystem::temp_directory_path() /
+    ("dvstor_explicit_dtype_" + std::to_string(::getpid()) + ".bin")};
+  {
+    std::ofstream output(input.path, std::ios::binary | std::ios::trunc);
+    const uint32_t rows = 2;
+    const uint32_t dim = 3;
+    const int8_t values[6] = {-3, -2, -1, 1, 2, 3};
+    output.write(reinterpret_cast<const char*>(&rows), sizeof(rows));
+    output.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
+    output.write(reinterpret_cast<const char*>(values), sizeof(values));
+  }
+  VamanaBuildConfig config;
+  config.data_path = input.path;
+  config.vector_data_type = "int8";
+  config.max_vectors = 2;
+  const Dataset dataset = read_dataset(config);
+  assert(dataset.dtype == VectorDType::int8);
+  assert(dataset.size() == 2);
+  assert(dataset.dim == 3);
+  assert(dataset.raw_vector(1)[0] == static_cast<byte_t>(1));
+}
+
 void validate_chain_result(const vec<std::pair<float, u32>> &result,
                            uint32_t nodes) {
   assert(result.size() == nodes);
@@ -46,6 +70,8 @@ void validate_chain_result(const vec<std::pair<float, u32>> &result,
 } // namespace
 
 int main() {
+  test_explicit_dtype_for_ambiguous_bin();
+
   constexpr uint32_t kNodes = 4097;
   constexpr uint32_t kDim = 1;
   TemporaryFile input{

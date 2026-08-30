@@ -20,7 +20,14 @@ inline void check_cuda(cudaError_t status, const char* operation) {
 }
 
 inline u64 align_up(u64 value, u64 alignment) {
-  return alignment == 0 ? value : ((value + alignment - 1) / alignment) * alignment;
+  if (alignment == 0) return value;
+  const u64 remainder = value % alignment;
+  if (remainder == 0) return value;
+  const u64 increment = alignment - remainder;
+  if (value > std::numeric_limits<u64>::max() - increment) {
+    throw std::overflow_error("GPU allocation alignment overflows u64");
+  }
+  return value + increment;
 }
 
 template <class T>

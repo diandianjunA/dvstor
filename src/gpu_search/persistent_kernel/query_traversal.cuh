@@ -1943,7 +1943,12 @@ __device__ __forceinline__ void process_query(
   }
   __syncthreads();
   if (query_slot >= params.query_slots || descriptor.dim != params.dim ||
-      descriptor.query_dtype > 2 || params.decoded_queries == nullptr ||
+      descriptor.query_dtype > 2 || descriptor.query_device_address == 0 ||
+      descriptor.result_device_address == 0 ||
+      (descriptor.query_dtype == 0 &&
+       descriptor.query_device_address % alignof(f32) != 0) ||
+      descriptor.result_device_address % alignof(u32) != 0 ||
+      params.decoded_queries == nullptr || params.result_distances == nullptr ||
       params.navigation_candidate_handles == nullptr ||
       params.navigation_candidate_distances == nullptr ||
       descriptor.k == 0 || descriptor.k > descriptor.result_capacity) {

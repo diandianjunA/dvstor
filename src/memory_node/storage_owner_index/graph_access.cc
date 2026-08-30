@@ -1691,10 +1691,10 @@ void MemoryNode::write_dynamic_navigation_code(
   transformed.resize(gpu_navigation_model_.dim);
   byte_t* destination = index_buffer_.get_full_buffer() +
     VamanaNode::dynamic_navigation_code_offset(rptr);
-  *reinterpret_cast<u32*>(destination) =
+  vamana::dynamic_navigation_code::store_u32_le(
+    destination,
     VamanaNode::pack_dynamic_navigation_tag(
-      rptr.incarnation(),
-      VamanaNode::DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN);
+      rptr.incarnation(), VamanaNode::DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN));
   gpu_search::pq::encode(
     gpu_navigation_model_,
     std::span<const f32>{components.data(), components.size()},
@@ -1762,13 +1762,14 @@ void MemoryNode::write_new_node_on_shard(
     rptr.incarnation(), VamanaNode::HEADER_NODE_LOCK);
   const u64 final_header = VamanaNode::make_header(
     rptr.incarnation(), provisional ? VamanaNode::HEADER_PROVISIONAL : 0);
-  *reinterpret_cast<u64*>(record.data()) = publishing_header;
-  *reinterpret_cast<u32*>(record.data() + VamanaNode::offset_id()) = id;
-  *reinterpret_cast<u32*>(
-    record.data() + VamanaNode::offset_generation()) = generation;
-  *reinterpret_cast<u32*>(
-    record.data() + VamanaNode::offset_slot_incarnation()) =
-      rptr.incarnation();
+  const u32 incarnation = rptr.incarnation();
+  std::memcpy(record.data(), &publishing_header, sizeof(publishing_header));
+  std::memcpy(
+    record.data() + VamanaNode::offset_id(), &id, sizeof(id));
+  std::memcpy(record.data() + VamanaNode::offset_generation(),
+              &generation, sizeof(generation));
+  std::memcpy(record.data() + VamanaNode::offset_slot_incarnation(),
+              &incarnation, sizeof(incarnation));
   encode_float_vector_to_storage(
     components.data(), VamanaNode::DIM, VamanaNode::vector_dtype(),
     record.data() + VamanaNode::offset_vector());

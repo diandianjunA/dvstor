@@ -47,6 +47,8 @@ int main(int argc, char** argv) {
 
   // Initialize VamanaNode static storage
   VamanaNode::init_static_storage(dataset.dim, config.R, dataset.dtype);
+  validate_vamana_shard_capacity(dataset.size(), config);
+  preflight_optional_recall_inputs(dataset, config);
 
   std::cerr << "offline distance execution: cpu-avx2\n";
 

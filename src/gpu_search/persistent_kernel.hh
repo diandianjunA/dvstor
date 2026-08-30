@@ -4,17 +4,16 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "common/constants.hh"
+#include "gpu/gpunetio_probe.hh"
 #include "gpu_search/device_ring.cuh"
 #include "gpu_search/types.hh"
 
-struct CUstream_st;
-using cudaStream_t = CUstream_st*;
-
 namespace gpu_search {
 
-inline constexpr u32 kPersistentMaxBeam = 128;
+inline constexpr u32 kPersistentMaxBeam = kMaxPersistentTraversalBeam;
 inline constexpr u32 kPersistentMaxExact = 256;
-inline constexpr u32 kPersistentMaxSubquantizers = 32;
+inline constexpr u32 kPersistentMaxSubquantizers = kMaxPersistentSubquantizers;
 inline constexpr u32 kPersistentMaxGraphDegree = 128;
 // The authoritative commit frontier preserves the legacy maximum batch width.
 // The speculative ROB is independently bounded by the same compile-time
@@ -36,18 +35,41 @@ inline constexpr u64 kInvalidDeviceHandle = ~u64{0};
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-    inline constexpr u32
-    exact_record_trailer_offset(u32 record_bytes) {
+  inline constexpr u32
+  exact_record_trailer_offset(u32 record_bytes) {
   return static_cast<u32>((static_cast<u64>(record_bytes) + alignof(u64) - 1u) &
                           ~static_cast<u64>(alignof(u64) - 1u));
 }
+
+// RDMA transfers only the incarnation, PQ payload, and checksum. Keep each
+// local scratch slot naturally aligned even when a valid PQ width makes that
+// wire payload an odd multiple of four bytes (for example PQ15 or PQ30).
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+  inline constexpr u32
+  dynamic_code_scratch_stride(u32 record_bytes) {
+  return static_cast<u32>((static_cast<u64>(record_bytes) + alignof(u32) - 1u) &
+                          ~static_cast<u64>(alignof(u32) - 1u));
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+  inline constexpr bool
+  exact_snapshot_local_layout_matches(u64 prefix_iova, u64 trailer_iova,
+                                      u32 record_bytes) {
+  const u64 trailer_offset = exact_record_trailer_offset(record_bytes);
+  return prefix_iova <= ~u64{0} - trailer_offset &&
+         prefix_iova + trailer_offset == trailer_iova;
+}
+
 inline constexpr u32 kRemoteOffsetUnitBits = 34;
 inline constexpr u32 kRemoteShardBits = 6;
 inline constexpr u32 kRemoteIncarnationShift = 40;
 inline constexpr u64 kRemoteOffsetUnitMask =
   (u64{1} << kRemoteOffsetUnitBits) - 1;
-inline constexpr u64 kRemoteShardMask =
-  (u64{1} << kRemoteShardBits) - 1;
+inline constexpr u64 kRemoteShardMask = (u64{1} << kRemoteShardBits) - 1;
 inline constexpr u32 kRemoteMaxIncarnation = (u32{1} << 24) - 2;
 inline constexpr u32 kNodeHeaderIncarnationShift = 32;
 
@@ -57,17 +79,17 @@ inline constexpr u32 kNodeHeaderIncarnationShift = 32;
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr u32 persistent_score_chunk_capacity(
-    u32 graph_entry_capacity, u32 traversal_beam_width) {
+  inline constexpr u32
+  persistent_score_chunk_capacity(u32 graph_entry_capacity,
+                                  u32 traversal_beam_width) {
   if (graph_entry_capacity == 0 ||
       traversal_beam_width >= kPersistentMaxMergeCandidates) {
     return 0;
   }
-  const u32 available =
-    kPersistentMaxMergeCandidates - traversal_beam_width;
+  const u32 available = kPersistentMaxMergeCandidates - traversal_beam_width;
   const u32 by_workspace = available / graph_entry_capacity;
-  return by_workspace < kPersistentScoreChunk
-    ? by_workspace : kPersistentScoreChunk;
+  return by_workspace < kPersistentScoreChunk ? by_workspace
+                                              : kPersistentScoreChunk;
 }
 
 struct DeviceShardRegion {
@@ -91,15 +113,38 @@ struct DeviceShardRegion {
   u64 dynamic_arena_slot_count{};
 };
 
+// Validate one byte range within a real dynamic-node slot before any RDMA
+// request is published. This rejects aligned but one-past/corrupt RemotePtrs
+// locally instead of turning a query-local bad neighbor into a QP failure.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+  inline constexpr bool
+  dynamic_record_range_from_offset(const DeviceShardRegion& region,
+                                   u64 node_offset, u32 record_offset,
+                                   u32 bytes) {
+  if (region.dynamic_record_bytes == 0 ||
+      node_offset < region.dynamic_base_offset ||
+      record_offset > region.dynamic_record_bytes ||
+      bytes > region.dynamic_record_bytes - record_offset) {
+    return false;
+  }
+  const u64 relative = node_offset - region.dynamic_base_offset;
+  if (relative % region.dynamic_record_bytes != 0) return false;
+  return relative / region.dynamic_record_bytes <
+         region.dynamic_arena_slot_count;
+}
+
 // Translate a physical dynamic-node offset to its unique GPU arena slot.
 // Keeping this helper host/device makes the storage/GPU layout contract
 // directly unit-testable.
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr bool dynamic_code_arena_slot_from_offset(
-    const DeviceShardRegion& region, u64 node_offset,
-    u64 arena_capacity, u64& arena_slot) {
+  inline constexpr bool
+  dynamic_code_arena_slot_from_offset(const DeviceShardRegion& region,
+                                      u64 node_offset, u64 arena_capacity,
+                                      u64& arena_slot) {
   if (region.dynamic_record_bytes == 0 ||
       node_offset < region.dynamic_base_offset) {
     return false;
@@ -116,11 +161,7 @@ inline constexpr bool dynamic_code_arena_slot_from_offset(
   return true;
 }
 
-struct DirectRemoteRegion {
-  u64 address{};
-  u32 rkey{};
-  u32 reserved{};
-};
+using DirectRemoteRegion = gpu::GpuNetioRemoteMemoryRegion;
 
 inline constexpr u32 kCentroidRouteMaxLiveEntries = 4;
 inline constexpr u32 kCentroidRouteLive = 1u;
@@ -148,8 +189,7 @@ struct CentroidRouteUpdate {
   u64 vector_count{};
   u32 shard{};
   u32 live_entry_count{};
-  std::array<DeviceCentroidRouteEntry,
-             kCentroidRouteMaxLiveEntries> entries{};
+  std::array<DeviceCentroidRouteEntry, kCentroidRouteMaxLiveEntries> entries{};
 };
 
 static_assert(sizeof(DeviceCentroidRouteEntry) == 16);
@@ -222,15 +262,17 @@ inline constexpr u8 kDirectBatchKnownFlags =
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr bool exact_snapshot_transport_failed(i32 final_status) {
+  inline constexpr bool
+  exact_snapshot_transport_failed(i32 final_status) {
   return final_status != 0;
 }
 
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr bool exact_rerank_should_retry_route(
-    bool exact_fetch_succeeded, u32 route_attempt) {
+  inline constexpr bool
+  exact_rerank_should_retry_route(bool exact_fetch_succeeded,
+                                  u32 route_attempt) {
   return exact_fetch_succeeded && route_attempt == 0;
 }
 
@@ -366,6 +408,7 @@ struct PersistentKernelParams {
   u32 pq_subvector_dim{};
   u32 pq_code_bytes{};
   u32 dynamic_code_record_bytes{};
+  u32 dynamic_code_record_stride{};
   u32 graph_entry_bytes{};
   u32 graph_degree{};
   // Total decodable pointer slots: stable graph_degree plus provisional
@@ -511,48 +554,51 @@ inline constexpr u32 kPersistentDynamicCodeArenaBusy = u32{1} << 31;
 inline constexpr u32 kPersistentDynamicCodeArenaIncarnationMask =
   kPersistentDynamicCodeTagIncarnationMask;
 inline constexpr u32 kPersistentDynamicCodeArenaExtentMask =
-  u32{kPersistentDynamicCodeArenaUnknownExtent} <<
-    kPersistentDynamicCodeTagExtentShift;
+  u32{kPersistentDynamicCodeArenaUnknownExtent}
+  << kPersistentDynamicCodeTagExtentShift;
 static_assert(kRemoteMaxIncarnation <
               kPersistentDynamicCodeArenaIncarnationMask);
 
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr u32 dynamic_code_tag_incarnation(u32 tag) {
+  inline constexpr u32
+  dynamic_code_tag_incarnation(u32 tag) {
   return tag & kPersistentDynamicCodeTagIncarnationMask;
 }
 
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr u8 dynamic_code_tag_extent_class(u32 tag) {
+  inline constexpr u8
+  dynamic_code_tag_extent_class(u32 tag) {
   const u32 extent = tag >> kPersistentDynamicCodeTagExtentShift;
-  return static_cast<u8>(
-    extent < kPersistentDynamicCodeArenaUnknownExtent
-      ? extent : kPersistentDynamicCodeArenaUnknownExtent);
+  return static_cast<u8>(extent < kPersistentDynamicCodeArenaUnknownExtent
+                           ? extent
+                           : kPersistentDynamicCodeArenaUnknownExtent);
 }
 
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr u32 make_dynamic_code_tag(u32 incarnation,
-                                           u8 extent_class) {
+  inline constexpr u32
+  make_dynamic_code_tag(u32 incarnation, u8 extent_class) {
   const u32 normalized_extent =
     extent_class < kPersistentDynamicCodeArenaUnknownExtent
-      ? extent_class : kPersistentDynamicCodeArenaUnknownExtent;
+      ? extent_class
+      : kPersistentDynamicCodeArenaUnknownExtent;
   return (normalized_extent << kPersistentDynamicCodeTagExtentShift) |
-    (incarnation & kPersistentDynamicCodeTagIncarnationMask);
+         (incarnation & kPersistentDynamicCodeTagIncarnationMask);
 }
 
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr bool dynamic_code_arena_state_matches(
-    u32 state, u32 incarnation) {
+  inline constexpr bool
+  dynamic_code_arena_state_matches(u32 state, u32 incarnation) {
   return incarnation != 0 && incarnation <= kRemoteMaxIncarnation &&
-    (state & kPersistentDynamicCodeArenaBusy) == 0 &&
-    dynamic_code_tag_incarnation(state) == incarnation;
+         (state & kPersistentDynamicCodeArenaBusy) == 0 &&
+         dynamic_code_tag_incarnation(state) == incarnation;
 }
 
 // A cache reader samples the state on both sides of the payload load.  Extent
@@ -563,21 +609,21 @@ inline constexpr bool dynamic_code_arena_state_matches(
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr bool dynamic_code_arena_read_stable(
-    u32 before, u32 after, u32 incarnation) {
+  inline constexpr bool
+  dynamic_code_arena_read_stable(u32 before, u32 after, u32 incarnation) {
   return dynamic_code_arena_state_matches(before, incarnation) &&
-    dynamic_code_arena_state_matches(after, incarnation);
+         dynamic_code_arena_state_matches(after, incarnation);
 }
 
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr bool dynamic_code_arena_can_publish(
-    u32 observed_state, u32 desired_incarnation) {
+  inline constexpr bool
+  dynamic_code_arena_can_publish(u32 observed_state, u32 desired_incarnation) {
   return desired_incarnation != 0 &&
-    desired_incarnation <= kRemoteMaxIncarnation &&
-    (observed_state & kPersistentDynamicCodeArenaBusy) == 0 &&
-    dynamic_code_tag_incarnation(observed_state) < desired_incarnation;
+         desired_incarnation <= kRemoteMaxIncarnation &&
+         (observed_state & kPersistentDynamicCodeArenaBusy) == 0 &&
+         dynamic_code_tag_incarnation(observed_state) < desired_incarnation;
 }
 
 // A successful 0 -> BUSY|tag reservation is the only transition that adds a
@@ -586,8 +632,8 @@ inline constexpr bool dynamic_code_arena_can_publish(
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr bool dynamic_code_arena_first_occupancy(
-    u32 reserved_from_state) {
+  inline constexpr bool
+  dynamic_code_arena_first_occupancy(u32 reserved_from_state) {
   return reserved_from_state == 0;
 }
 
@@ -597,25 +643,23 @@ inline constexpr bool dynamic_code_arena_first_occupancy(
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr bool dynamic_code_arena_promoted_extent_state(
-    u32 observed_state,
-    u32 desired_incarnation,
-    u8 requested_extent_class,
-    u32& promoted_state) {
+  inline constexpr bool
+  dynamic_code_arena_promoted_extent_state(u32 observed_state,
+                                           u32 desired_incarnation,
+                                           u8 requested_extent_class,
+                                           u32& promoted_state) {
   promoted_state = observed_state;
-  if (!dynamic_code_arena_state_matches(
-        observed_state, desired_incarnation) ||
+  if (!dynamic_code_arena_state_matches(observed_state, desired_incarnation) ||
       requested_extent_class >= kPersistentDynamicCodeArenaUnknownExtent) {
     return false;
   }
-  const u8 observed_extent =
-    dynamic_code_tag_extent_class(observed_state);
+  const u8 observed_extent = dynamic_code_tag_extent_class(observed_state);
   if (observed_extent == kPersistentDynamicCodeArenaUnknownExtent ||
       requested_extent_class <= observed_extent) {
     return false;
   }
-  promoted_state = make_dynamic_code_tag(
-    desired_incarnation, requested_extent_class);
+  promoted_state =
+    make_dynamic_code_tag(desired_incarnation, requested_extent_class);
   return true;
 }
 
@@ -628,21 +672,20 @@ inline constexpr bool dynamic_code_arena_promoted_extent_state(
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr bool dynamic_code_arena_refined_unknown_extent_state(
-    u32 observed_state,
-    u32 desired_incarnation,
-    u8 observed_graph_class,
-    u32& refined_state) {
+  inline constexpr bool
+  dynamic_code_arena_refined_unknown_extent_state(u32 observed_state,
+                                                  u32 desired_incarnation,
+                                                  u8 observed_graph_class,
+                                                  u32& refined_state) {
   refined_state = observed_state;
-  if (!dynamic_code_arena_state_matches(
-        observed_state, desired_incarnation) ||
+  if (!dynamic_code_arena_state_matches(observed_state, desired_incarnation) ||
       observed_graph_class >= kPersistentDynamicCodeArenaUnknownExtent ||
       dynamic_code_tag_extent_class(observed_state) !=
         kPersistentDynamicCodeArenaUnknownExtent) {
     return false;
   }
-  refined_state = make_dynamic_code_tag(
-    desired_incarnation, observed_graph_class);
+  refined_state =
+    make_dynamic_code_tag(desired_incarnation, observed_graph_class);
   return true;
 }
 
@@ -654,19 +697,17 @@ inline constexpr bool dynamic_code_arena_refined_unknown_extent_state(
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline constexpr bool dynamic_code_arena_guarded_demoted_extent_state(
-    u32 observed_state,
-    u32 desired_incarnation,
-    u8 observed_graph_class,
-    u32& demoted_state) {
+  inline constexpr bool
+  dynamic_code_arena_guarded_demoted_extent_state(u32 observed_state,
+                                                  u32 desired_incarnation,
+                                                  u8 observed_graph_class,
+                                                  u32& demoted_state) {
   demoted_state = observed_state;
-  if (!dynamic_code_arena_state_matches(
-        observed_state, desired_incarnation) ||
+  if (!dynamic_code_arena_state_matches(observed_state, desired_incarnation) ||
       observed_graph_class >= kPersistentDynamicCodeArenaUnknownExtent) {
     return false;
   }
-  const u8 cached_extent =
-    dynamic_code_tag_extent_class(observed_state);
+  const u8 cached_extent = dynamic_code_tag_extent_class(observed_state);
   if (cached_extent == kPersistentDynamicCodeArenaUnknownExtent ||
       static_cast<u32>(observed_graph_class) + 2u > cached_extent) {
     return false;
@@ -680,6 +721,7 @@ struct PersistentKernelOccupancy {
   u32 active_blocks_per_sm{};
   u32 registers_per_thread{};
   size_t static_shared_bytes{};
+  size_t local_bytes_per_thread{};
   u32 max_threads_per_block{};
 };
 
@@ -690,17 +732,18 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(
   u32 threads, bool enable_asfe = true);
 
 void launch_persistent_search(cudaStream_t stream,
-                              const PersistentKernelParams& params,
-                              u32 blocks, u32 threads,
-                              bool decoupled_search_progression);
+                              const PersistentKernelParams& params, u32 blocks,
+                              u32 threads, bool decoupled_search_progression);
 void launch_direct_read_owners(cudaStream_t stream,
                                const PersistentKernelParams& params,
                                u32 queue_count, u32 threads);
-void launch_gpunetio_owner_read_probe(
-  cudaStream_t stream, const PersistentKernelParams& params,
-  u32* request_shards, u64* remote_offsets, u64* local_iova_offsets,
-  u8* destinations, u32 destination_stride, i32* statuses,
-  u32* completed, u32* phases, u32 queue_count);
+void launch_gpunetio_owner_read_probe(cudaStream_t stream,
+                                      const PersistentKernelParams& params,
+                                      u32* request_shards, u64* remote_offsets,
+                                      u64* local_iova_offsets, u8* destinations,
+                                      u32 destination_stride, i32* statuses,
+                                      u32* completed, u32* phases,
+                                      u32 queue_count);
 void launch_gpunetio_locked_read_probe(cudaStream_t stream,
                                        const PersistentKernelParams& params,
                                        u8* destinations, u32 destination_stride,
@@ -708,7 +751,8 @@ void launch_gpunetio_locked_read_probe(cudaStream_t stream,
                                        u32 blocks, u32 iterations);
 void launch_gpunetio_batched_read_probe(cudaStream_t stream,
                                         const PersistentKernelParams& params,
-                                        u8* destinations, u32 destination_stride,
-                                        i32* statuses, u32* completed,
-                                        u32 blocks, u32 batch_size);
+                                        u8* destinations,
+                                        u32 destination_stride, i32* statuses,
+                                        u32* completed, u32 blocks,
+                                        u32 batch_size);
 }  // namespace gpu_search

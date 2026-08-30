@@ -1,6 +1,7 @@
 #include "gpu_search/persistent_engine.hh"
 
 #include <memory>
+#include <utility>
 
 #include "gpu_search/persistent_engine/cuda_helpers.hh"
 #include "gpu_search/persistent_engine/impl.hh"
@@ -16,17 +17,24 @@ PersistentSearchEngine::PersistentSearchEngine(
     const MemoryRegionTokens& remote_regions) {
   check_cuda(cudaSetDevice(static_cast<int>(config.gpu_device)),
              "cudaSetDevice(GPU navigation engine)");
-  impl_ = std::make_unique<Impl>(*this, config, channel_context,
-                                 connection_manager, remote_regions);
+  // Establish ownership before any fallible CUDA/RDMA initialization. If
+  // initialization, kernel readiness, the first route snapshot, or
+  // worker-thread creation throws, the complete Impl object releases partial
+  // resources, stopping/synchronizing a launched kernel before freeing its
+  // backing memory.
+  auto candidate = std::make_unique<Impl>(*this, config);
+  candidate->initialize(channel_context, connection_manager, remote_regions);
+  candidate->start();
   telemetry_.set_gpu_occupancy(
-    impl_->kernel_threads,
-    impl_->persistent_kernel_occupancy.registers_per_thread,
-    impl_->persistent_kernel_occupancy.static_shared_bytes,
-    impl_->persistent_kernel_occupancy.active_blocks_per_sm,
-    impl_->persistent_grid_plan.selected.effective_blocks_per_sm,
-    impl_->persistent_grid_plan.selected.query_blocks,
-    impl_->persistent_grid_plan.selected.owner_blocks,
-    impl_->persistent_grid_plan.selected.total_blocks);
+    candidate->kernel_threads,
+    candidate->persistent_kernel_occupancy.registers_per_thread,
+    candidate->persistent_kernel_occupancy.static_shared_bytes,
+    candidate->persistent_kernel_occupancy.active_blocks_per_sm,
+    candidate->persistent_grid_plan.selected.effective_blocks_per_sm,
+    candidate->persistent_grid_plan.selected.query_blocks,
+    candidate->persistent_grid_plan.selected.owner_blocks,
+    candidate->persistent_grid_plan.selected.total_blocks);
+  impl_ = std::move(candidate);
 }
 
 PersistentSearchEngine::~PersistentSearchEngine() {

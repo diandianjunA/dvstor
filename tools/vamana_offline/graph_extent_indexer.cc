@@ -113,7 +113,7 @@ GraphLayout read_layout(const filepath_t& prefix) {
       layout.shard_bits != shard_bits_for(layout.shards) ||
       layout.node_bytes == 0 ||
       layout.node_bytes % RemotePtr::OFFSET_ALIGNMENT != 0 ||
-      layout.nodes == 0 || layout.nodes >= (1ull << 30) ||
+      layout.nodes == 0 || layout.nodes > kMaxGpuNavigationNodes ||
       layout.build_fingerprint == 0 ||
       metadata.value("hot_graph_pointer_bytes", 0u) !=
         vamana::hot_graph::kCompactPointerBytes) {

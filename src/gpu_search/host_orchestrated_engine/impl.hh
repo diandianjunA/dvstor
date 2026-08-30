@@ -7,6 +7,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <library/detached_qp.hh>
+#include <library/memory_region.hh>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -14,9 +16,6 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
-
-#include <library/detached_qp.hh>
-#include <library/memory_region.hh>
 
 #include "common/bounded_queue.hh"
 #include "gpu_search/centroid_home_selector.hh"
@@ -41,7 +40,8 @@ struct HostOrchestratedSearchEngine::Impl {
     u64 vector_count{};
     std::vector<f32> centroid;
     std::array<format::StorageCentroidRouteEntry,
-               format::kStorageCentroidRouteMaxLiveEntries> entries{};
+               format::kStorageCentroidRouteMaxLiveEntries>
+      entries{};
     u32 live_entry_count{};
   };
 
@@ -59,6 +59,7 @@ struct HostOrchestratedSearchEngine::Impl {
 
   struct Lane {
     Lane(Impl& engine, u32 lane_id);
+    void initialize();
     ~Lane();
 
     Lane(const Lane&) = delete;
@@ -87,6 +88,7 @@ struct HostOrchestratedSearchEngine::Impl {
     std::vector<Candidate> beam;
     std::vector<Candidate> pending;
     std::unordered_set<u64> visited;
+    bool initialization_complete{};
     bool poisoned{};
   };
 
@@ -98,42 +100,41 @@ struct HostOrchestratedSearchEngine::Impl {
     LaneGuard(const LaneGuard&) = delete;
     LaneGuard& operator=(const LaneGuard&) = delete;
     LaneGuard(LaneGuard&& other) noexcept
-        : engine(other.engine), lane(other.lane) { other.engine = nullptr; }
+        : engine(other.engine), lane(other.lane) {
+      other.engine = nullptr;
+    }
     ~LaneGuard();
     Lane& get() const { return *engine->lanes[lane]; }
   };
 
   Impl(HostOrchestratedSearchEngine& owner,
-       configuration::IndexConfiguration& config,
-       Context& channel_context,
+       configuration::IndexConfiguration& config, Context& channel_context,
        ClientConnectionManager& connection_manager,
        const MemoryRegionTokens& remote_regions);
+  void initialize();
   ~Impl();
 
-  service::QueryResult search(VectorDType query_dtype,
-                              const byte_t* query_data, u32 k);
-  std::optional<u32> select_centroid_home(
-    std::span<const f32> vector) const;
-  bool wait_for_maintenance(
-    std::span<const u64> target_sequences,
-    std::chrono::milliseconds timeout,
-    std::vector<u64>* durable_sequences,
-    std::vector<u64>* effective_target_sequences);
+  service::QueryResult search(VectorDType query_dtype, const byte_t* query_data,
+                              u32 k);
+  std::optional<u32> select_centroid_home(std::span<const f32> vector) const;
+  bool wait_for_maintenance(std::span<const u64> target_sequences,
+                            std::chrono::milliseconds timeout,
+                            std::vector<u64>* durable_sequences,
+                            std::vector<u64>* effective_target_sequences);
   std::vector<std::optional<maintenance_telemetry::Snapshot>>
-    read_maintenance_telemetry();
+  read_maintenance_telemetry();
 
   LaneGuard acquire_lane(bool account_query_wait = false);
   void release_lane(u32 lane);
   std::string unhealthy_message() const;
   void mark_unhealthy(Lane* lane, const std::string& message);
-  void check_lane_cuda(Lane& lane, cudaError_t status,
-                       const char* operation);
+  void check_lane_cuda(Lane& lane, cudaError_t status, const char* operation);
   void read_batch(Lane& lane, std::span<const ReadRequest> requests,
                   bool account_query_io);
   void stream_codes_to_gpu();
   std::vector<format::StorageControlBlock> read_storage_controls(Lane& lane);
-  void validate_storage_control(
-    const format::StorageControlBlock& control, size_t shard) const;
+  void validate_storage_control(const format::StorageControlBlock& control,
+                                size_t shard) const;
   // Returns true only when at least one shard publication changed.  A stable
   // poll must remain distinguishable so the background refresher can back off
   // instead of imposing a permanent high-frequency control-plane load.
@@ -141,16 +142,15 @@ struct HostOrchestratedSearchEngine::Impl {
   void initialize_storage_routes(Lane& lane);
   void maintenance_loop();
   std::vector<std::optional<maintenance_telemetry::Snapshot>>
-    read_maintenance_telemetry(Lane& lane);
+  read_maintenance_telemetry(Lane& lane);
 
-  std::vector<Candidate> route_seeds(
-    const RouteSnapshot& routes, std::span<const f32> query) const;
+  std::vector<Candidate> route_seeds(const RouteSnapshot& routes,
+                                     std::span<const f32> query) const;
   void score_candidates(Lane& lane, std::vector<Candidate>& candidates);
-  void fetch_graph_wave(
-    Lane& lane, std::span<Candidate*> wave,
-    std::vector<std::vector<RemotePtr>>& neighbors);
-  service::QueryResult exact_rerank(
-    Lane& lane, std::span<const Candidate> beam, u32 k);
+  void fetch_graph_wave(Lane& lane, std::span<Candidate*> wave,
+                        std::vector<std::vector<RemotePtr>>& neighbors);
+  service::QueryResult exact_rerank(Lane& lane, std::span<const Candidate> beam,
+                                    u32 k);
   service::QueryResult execute_query(
     Lane& lane, VectorDType query_dtype, const byte_t* query_data, u32 k,
     const std::shared_ptr<const RouteSnapshot>& routes);
@@ -181,6 +181,7 @@ struct HostOrchestratedSearchEngine::Impl {
   u32 route_poll_salt{};
   u32 code_bytes{};
   u32 dynamic_code_record_bytes{};
+  u32 dynamic_code_record_stride{};
   u32 graph_entry_bytes{};
   u32 graph_entry_capacity{};
   u32 score_capacity{};
@@ -198,7 +199,9 @@ struct HostOrchestratedSearchEngine::Impl {
   size_t route_sequence_scratch_offset{};
   size_t lane_scratch_bytes{};
   size_t route_snapshot_stride{};
+  size_t base_code_bytes{};
   u8* d_base_codes{};
+  bool initialization_complete{};
 };
 
 }  // namespace gpu_search

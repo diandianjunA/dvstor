@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.18)
 
 option(DVSTOR_STORAGE_NODE_ONLY
     "Build storage-host runtime and CPU offline tools without CUDA/GPU dependencies" OFF)
+if (NOT DVSTOR_STORAGE_NODE_ONLY AND
+    NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND
+    "$ENV{CUDAARCHS}" STREQUAL "")
+    # Select the project default before project(... CUDA): CMake otherwise
+    # initializes this variable from nvcc's compiler default, making a later
+    # NOT DEFINED check ineffective (and often selecting pre-SM80 code).
+    set(CMAKE_CUDA_ARCHITECTURES 80 86)
+endif ()
 if (DVSTOR_STORAGE_NODE_ONLY)
     project(dvstor CXX)
 else ()
@@ -49,10 +57,9 @@ if (NOT DVSTOR_STORAGE_NODE_ONLY)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-    # Auto-detect GPU architecture if not specified
-    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90)
-    endif ()
+    # The SM80/86 default is selected before project(... CUDA), so CMake cannot
+    # silently replace it with nvcc's compiler default. Newer Ada/Hopper GPUs
+    # can JIT the emitted PTX; CUDA 12 deployments may request 89/90 SASS.
 endif ()
 
 # set default build type to Release
@@ -240,6 +247,36 @@ if (DVSTOR_STORAGE_NODE_ONLY)
     endif ()
     if (DVSTOR_BUILD_TESTS)
         enable_testing()
+        add_executable(vector_dtype_test test/vector_dtype_test.cc)
+        dvstor_target_common_includes(vector_dtype_test)
+        target_compile_options(vector_dtype_test PRIVATE -UNDEBUG)
+        add_test(NAME vector_dtype_test COMMAND vector_dtype_test)
+
+        add_executable(index_metadata_test
+            test/index_metadata_test.cc
+            src/service/index_metadata.cc
+            src/gpu_search/index_format.cc)
+        dvstor_target_common_includes(index_metadata_test)
+        target_compile_options(index_metadata_test PRIVATE -UNDEBUG)
+        add_test(NAME index_metadata_test COMMAND index_metadata_test)
+        set_tests_properties(index_metadata_test PROPERTIES TIMEOUT 10)
+
+        add_executable(rdma_contract_test test/rdma_contract_test.cc)
+        dvstor_target_common_includes(rdma_contract_test)
+        target_link_libraries(rdma_contract_test PRIVATE rdma_library)
+        target_compile_options(rdma_contract_test PRIVATE -UNDEBUG)
+        add_test(NAME rdma_contract_test COMMAND rdma_contract_test)
+        set_tests_properties(rdma_contract_test PROPERTIES TIMEOUT 10)
+
+        add_executable(configuration_update_protocol_test
+            test/configuration_update_protocol_test.cc)
+        dvstor_target_common_includes(configuration_update_protocol_test)
+        target_link_libraries(configuration_update_protocol_test PRIVATE rdma_library)
+        target_compile_options(configuration_update_protocol_test PRIVATE -UNDEBUG)
+        add_test(NAME configuration_update_protocol_test
+                 COMMAND configuration_update_protocol_test)
+        set_tests_properties(configuration_update_protocol_test PROPERTIES TIMEOUT 10)
+
         add_executable(offline_local_id_set_test
             test/offline_local_id_set_test.cc)
         dvstor_target_tool_includes(offline_local_id_set_test)
@@ -247,6 +284,20 @@ if (DVSTOR_STORAGE_NODE_ONLY)
         add_test(NAME offline_local_id_set_test
                  COMMAND offline_local_id_set_test)
         set_tests_properties(offline_local_id_set_test PROPERTIES TIMEOUT 10)
+
+        add_executable(shard_publication_test
+            test/shard_publication_test.cc
+            tools/vamana_offline/dataset_io.cc
+            tools/vamana_offline/graph.cc
+            tools/vamana_offline/partitioning.cc
+            tools/vamana_offline/progress.cc
+            tools/vamana_offline/shard_writer.cc)
+        dvstor_target_tool_includes(shard_publication_test)
+        target_link_libraries(shard_publication_test PRIVATE rdma_library)
+        target_compile_options(shard_publication_test PRIVATE -UNDEBUG)
+        add_test(NAME shard_publication_test
+                 COMMAND shard_publication_test)
+        set_tests_properties(shard_publication_test PROPERTIES TIMEOUT 20)
 
         add_executable(vamana_offline_graph_test
             test/vamana_offline_graph_test.cc
@@ -282,11 +333,29 @@ else ()
             "The compute-node runtime requires a complete DOCA GPUNetIO installation")
     endif ()
     set(DVSTOR_HAVE_GPUNETIO ON)
-    list(FIND CMAKE_CUDA_ARCHITECTURES 52 DVSTOR_CUDA_SM52_INDEX)
-    if (NOT DVSTOR_CUDA_SM52_INDEX EQUAL -1)
-        message(WARNING "GPUNetIO requires sm_60+; replacing cached sm_52 with sm_80")
-        set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures" FORCE)
+    # The persistent query path uses SM80 warp reductions and system-scope
+    # acquire/release operations. Reject an incompatible fatbin at configure
+    # time instead of producing a binary that fails after index/RDMA startup.
+    if (NOT CMAKE_CUDA_ARCHITECTURES)
+        message(FATAL_ERROR
+            "DVSTOR persistent GPUNetIO requires an explicit SM80+ CUDA "
+            "architecture; CMAKE_CUDA_ARCHITECTURES is empty or OFF")
     endif ()
+    foreach (DVSTOR_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        if (DVSTOR_CUDA_ARCH MATCHES "^([0-9]+)(-real|-virtual)?$")
+            set(DVSTOR_CUDA_ARCH_NUMBER "${CMAKE_MATCH_1}")
+            if (DVSTOR_CUDA_ARCH_NUMBER LESS 80)
+                message(FATAL_ERROR
+                    "DVSTOR persistent GPUNetIO requires SM80+; unsupported "
+                    "CMAKE_CUDA_ARCHITECTURES entry: ${DVSTOR_CUDA_ARCH}")
+            endif ()
+        else ()
+            message(FATAL_ERROR
+                "DVSTOR persistent GPUNetIO requires an explicit numeric "
+                "SM80+ CUDA architecture; unsupported entry: "
+                "${DVSTOR_CUDA_ARCH}")
+        endif ()
+    endforeach ()
 
     # Query distance kernels. The persistent backend owns RDMA from its
     # long-lived kernel; the coupled baseline launches only bounded ordinary

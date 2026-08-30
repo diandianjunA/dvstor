@@ -15,13 +15,12 @@
 | OPQ/PQ | PQ32（每个子空间3维） |
 | 最终索引 | schema-16 tagged graph + centroid/idmap/PQ/extent sidecars |
 
-`queries.fbin` 会流式切成互不重叠的三段：
+`queries.fbin` 的 `[0,3334)` 默认用于 recall query，并同步切出对应 GT。性能查询和插入默认使用从官方 DEEP1B base 提取、且未进入 100M 索引的两段：
 
-- `[0,3334)`：recall query，并同步切出对应 GT；
-- `[3334,6667)`：performance query；
-- `[6667,10000)`：insert。
+- `[100000000,110000000)`：`deep100m_to_110m_query.fbin`；
+- `[110000000,120000000)`：`deep110m_to_120m_insert.fbin`。
 
-派生文件默认写入 `/data/xjs/index/dvstor_deep100m/prepared`，38.4 GB base 不复制。
+recall 派生文件默认写入 `/data/xjs/index/dvstor_deep100m/prepared`，38.4 GB base 不复制。
 
 ## 配置
 

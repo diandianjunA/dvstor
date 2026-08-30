@@ -23,10 +23,10 @@ Usage: ./experiment/spacev100m/run_breakdown.sh [PROFILE]
   MIXED_WRITE_THREADS=N                   write_rate_limited 专用写线程数
 
 数据文件与声明范围（在 spacev100m_common.sh 集中配置，也可用环境变量覆盖）：
-  PERFORMANCE_QUERY_FILE                 默认 prepared/performance_query.i8bin
-  PERFORMANCE_QUERY_START/END            默认 [10000,20000)
-  INSERT_FILE                            默认 prepared/insert.i8bin
-  INSERT_VECTOR_START/END                默认 [20000,29316)
+  PERFORMANCE_QUERY_FILE                 默认 DATASET_DIR/spacev100m_to_110m_query.i8bin
+  PERFORMANCE_QUERY_START/END            默认 [100000000,110000000)
+  INSERT_FILE                            默认 DATASET_DIR/spacev110m_to_120m_insert.i8bin
+  INSERT_VECTOR_START/END                默认 [110000000,120000000)
 
 数据准备：
   PREPARE_BENCHMARK_DATA=0                默认；只读取预生成 i8bin，不需要复制 spacev100m_base.i8bin

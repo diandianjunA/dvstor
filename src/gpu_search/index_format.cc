@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 
+#include "common/constants.hh"
 #include "nlohmann/json.hh"
 #include "vamana/hot_graph.hh"
 #include "vamana/vamana_node.hh"
@@ -326,7 +327,7 @@ u64 checksum64(const byte_t* data, size_t bytes) {
 
 bool validate_layout(const NavigationLayout& layout, std::string* error) {
   if (layout.dim == 0 || layout.graph_degree == 0 || layout.num_shards == 0 ||
-      layout.num_nodes == 0 || layout.num_nodes >= (1ull << 30) ||
+      layout.num_nodes == 0 || layout.num_nodes > kMaxGpuNavigationNodes ||
       layout.num_nodes > std::numeric_limits<u32>::max() || layout.base_generation == 0) {
     set_error(error, "GPU navigation layout has invalid dimensions");
     return false;
@@ -376,6 +377,15 @@ bool validate_view(const View& view, std::string* error) {
        (kRemoteOffsetLimit - shard.graph_base_offset) / view.layout.graph_entry_bytes);
     const bool code_range_overflows = shard.code_remote_offset > kRemoteOffsetLimit ||
       shard.code_bytes > kRemoteOffsetLimit - shard.code_remote_offset;
+    const bool control_range_overflows =
+      shard.control_remote_offset > kRemoteOffsetLimit ||
+      kStorageControlBytes >
+        kRemoteOffsetLimit - shard.control_remote_offset;
+    const bool dynamic_range_overflows =
+      !RemotePtr::representable(
+        shard.memory_node, shard.dynamic_base_offset, 1) ||
+      shard.dynamic_record_bytes >
+        kRemoteOffsetLimit - shard.dynamic_base_offset;
     const u64 node_end = node_range_overflows ? kRemoteOffsetLimit :
       shard.node_base_offset + shard.node_count * shard.node_stride;
     const u64 graph_end = graph_range_overflows ? kRemoteOffsetLimit :
@@ -386,7 +396,8 @@ bool validate_view(const View& view, std::string* error) {
         shard.dynamic_base_offset == 0 || shard.control_remote_offset == 0 ||
         shard.dynamic_record_bytes == 0 ||
         shard.dynamic_hot_offset == 0 || node_range_overflows || graph_range_overflows ||
-        code_range_overflows || node_end > shard.graph_base_offset ||
+        code_range_overflows || control_range_overflows ||
+        dynamic_range_overflows || node_end > shard.graph_base_offset ||
         graph_end > shard.control_remote_offset ||
         shard.dynamic_hot_offset < shard.node_stride ||
         shard.dynamic_hot_offset > shard.dynamic_record_bytes ||
@@ -420,12 +431,37 @@ bool synthesize_distributed_view(
     std::string* error) {
   try {
     const std::filesystem::path metadata_path{index_prefix.string() + ".meta.json"};
-    std::ifstream metadata_input(metadata_path);
+    std::ifstream metadata_input(metadata_path, std::ios::binary);
     if (!metadata_input.good()) {
       throw std::runtime_error("missing index metadata: " + metadata_path.string());
     }
-    nlohmann::json metadata;
-    metadata_input >> metadata;
+    metadata_input.seekg(0, std::ios::end);
+    const std::streamoff metadata_end = metadata_input.tellg();
+    constexpr u64 kMaximumMetadataBytes = 4ull << 20;
+    if (metadata_end <= 0 ||
+        static_cast<u64>(metadata_end) > kMaximumMetadataBytes) {
+      throw std::runtime_error(
+        "index metadata exceeds the runtime JSON safety limit");
+    }
+    std::string metadata_document(
+      static_cast<size_t>(metadata_end), '\0');
+    metadata_input.seekg(0, std::ios::beg);
+    metadata_input.read(
+      metadata_document.data(),
+      static_cast<std::streamsize>(metadata_document.size()));
+    if (metadata_input.gcount() !=
+          static_cast<std::streamsize>(metadata_document.size())) {
+      throw std::runtime_error("short read from index metadata");
+    }
+    char trailing_byte = 0;
+    if (metadata_input.get(trailing_byte)) {
+      throw std::runtime_error("index metadata changed while it was read");
+    }
+    const nlohmann::json metadata =
+      nlohmann::json::parse(metadata_document);
+    if (!metadata.is_object()) {
+      throw std::runtime_error("index metadata root is not an object");
+    }
     const std::string quantizer = metadata.value("navigation_quantizer", std::string{});
     const std::string navigation_format = metadata.value("navigation_format", std::string{});
     if (metadata.value("schema_version", 0u) != kMetadataSchemaVersion ||
@@ -508,15 +544,32 @@ bool synthesize_distributed_view(
     u64 node_count = 0;
     for (u32 shard = 0; shard < shard_count; ++shard) {
       const u64 expected_control_offset = align_up(dynamic_offsets[shard], 64);
+      if (expected_control_offset == 0 ||
+          expected_control_offset >
+            std::numeric_limits<u64>::max() - kStorageControlBytes ||
+          synthesized.layout.code_bytes == 0 ||
+          counts[shard] >
+            std::numeric_limits<u64>::max() /
+              synthesized.layout.code_bytes) {
+        throw std::runtime_error(
+          "GPU navigation metadata shard layout overflows");
+      }
       const u64 expected_code_offset = expected_control_offset + kStorageControlBytes;
       const u64 expected_code_bytes = counts[shard] * synthesized.layout.code_bytes;
+      if (expected_code_offset >
+          std::numeric_limits<u64>::max() - expected_code_bytes) {
+        throw std::runtime_error(
+          "GPU navigation metadata code region overflows");
+      }
+      const u64 expected_code_end =
+        expected_code_offset + expected_code_bytes;
       if (counts[shard] == 0 || graph_offsets[shard] == 0 ||
           dynamic_offsets[shard] == 0 ||
           control_offsets[shard] != expected_control_offset ||
           code_offsets[shard] != expected_code_offset ||
           code_sizes[shard] != expected_code_bytes ||
-          dynamic_node_offsets[shard] < expected_code_offset + expected_code_bytes ||
-          counts[shard] >= (1ull << 30) - node_count) {
+          dynamic_node_offsets[shard] < expected_code_end ||
+          counts[shard] > kMaxGpuNavigationNodes - node_count) {
         throw std::runtime_error("GPU navigation metadata contains an invalid shard");
       }
       synthesized.shards[shard] = {
@@ -537,7 +590,7 @@ bool synthesize_distributed_view(
       node_count += counts[shard];
     }
     if (node_count != metadata.at("num_vectors").get<u64>() ||
-        node_count == 0 || node_count >= (1ull << 30)) {
+        node_count == 0 || node_count > kMaxGpuNavigationNodes) {
       throw std::runtime_error("GPU navigation metadata has an invalid node count");
     }
     synthesized.layout.num_nodes = node_count;
@@ -569,7 +622,12 @@ bool validate_code_header(const CodeHeader& header, std::string* error) {
       header.reserved[1] != 0 ||
       header.entry_count >
         std::numeric_limits<u64>::max() / header.code_bytes ||
-      header.payload_bytes != header.entry_count * header.code_bytes) {
+      header.payload_bytes != header.entry_count * header.code_bytes ||
+      header.payload_bytes >
+        std::numeric_limits<u64>::max() - sizeof(CodeHeader) ||
+      header.remote_offset >= RemotePtr::BYTE_OFFSET_CAPACITY ||
+      header.payload_bytes >
+        RemotePtr::BYTE_OFFSET_CAPACITY - header.remote_offset) {
     set_error(error, "invalid GPU PQ code sidecar dimensions");
     return false;
   }
@@ -592,7 +650,12 @@ bool read_code_header(const std::filesystem::path& path, CodeHeader& header,
   }
   input.read(reinterpret_cast<char*>(&header), sizeof(header));
   if (!input.good() || !validate_code_header(header, error)) return false;
-  if (std::filesystem::file_size(path) != sizeof(CodeHeader) + header.payload_bytes) {
+  std::error_code file_error;
+  const std::uintmax_t file_bytes =
+    std::filesystem::file_size(path, file_error);
+  if (file_error || file_bytes > std::numeric_limits<u64>::max() ||
+      static_cast<u64>(file_bytes) !=
+        sizeof(CodeHeader) + header.payload_bytes) {
     set_error(error, "GPU PQ code sidecar file size mismatch: " + path.string());
     return false;
   }
@@ -660,7 +723,7 @@ bool validate_graph_extent_header(
       header.num_shards == 0 ||
       header.num_shards > RemotePtr::MEMORY_NODE_MASK + 1 ||
       header.reserved0 != 0 || header.num_nodes == 0 ||
-      header.num_nodes >= (1ull << 30) ||
+      header.num_nodes > kMaxGpuNavigationNodes ||
       header.num_nodes >
         std::numeric_limits<u64>::max() / header.class_bytes ||
       header.payload_bytes != header.num_nodes * header.class_bytes ||
@@ -806,7 +869,7 @@ bool remote_to_ordinal(const View& view, RemotePtr pointer, u32& ordinal) {
   const u64 relative = pointer.byte_offset() - shard.node_base_offset;
   if (relative % shard.node_stride != 0) return false;
   const u64 slot = relative / shard.node_stride;
-  if (slot >= shard.node_count || shard.ordinal_base + slot >= (1ull << 30)) return false;
+  if (slot >= shard.node_count || shard.ordinal_base + slot > kMaxGpuNavigationNodes) return false;
   ordinal = static_cast<u32>(shard.ordinal_base + slot);
   return true;
 }

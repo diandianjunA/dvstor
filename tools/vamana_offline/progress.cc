@@ -7,7 +7,9 @@ namespace tools::vamana_offline {
 
 size_t effective_thread_count(u32 configured_threads) {
   const size_t detected = std::thread::hardware_concurrency();
-  return configured_threads == 0 ? std::max<size_t>(detected, 1) : configured_threads;
+  return configured_threads == 0
+    ? std::min<size_t>(std::max<size_t>(detected, 1), 32)
+    : configured_threads;
 }
 
 str format_duration(std::chrono::steady_clock::duration duration) {

@@ -1,14 +1,29 @@
-#include "gpu_search/persistent_engine/impl.hh"
-#include "gpu_search/persistent_engine/cuda_helpers.hh"
-
 #include <filesystem>
 
+#ifdef DVSTOR_HAVE_GPUNETIO
+#include "gpu/gpunetio_probe.hh"
+#endif
+
+#include "gpu_search/persistent_engine/cuda_helpers.hh"
+#include "gpu_search/persistent_engine/impl.hh"
 #include "nlohmann/json.hh"
 
 namespace gpu_search {
 
 static_assert(kCentroidRouteMaxLiveEntries ==
               format::kStorageCentroidRouteMaxLiveEntries);
+#ifdef DVSTOR_HAVE_GPUNETIO
+static_assert(sizeof(DirectRemoteRegion) ==
+              sizeof(gpu::GpuNetioRemoteMemoryRegion));
+static_assert(alignof(DirectRemoteRegion) ==
+              alignof(gpu::GpuNetioRemoteMemoryRegion));
+static_assert(offsetof(DirectRemoteRegion, address) ==
+              offsetof(gpu::GpuNetioRemoteMemoryRegion, address));
+static_assert(offsetof(DirectRemoteRegion, rkey) ==
+              offsetof(gpu::GpuNetioRemoteMemoryRegion, rkey));
+static_assert(offsetof(DirectRemoteRegion, bytes) ==
+              offsetof(gpu::GpuNetioRemoteMemoryRegion, bytes));
+#endif
 
 using namespace persistent_engine_detail;
 
@@ -17,8 +32,8 @@ namespace {
 static_assert(kPersistentMaxGraphDegree == kMaxSupportedGraphDegree);
 
 u64 read_index_build_fingerprint(const std::filesystem::path& index_prefix) {
-  const std::filesystem::path metadata_path{
-    index_prefix.string() + ".meta.json"};
+  const std::filesystem::path metadata_path{index_prefix.string() +
+                                            ".meta.json"};
   std::ifstream input(metadata_path);
   if (!input.good()) {
     throw std::runtime_error(
@@ -27,32 +42,122 @@ u64 read_index_build_fingerprint(const std::filesystem::path& index_prefix) {
   }
   nlohmann::json metadata;
   input >> metadata;
-  const u64 fingerprint =
-    metadata.value("index_build_fingerprint", u64{0});
+  const u64 fingerprint = metadata.value("index_build_fingerprint", u64{0});
   if (fingerprint == 0) {
     throw std::runtime_error(
-      "index metadata has no build fingerprint for graph extent validation: " +
+      "index metadata has no build fingerprint for "
+      "graph extent validation: " +
       metadata_path.string());
   }
   return fingerprint;
 }
 
 }  // namespace
-PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
-     configuration::IndexConfiguration& config_in,
-     Context& channel_context,
-     ClientConnectionManager& connection_manager,
-     const MemoryRegionTokens& remote_regions)
-    : engine(owner), config(config_in),
-      submissions(config.gpu_query_slots * 2,
-                  MappedRing<QueryDescriptor>::Direction::host_to_device),
-      completions(config.gpu_query_slots * 2,
-                  MappedRing<CompletionDescriptor>::Direction::device_to_host),
-      route_submissions(
-        8, MappedRing<CentroidRoutePublishDescriptor>::Direction::host_to_device),
-      route_completions(
-        8, MappedRing<CentroidRoutePublishCompletion>::Direction::device_to_host) {
+PersistentSearchEngine::Impl::Impl(
+    PersistentSearchEngine& owner,
+    configuration::IndexConfiguration& config_in)
+    : engine(owner), config(config_in) {}
+
+void PersistentSearchEngine::Impl::initialize(
+    Context& channel_context,
+    ClientConnectionManager& connection_manager,
+    const MemoryRegionTokens& remote_regions) {
+  if (initialization_complete) {
+    throw std::logic_error(
+      "persistent GPU engine was initialized more than once");
+  }
   bind_cuda_device("cudaSetDevice(GPU navigation construction)");
+  // Establish the CUDA/GPUDirect contract before allocating mapped rings or
+  // opening any QP. This keeps an unsupported selected GPU from failing after
+  // transport and index initialization have already done expensive work.
+  cudaDeviceProp properties{};
+  check_cuda(
+    cudaGetDeviceProperties(&properties, static_cast<int>(config.gpu_device)),
+    "cudaGetDeviceProperties(GPU navigation preflight)");
+  int gdr_supported = 0;
+  check_cuda(
+    cudaDeviceGetAttribute(&gdr_supported, cudaDevAttrGPUDirectRDMASupported,
+                           static_cast<int>(config.gpu_device)),
+    "cudaDeviceGetAttribute(GPUDirect RDMA support)");
+  if (properties.major < 8 || properties.warpSize != 32 ||
+      properties.canMapHostMemory == 0 || properties.unifiedAddressing == 0 ||
+      properties.deviceOverlap == 0 || properties.asyncEngineCount <= 0 ||
+      gdr_supported == 0 || properties.multiProcessorCount <= 0 ||
+      properties.maxThreadsPerBlock <
+        static_cast<int>(kPersistentThreadCandidates.front())) {
+    throw std::runtime_error(
+      "persistent GPUNetIO requires SM80+, warpSize=32, mapped host "
+      "memory, unified addressing, asynchronous copy overlap, GPUDirect "
+      "RDMA, and a 128-thread CTA; "
+      "device=" +
+      std::string(properties.name) + " cc=" + std::to_string(properties.major) +
+      "." + std::to_string(properties.minor) +
+      " warp=" + std::to_string(properties.warpSize) +
+      " mapped_host=" + std::to_string(properties.canMapHostMemory) +
+      " uva=" + std::to_string(properties.unifiedAddressing) +
+      " copy_overlap=" + std::to_string(properties.deviceOverlap) +
+      " async_engines=" + std::to_string(properties.asyncEngineCount) +
+      " gdr=" + std::to_string(gdr_supported) +
+      " max_threads=" + std::to_string(properties.maxThreadsPerBlock));
+  }
+  const bool decoupled_search_progression =
+    config.decoupled_gpu_rdma_search_progression_enabled();
+  if (decoupled_search_progression &&
+      config.gpu_graph_issue_width < config.gpu_graph_commit_width) {
+    throw std::logic_error(
+      "exact-frontier progression requires issue width >= commit width");
+  }
+  if (decoupled_search_progression) {
+    size_t device_stack_limit = 0;
+    check_cuda(cudaDeviceGetLimit(&device_stack_limit, cudaLimitStackSize),
+               "cudaDeviceGetLimit(cudaLimitStackSize preflight)");
+    const size_t requested_stack = config.gpu_device_stack_bytes;
+    if (device_stack_limit < requested_stack) {
+      check_cuda(cudaDeviceSetLimit(cudaLimitStackSize, requested_stack),
+                 "cudaDeviceSetLimit(cudaLimitStackSize preflight)");
+      check_cuda(cudaDeviceGetLimit(&device_stack_limit, cudaLimitStackSize),
+                 "cudaDeviceGetLimit(cudaLimitStackSize adjusted)");
+    }
+    if (device_stack_limit < requested_stack) {
+      throw std::runtime_error(
+        "CUDA did not honor the configured ASFE device stack floor");
+    }
+    std::cerr << "[gpu-search] ASFE device stack bytes/thread="
+              << device_stack_limit << " requested=" << requested_stack << "\n";
+  }
+  std::array<PersistentKernelOccupancy, 2> occupancies{};
+  std::array<u32, 2> hardware_blocks_per_sm{};
+  for (size_t candidate = 0; candidate < occupancies.size(); ++candidate) {
+    occupancies[candidate] = inspect_persistent_search_kernel(
+      kPersistentThreadCandidates[candidate], decoupled_search_progression);
+    hardware_blocks_per_sm[candidate] =
+      occupancies[candidate].active_blocks_per_sm;
+  }
+  if (hardware_blocks_per_sm[0] == 0 && hardware_blocks_per_sm[1] == 0) {
+    throw std::runtime_error(
+      "selected GPU cannot make either persistent CUDA kernel resident; "
+      "threads128_regs=" + std::to_string(occupancies[0].registers_per_thread) +
+      " threads128_shared=" +
+      std::to_string(occupancies[0].static_shared_bytes) +
+      " threads256_regs=" + std::to_string(occupancies[1].registers_per_thread) +
+      " threads256_shared=" +
+      std::to_string(occupancies[1].static_shared_bytes));
+  }
+  if (config.gpu_query_slots > std::numeric_limits<u32>::max() / 2u) {
+    throw std::invalid_argument("GPU query ring capacity overflows u32");
+  }
+  const u32 query_ring_capacity = config.gpu_query_slots * 2u;
+  submissions.initialize(
+    query_ring_capacity,
+    MappedRing<QueryDescriptor>::Direction::host_to_device);
+  completions.initialize(
+    query_ring_capacity,
+    MappedRing<CompletionDescriptor>::Direction::device_to_host);
+  route_submissions.initialize(
+    8, MappedRing<CentroidRoutePublishDescriptor>::Direction::host_to_device);
+  route_completions.initialize(
+    8,
+    MappedRing<CentroidRoutePublishCompletion>::Direction::device_to_host);
   route_poll_salt = connection_manager.client_id;
   if (connection_manager.num_total_clients == 0 ||
       route_poll_salt >= connection_manager.num_total_clients) {
@@ -61,18 +166,20 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   if (config.gpu_traversal_beam_width > kPersistentMaxBeam ||
       config.gpu_final_rerank_width > kPersistentMaxExact ||
       config.R > kPersistentMaxGraphDegree) {
-    throw std::invalid_argument("GPU navigation beam/exact/degree limit exceeded");
+    throw std::invalid_argument(
+      "GPU navigation beam/exact/degree limit exceeded");
   }
 
   std::string load_error;
-  if (!format::synthesize_distributed_view(
-        config.resolved_index_prefix(), index,
-        &load_error)) {
+  if (!format::synthesize_distributed_view(config.resolved_index_prefix(),
+                                           index, &load_error)) {
     throw std::runtime_error(load_error);
   }
-  std::cerr << "[gpu-search] synthesized navigation manifest in memory from metadata\n";
-  if (!pq::read_model(index_path::navigation_model_file(
-        config.resolved_index_prefix(), index.layout.pq_subquantizers),
+  std::cerr << "[gpu-search] synthesized navigation manifest in memory from "
+               "metadata\n";
+  if (!pq::read_model(
+        index_path::navigation_model_file(config.resolved_index_prefix(),
+                                          index.layout.pq_subquantizers),
         pq_model, &load_error)) {
     throw std::runtime_error(load_error);
   }
@@ -80,21 +187,24 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       index.layout.num_shards != remote_regions.size() ||
       index.layout.num_shards > kPersistentMaxShards ||
       index.layout.pq_subquantizers != pq_model.subquantizers ||
+      pq_model.dim != config.dim ||
       index.layout.pq_subquantizers > kPersistentMaxSubquantizers ||
       index.layout.pq_bits != pq_model.bits_per_code ||
       index.layout.code_bytes != pq_model.code_bytes() ||
       index.layout.model_checksum != pq_model.checksum() ||
       index.layout.graph_entry_bytes != VamanaNode::hot_graph_entry_size() ||
       index.layout.graph_shard_bits != VamanaNode::HOT_GRAPH_SHARD_BITS ||
-      index.layout.vector_dtype != static_cast<u32>(config.resolved_vector_dtype())) {
-    throw std::runtime_error("GPU navigation manifest does not match runtime metadata");
+      index.layout.vector_dtype !=
+        static_cast<u32>(config.resolved_vector_dtype())) {
+    throw std::runtime_error(
+      "GPU navigation manifest does not match runtime metadata");
   }
   const u32 graph_entry_capacity = VamanaNode::graph_entry_capacity();
   if (graph_entry_capacity < config.R ||
       index.layout.graph_entry_bytes <
         vamana::hot_graph::kTaggedNeighborBaseOffset +
           static_cast<u64>(graph_entry_capacity) *
-          vamana::hot_graph::kCompactPointerBytes) {
+            vamana::hot_graph::kCompactPointerBytes) {
     throw std::runtime_error(
       "GPU hot graph cannot contain stable and provisional backlink slots");
   }
@@ -109,9 +219,9 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   const std::filesystem::path graph_extent_path =
     index_path::graph_extent_file(config.resolved_index_prefix());
   if (live_extent_graph_reads) {
-    if (!format::read_graph_extent_sidecar(
-          graph_extent_path, graph_extent_header, graph_extent_classes,
-          &load_error)) {
+    if (!format::read_graph_extent_sidecar(graph_extent_path,
+                                           graph_extent_header,
+                                           graph_extent_classes, &load_error)) {
       throw std::runtime_error(
         "live-extent graph reads require a valid extent sidecar: " +
         load_error);
@@ -125,8 +235,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
         graph_extent_header.graph_entry_capacity != graph_entry_capacity ||
         graph_extent_header.graph_pointer_bytes !=
           index.layout.graph_pointer_bytes ||
-        graph_extent_header.build_fingerprint !=
-          expected_build_fingerprint ||
+        graph_extent_header.build_fingerprint != expected_build_fingerprint ||
         graph_extent_header.payload_bytes != index.layout.num_nodes ||
         graph_extent_classes.size() != index.layout.num_nodes) {
       throw std::runtime_error(
@@ -138,8 +247,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
               << " extent_quantum=" << format::kGraphExtentQuantum
               << " extent_source=" << graph_extent_path
               << " extent_classes=" << graph_extent_classes.size()
-              << " extent_payload_bytes=" << graph_extent_sidecar_bytes
-              << '\n';
+              << " extent_payload_bytes=" << graph_extent_sidecar_bytes << '\n';
   } else if (header_neighbor_graph_reads) {
     std::cerr << "[gpu-search] graph-read-policy=header-neighbor"
               << " header_bytes="
@@ -156,11 +264,13 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     graph_entry_capacity, config.gpu_traversal_beam_width);
   const u64 max_merge_candidates =
     static_cast<u64>(config.gpu_traversal_beam_width) +
-    static_cast<u64>(std::min(config.gpu_graph_commit_width,
-                              score_chunk_capacity)) * graph_entry_capacity;
+    static_cast<u64>(
+      std::min(config.gpu_graph_commit_width, score_chunk_capacity)) *
+      graph_entry_capacity;
   if (score_chunk_capacity == 0 ||
       max_merge_candidates > kPersistentMaxMergeCandidates) {
-    throw std::invalid_argument("GPU navigation prefetch/degree exceeds parallel top-k capacity");
+    throw std::invalid_argument(
+      "GPU navigation prefetch/degree exceeds parallel top-k capacity");
   }
 
   centroid_route_shard_capacity = static_cast<u32>(index.shards.size());
@@ -185,20 +295,47 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     }
   }
 
-  node_record_bytes = static_cast<u32>(VamanaNode::size_until_vector_end());
-  node_record_stride = exact_record_trailer_offset(node_record_bytes) +
-                       static_cast<u32>(sizeof(u64));
-  dynamic_code_record_bytes = VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
-                              code_bytes +
-                              VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES;
+  const u64 node_record_bytes_wide = VamanaNode::size_until_vector_end();
+  const u64 node_record_stride_wide =
+    align_up(node_record_bytes_wide, alignof(u64)) + sizeof(u64);
+  const u64 dynamic_code_record_bytes_wide =
+    static_cast<u64>(VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES) + code_bytes +
+    VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES;
+  const u64 dynamic_code_record_stride_wide =
+    align_up(dynamic_code_record_bytes_wide, alignof(u32));
+  if (node_record_stride_wide > std::numeric_limits<u32>::max() ||
+      dynamic_code_record_stride_wide > std::numeric_limits<u32>::max() ||
+      VamanaNode::offset_slot_incarnation() % alignof(u32) != 0 ||
+      (config.resolved_vector_dtype() == VectorDType::float32 &&
+       VamanaNode::offset_vector() % alignof(f32) != 0)) {
+    throw std::overflow_error(
+      "GPU exact/dynamic record layout is not representable or aligned");
+  }
+  node_record_bytes = static_cast<u32>(node_record_bytes_wide);
+  node_record_stride = static_cast<u32>(node_record_stride_wide);
+  dynamic_code_record_bytes =
+    static_cast<u32>(dynamic_code_record_bytes_wide);
+  dynamic_code_record_stride =
+    static_cast<u32>(dynamic_code_record_stride_wide);
   const u64 storage_region_bytes = static_cast<u64>(config.mn_memory_gb) << 30;
+  for (size_t shard = 0; shard < remote_regions.size(); ++shard) {
+    if (remote_regions[shard] == nullptr ||
+        !remote_regions[shard]->address_range_valid() ||
+        remote_regions[shard]->bytes < storage_region_bytes) {
+      throw std::runtime_error(
+        "storage node " + std::to_string(shard) +
+        " registered fewer RDMA bytes than --mn-memory-gb requires; rebuild "
+        "and restart every storage and compute binary from the same revision");
+    }
+  }
   const u64 centroid_publication_bytes =
     format::storage_centroid_route_publication_bytes(
       config.dim, format::CentroidScalarType::float32,
       format::kStorageCentroidRouteMaxLiveEntries);
   if (centroid_publication_bytes == 0 ||
       centroid_publication_bytes > storage_region_bytes) {
-    throw std::runtime_error("invalid storage tail reservation for dynamic PQ arena");
+    throw std::runtime_error(
+      "invalid storage tail reservation for dynamic PQ arena");
   }
   const u64 dynamic_allocation_limit =
     (storage_region_bytes - centroid_publication_bytes) & ~u64{63};
@@ -213,9 +350,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     const u64 slot_count =
       (dynamic_allocation_limit - shard.dynamic_base_offset) /
       shard.dynamic_record_bytes;
-    if (slot_count == 0 ||
-        dynamic_code_arena_capacity >
-          std::numeric_limits<u64>::max() - slot_count) {
+    if (slot_count == 0 || dynamic_code_arena_capacity >
+                             std::numeric_limits<u64>::max() - slot_count) {
       throw std::runtime_error("dynamic GPU PQ arena slot count overflows");
     }
     device_shards.push_back(DeviceShardRegion{
@@ -237,14 +373,19 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     });
     dynamic_code_arena_capacity += slot_count;
   }
-  const u64 engine_budget = static_cast<u64>(
-    config.gpu_memory_limit_gb - config.gpu_memory_reserve_gb) << 30;
+  const u64 engine_budget =
+    static_cast<u64>(config.gpu_memory_limit_gb - config.gpu_memory_reserve_gb)
+    << 30;
   size_t free_gpu_bytes = 0;
   size_t total_gpu_bytes = 0;
-  check_cuda(cudaMemGetInfo(&free_gpu_bytes, &total_gpu_bytes), "cudaMemGetInfo(GPU navigation budget)");
-  const u64 runtime_reserve = static_cast<u64>(config.gpu_memory_reserve_gb) << 30;
-  const u64 physically_available = free_gpu_bytes > runtime_reserve
-    ? static_cast<u64>(free_gpu_bytes) - runtime_reserve : 0;
+  check_cuda(cudaMemGetInfo(&free_gpu_bytes, &total_gpu_bytes),
+             "cudaMemGetInfo(GPU navigation budget)");
+  const u64 runtime_reserve = static_cast<u64>(config.gpu_memory_reserve_gb)
+                              << 30;
+  const u64 physically_available =
+    free_gpu_bytes > runtime_reserve
+      ? static_cast<u64>(free_gpu_bytes) - runtime_reserve
+      : 0;
   const u64 usable_budget = std::min(engine_budget, physically_available);
   const auto budget = memory_budget::estimate(memory_budget::Request{
     .nodes = index.layout.num_nodes,
@@ -261,89 +402,112 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   });
   if (!budget.fits) {
     throw std::runtime_error(
-      "GPU navigation allocations exceed the configured memory budget; codes=" +
-      std::to_string(budget.code_bytes) + " fixed=" +
-      std::to_string(budget.fixed_bytes));
+      "GPU navigation allocations exceed the configured "
+      "memory budget; codes=" +
+      std::to_string(budget.code_bytes) +
+      " fixed=" + std::to_string(budget.fixed_bytes));
   }
   visited_capacity = budget.visited_capacity;
-  const u64 dynamic_code_scratch_bytes =
-    static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates *
-      dynamic_code_record_bytes;
+  const u64 dynamic_code_scratch_bytes = static_cast<u64>(query_slots) *
+                                         kPersistentMaxMergeCandidates *
+                                         dynamic_code_record_stride;
   if (dynamic_code_arena_capacity >
       std::numeric_limits<u64>::max() / (sizeof(u32) + code_bytes)) {
     throw std::runtime_error("dynamic GPU PQ arena byte count overflows");
   }
   const u64 dynamic_code_arena_bytes =
     dynamic_code_arena_capacity * (sizeof(u32) + code_bytes);
-  const u64 dynamic_request_scratch_bytes =
-    static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates *
-    (sizeof(u32) + 2 * sizeof(u64));
-  const u64 navigation_candidate_bytes =
-    static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates *
-    (sizeof(u64) + sizeof(f32));
+  const u64 dynamic_request_scratch_bytes = static_cast<u64>(query_slots) *
+                                            kPersistentMaxMergeCandidates *
+                                            (sizeof(u32) + 2 * sizeof(u64));
+  const u64 navigation_candidate_bytes = static_cast<u64>(query_slots) *
+                                         kPersistentMaxMergeCandidates *
+                                         (sizeof(u64) + sizeof(f32));
   const u64 estimated_direct_queue_count =
     static_cast<u64>(config.gpu_rdma_qps) * index.shards.size();
-  const u64 query_dispatch_bytes = 2 * sizeof(u64) +
-    static_cast<u64>(query_dispatch_capacity) *
-      (sizeof(u64) + sizeof(QueryDescriptor));
+  if (estimated_direct_queue_count == 0 ||
+      estimated_direct_queue_count > std::numeric_limits<u32>::max()) {
+    throw std::runtime_error("GPU owner queue count cannot be represented");
+  }
+
+  gpu_clock_khz = static_cast<u64>(std::max(1, properties.clockRate));
+  persistent_grid_plan = plan_persistent_grid(
+    hardware_blocks_per_sm, config.gpu_persistent_blocks_per_sm,
+    static_cast<u32>(properties.multiProcessorCount), query_slots,
+    static_cast<u32>(estimated_direct_queue_count));
+  kernel_threads = persistent_grid_plan.selected.threads;
+  owner_kernel_blocks = persistent_grid_plan.selected.owner_blocks;
+  kernel_blocks = persistent_grid_plan.selected.query_blocks;
+  const size_t selected_occupancy =
+    kernel_threads == kPersistentThreadCandidates[0] ? 0 : 1;
+  persistent_kernel_occupancy = occupancies[selected_occupancy];
+  std::cerr << "[gpu-search] device=" << properties.name
+            << " cc=" << properties.major << "." << properties.minor
+            << " sm_count=" << properties.multiProcessorCount
+            << " global_memory=" << total_gpu_bytes
+            << " gpudirect_rdma=" << gdr_supported << "\n";
+  const u64 query_dispatch_bytes =
+    2 * sizeof(u64) + static_cast<u64>(query_dispatch_capacity) *
+                        (sizeof(u64) + sizeof(QueryDescriptor));
   const bool rdma_trace_enabled = config.query_rdma_trace_mode != "off";
-  const u64 direct_queue_bytes = estimated_direct_queue_count *
-    (2 * (2 * sizeof(u64) +
-          sizeof(DeviceRingView<DirectBatchDescriptor>) +
-          static_cast<u64>(kDirectBatchQueueCapacity) *
-            (sizeof(u64) + sizeof(DirectBatchDescriptor))) +
-     sizeof(DirectOwnerProgress)) +
+  const u64 direct_queue_bytes =
+    estimated_direct_queue_count *
+      (2 * (2 * sizeof(u64) + sizeof(DeviceRingView<DirectBatchDescriptor>) +
+            static_cast<u64>(kDirectBatchQueueCapacity) *
+              (sizeof(u64) + sizeof(DirectBatchDescriptor))) +
+       sizeof(DirectOwnerProgress)) +
     static_cast<u64>(query_slots) * index.shards.size() *
       (3 * sizeof(i32) + 2 * sizeof(u64) +
        (rdma_trace_enabled ? sizeof(u64) : 0));
-  const u64 rdma_trace_bytes = rdma_trace_enabled
-    ? static_cast<u64>(query_slots) *
-        (sizeof(QueryRdmaTraceHeader) +
-         static_cast<u64>(config.query_rdma_trace_events_per_query) *
-           sizeof(QueryRdmaTraceEvent))
-    : 0;
+  const u64 rdma_trace_bytes =
+    rdma_trace_enabled
+      ? static_cast<u64>(query_slots) *
+          (sizeof(QueryRdmaTraceHeader) +
+           static_cast<u64>(config.query_rdma_trace_events_per_query) *
+             sizeof(QueryRdmaTraceEvent))
+      : 0;
   const u64 graph_scratch_bytes = static_cast<u64>(query_slots) *
-    kPersistentGraphScratchSlots * kPersistentGraphReadBytes;
-  const u64 graph_request_metadata_bytes = variable_graph_reads
-    ? static_cast<u64>(query_slots) * kPersistentMaxPrefetch * sizeof(u32)
-    : 0;
+                                  kPersistentGraphScratchSlots *
+                                  kPersistentGraphReadBytes;
+  const u64 graph_request_metadata_bytes =
+    variable_graph_reads
+      ? static_cast<u64>(query_slots) * kPersistentMaxPrefetch * sizeof(u32)
+      : 0;
   const u64 speculative_graph_request_metadata_bytes =
     static_cast<u64>(query_slots) * kPersistentFrontierRobCapacity *
-      (sizeof(u32) + 3 * sizeof(u64) + sizeof(u8) +
-       (variable_graph_reads ? sizeof(u32) : 0));
+    (sizeof(u32) + 3 * sizeof(u64) + sizeof(u8) +
+     (variable_graph_reads ? sizeof(u32) : 0));
   // The sidecar remains exactly one byte per base node on disk. Round only
   // the device allocation to a u32 word so the last real byte can be repaired
   // with an in-bounds packed CAS.
-  const u64 graph_extent_device_bytes = live_extent_graph_reads
-    ? align_up(graph_extent_sidecar_bytes, sizeof(u32))
-    : 0;
+  const u64 graph_extent_device_bytes =
+    live_extent_graph_reads ? align_up(graph_extent_sidecar_bytes, sizeof(u32))
+                            : 0;
   const u64 centroid_route_bytes =
     static_cast<u64>(centroid_route_shard_capacity) *
       sizeof(DeviceCentroidRouteShard) +
     static_cast<u64>(centroid_route_shard_capacity) *
       centroid_route_entry_capacity * sizeof(DeviceCentroidRouteEntry) +
     sizeof(u64);
-  const u64 shard_centroid_bytes = static_cast<u64>(index.shards.size()) *
-    config.dim * sizeof(f32);
-  route_graph_bytes = centroid_route_bytes +
-    shard_centroid_bytes;
+  const u64 shard_centroid_bytes =
+    static_cast<u64>(index.shards.size()) * config.dim * sizeof(f32);
+  route_graph_bytes = centroid_route_bytes + shard_centroid_bytes;
   const u64 additional_scratch_bytes =
     dynamic_code_scratch_bytes + dynamic_code_arena_bytes +
-    dynamic_request_scratch_bytes +
-    navigation_candidate_bytes +
+    dynamic_request_scratch_bytes + navigation_candidate_bytes +
     query_dispatch_bytes + direct_queue_bytes + graph_scratch_bytes +
-    route_graph_bytes + rdma_trace_bytes +
-    graph_request_metadata_bytes +
+    route_graph_bytes + rdma_trace_bytes + graph_request_metadata_bytes +
     speculative_graph_request_metadata_bytes + graph_extent_device_bytes;
   if (additional_scratch_bytes > usable_budget - budget.explicit_bytes) {
     throw std::runtime_error(
-      "GPU navigation dynamic-code scratch exceeds the configured memory budget");
+      "GPU navigation dynamic-code scratch exceeds the "
+      "configured memory budget");
   }
   explicit_gpu_bytes = budget.explicit_bytes + additional_scratch_bytes;
-  engine.telemetry_.gpu_memory_explicit_bytes.store(
-    explicit_gpu_bytes, std::memory_order_relaxed);
-  engine.telemetry_.gpu_memory_base_pq_bytes.store(
-    budget.code_bytes, std::memory_order_relaxed);
+  engine.telemetry_.gpu_memory_explicit_bytes.store(explicit_gpu_bytes,
+                                                    std::memory_order_relaxed);
+  engine.telemetry_.gpu_memory_base_pq_bytes.store(budget.code_bytes,
+                                                   std::memory_order_relaxed);
   engine.telemetry_.dynamic_code_cache_capacity.store(
     dynamic_code_arena_capacity, std::memory_order_relaxed);
   engine.telemetry_.gpu_memory_route_graph_bytes.store(
@@ -365,30 +529,30 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
             << " query_rdma_trace=" << rdma_trace_bytes
             << " centroid_route=" << centroid_route_bytes
             << " shard_centroids=" << shard_centroid_bytes
-            << " explicit=" << explicit_gpu_bytes
-            << " limit=" << engine_budget << " bytes\n";
+            << " explicit=" << explicit_gpu_bytes << " limit=" << engine_budget
+            << " bytes\n";
 
   const size_t code_region_bytes = static_cast<size_t>(base_code_region_bytes);
-  dynamic_code_region_offset = static_cast<size_t>(align_up(
-    code_region_bytes, 256));
-  exact_region_offset = static_cast<size_t>(align_up(
-    dynamic_code_region_offset + dynamic_code_scratch_bytes, 256));
-  graph_scratch_offset = static_cast<size_t>(align_up(
-    exact_region_offset + exact_bytes, 512));
+  dynamic_code_region_offset =
+    static_cast<size_t>(align_up(code_region_bytes, 256));
+  exact_region_offset = static_cast<size_t>(
+    align_up(dynamic_code_region_offset + dynamic_code_scratch_bytes, 256));
+  graph_scratch_offset =
+    static_cast<size_t>(align_up(exact_region_offset + exact_bytes, 512));
   control_region_offset = static_cast<size_t>(
     align_up(graph_scratch_offset + graph_scratch_bytes, 256));
   const size_t control_snapshot_bytes =
     index.shards.size() * sizeof(format::StorageControlBlock);
-  const size_t maintenance_snapshot_offset = static_cast<size_t>(align_up(
-    control_snapshot_bytes, alignof(maintenance_telemetry::Snapshot)));
+  const size_t maintenance_snapshot_offset = static_cast<size_t>(
+    align_up(control_snapshot_bytes, alignof(maintenance_telemetry::Snapshot)));
   const size_t maintenance_snapshot_bytes =
     index.shards.size() * sizeof(maintenance_telemetry::Snapshot);
   const size_t maintenance_sequence_after_offset = static_cast<size_t>(align_up(
     maintenance_snapshot_offset + maintenance_snapshot_bytes, alignof(u64)));
   const size_t maintenance_sequence_after_bytes =
     index.shards.size() * sizeof(u64);
-  storage_route_snapshot_stride = static_cast<size_t>(
-    format::storage_centroid_route_publication_bytes(
+  storage_route_snapshot_stride =
+    static_cast<size_t>(format::storage_centroid_route_publication_bytes(
       config.dim, format::CentroidScalarType::float32,
       centroid_route_entry_capacity));
   if (storage_route_snapshot_stride == 0) {
@@ -396,22 +560,26 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   }
   if (index.shards.size() >
       std::numeric_limits<size_t>::max() / storage_route_snapshot_stride) {
-    throw std::runtime_error("centroid route snapshot allocation overflows size_t");
+    throw std::runtime_error(
+      "centroid route snapshot allocation overflows size_t");
   }
   const size_t route_snapshot_offset = static_cast<size_t>(align_up(
     maintenance_sequence_after_offset + maintenance_sequence_after_bytes, 64));
   const size_t route_snapshot_bytes =
     index.shards.size() * storage_route_snapshot_stride;
-  const size_t route_sequence_after_offset = static_cast<size_t>(align_up(
-    route_snapshot_offset + route_snapshot_bytes, alignof(u64)));
-  const size_t control_region_bytes = route_sequence_after_offset +
-    index.shards.size() * sizeof(u64);
-  const size_t remote_buffer_bytes = control_region_offset + control_region_bytes;
+  const size_t route_sequence_after_offset = static_cast<size_t>(
+    align_up(route_snapshot_offset + route_snapshot_bytes, alignof(u64)));
+  const size_t control_region_bytes =
+    route_sequence_after_offset + index.shards.size() * sizeof(u64);
+  const size_t remote_buffer_bytes =
+    control_region_offset + control_region_bytes;
 #ifdef DVSTOR_HAVE_GPUNETIO
   direct_transport = std::make_unique<gpu::GpuNetioPersistentTransport>(
-    config, remote_buffer_bytes, channel_context, connection_manager, remote_regions);
+    config, remote_buffer_bytes, channel_context, connection_manager,
+    remote_regions);
   direct_view = direct_transport->view();
-  if (direct_view.data == nullptr || direct_view.data_bytes < remote_buffer_bytes) {
+  if (direct_view.data == nullptr ||
+      direct_view.data_bytes < remote_buffer_bytes) {
     throw std::runtime_error("GPUNetIO returned an undersized GPU data region");
   }
   d_remote_buffer = direct_view.data;
@@ -425,12 +593,11 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   d_graph_scratch = d_remote_buffer + graph_scratch_offset;
   d_control_snapshots = reinterpret_cast<format::StorageControlBlock*>(
     d_remote_buffer + control_region_offset);
-  d_maintenance_snapshots =
-    reinterpret_cast<maintenance_telemetry::Snapshot*>(
-      d_remote_buffer + control_region_offset + maintenance_snapshot_offset);
-  d_maintenance_sequence_after = reinterpret_cast<u64*>(
-    d_remote_buffer + control_region_offset +
-      maintenance_sequence_after_offset);
+  d_maintenance_snapshots = reinterpret_cast<maintenance_telemetry::Snapshot*>(
+    d_remote_buffer + control_region_offset + maintenance_snapshot_offset);
+  d_maintenance_sequence_after =
+    reinterpret_cast<u64*>(d_remote_buffer + control_region_offset +
+                           maintenance_sequence_after_offset);
   d_storage_route_snapshots =
     d_remote_buffer + control_region_offset + route_snapshot_offset;
   d_storage_route_sequence_after = reinterpret_cast<u64*>(
@@ -448,42 +615,46 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   (void)read_storage_centroid_route_publications();
   stream_codes_to_gpu(*control_bootstrapper);
 
-  device_allocate(d_shards, index.shards.size(), "cudaMalloc(GPU navigation shards)");
+  device_allocate(d_shards, index.shards.size(),
+                  "cudaMalloc(GPU navigation shards)");
   if (live_extent_graph_reads) {
     device_allocate(
       d_graph_extent_class_words,
       static_cast<size_t>(graph_extent_device_bytes / sizeof(u32)),
       "cudaMalloc(static graph extent class words)");
-    check_cuda(cudaMemset(
-                 d_graph_extent_class_words, 0,
-                 static_cast<size_t>(graph_extent_device_bytes)),
+    check_cuda(cudaMemset(d_graph_extent_class_words, 0,
+                          static_cast<size_t>(graph_extent_device_bytes)),
                "cudaMemset(static graph extent class words)");
-    check_cuda(cudaMemcpy(
-                 d_graph_extent_class_words, graph_extent_classes.data(),
+    check_cuda(
+      cudaMemcpy(d_graph_extent_class_words, graph_extent_classes.data(),
                  graph_extent_classes.size() * sizeof(u8),
                  cudaMemcpyHostToDevice),
-               "cudaMemcpy(static graph extent class words)");
+      "cudaMemcpy(static graph extent class words)");
   }
-  device_allocate(d_opq_matrix, pq_model.rotation.size(), "cudaMalloc(OPQ matrix)");
-  device_allocate(d_pq_centroids, pq_model.centroids.size(), "cudaMalloc(PQ centroids)");
+  device_allocate(d_opq_matrix, pq_model.rotation.size(),
+                  "cudaMalloc(OPQ matrix)");
+  device_allocate(d_pq_centroids, pq_model.centroids.size(),
+                  "cudaMalloc(PQ centroids)");
   device_allocate(d_shard_centroids,
                   static_cast<size_t>(index.shards.size()) * config.dim,
                   "cudaMalloc(shard route centroids)");
   check_cuda(cudaMemcpy(d_shards, device_shards.data(),
                         device_shards.size() * sizeof(DeviceShardRegion),
-                        cudaMemcpyHostToDevice), "cudaMemcpy(GPU navigation shards)");
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy(GPU navigation shards)");
   if (!pq_model.rotation.empty()) {
     check_cuda(cudaMemcpy(d_opq_matrix, pq_model.rotation.data(),
                           pq_model.rotation.size() * sizeof(f32),
-                          cudaMemcpyHostToDevice), "cudaMemcpy(OPQ matrix)");
+                          cudaMemcpyHostToDevice),
+               "cudaMemcpy(OPQ matrix)");
   }
-  check_cuda(cudaMemcpy(d_pq_centroids, pq_model.centroids.data(),
-                        pq_model.centroids.size() * sizeof(f32),
-                        cudaMemcpyHostToDevice), "cudaMemcpy(PQ centroids)");
-  check_cuda(cudaMemset(
-               d_shard_centroids, 0,
-               static_cast<size_t>(index.shards.size()) * config.dim *
-                 sizeof(f32)),
+  check_cuda(
+    cudaMemcpy(d_pq_centroids, pq_model.centroids.data(),
+               pq_model.centroids.size() * sizeof(f32), cudaMemcpyHostToDevice),
+    "cudaMemcpy(PQ centroids)");
+  check_cuda(cudaMemset(d_shard_centroids, 0,
+                        static_cast<size_t>(index.shards.size()) * config.dim *
+                          sizeof(f32)),
              "cudaMemset(shard route centroids)");
   query_input_stride = static_cast<size_t>(config.dim) * sizeof(f32);
   device_allocate(d_queries, static_cast<size_t>(query_slots) * config.dim,
@@ -491,18 +662,23 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   mapped_host_allocate(query_input_host, d_query_input,
                        static_cast<size_t>(query_slots) * query_input_stride,
                        "cudaHostAlloc(GPU navigation query input)");
-  device_allocate(d_transformed_queries, static_cast<size_t>(query_slots) * config.dim,
+  device_allocate(d_transformed_queries,
+                  static_cast<size_t>(query_slots) * config.dim,
                   "cudaMalloc(GPU transformed queries)");
-  device_allocate(d_query_luts,
-                  static_cast<size_t>(query_slots) * pq_model.subquantizers * 256,
-                  "cudaMalloc(GPU PQ query LUTs)");
-  device_allocate(d_navigation_candidate_handles,
-                  static_cast<size_t>(query_slots) * kPersistentMaxMergeCandidates,
-                  "cudaMalloc(GPU navigation candidate handles)");
-  device_allocate(d_navigation_candidate_distances,
-                  static_cast<size_t>(query_slots) * kPersistentMaxMergeCandidates,
-                  "cudaMalloc(GPU navigation candidate distances)");
-  device_allocate(d_visited, static_cast<size_t>(query_slots) * visited_capacity,
+  device_allocate(
+    d_query_luts,
+    static_cast<size_t>(query_slots) * pq_model.subquantizers * 256,
+    "cudaMalloc(GPU PQ query LUTs)");
+  device_allocate(
+    d_navigation_candidate_handles,
+    static_cast<size_t>(query_slots) * kPersistentMaxMergeCandidates,
+    "cudaMalloc(GPU navigation candidate handles)");
+  device_allocate(
+    d_navigation_candidate_distances,
+    static_cast<size_t>(query_slots) * kPersistentMaxMergeCandidates,
+    "cudaMalloc(GPU navigation candidate distances)");
+  device_allocate(d_visited,
+                  static_cast<size_t>(query_slots) * visited_capacity,
                   "cudaMalloc(GPU navigation visited)");
   const size_t dynamic_request_elements =
     static_cast<size_t>(query_slots) * kPersistentMaxMergeCandidates;
@@ -529,25 +705,22 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   device_allocate(d_speculative_graph_validation_states,
                   speculative_graph_request_elements,
                   "cudaMalloc(speculative graph validation states)");
-  check_cuda(cudaMemset(
-               d_speculative_graph_validation_states, 0,
-               speculative_graph_request_elements * sizeof(u8)),
+  check_cuda(cudaMemset(d_speculative_graph_validation_states, 0,
+                        speculative_graph_request_elements * sizeof(u8)),
              "cudaMemset(speculative graph validation states)");
   if (variable_graph_reads) {
     const size_t graph_request_elements =
       static_cast<size_t>(query_slots) * kPersistentMaxPrefetch;
     device_allocate(d_graph_request_bytes, graph_request_elements,
                     "cudaMalloc(graph request byte lengths)");
-    check_cuda(cudaMemset(
-                 d_graph_request_bytes, 0,
-                 graph_request_elements * sizeof(u32)),
+    check_cuda(cudaMemset(d_graph_request_bytes, 0,
+                          graph_request_elements * sizeof(u32)),
                "cudaMemset(graph request byte lengths)");
     device_allocate(d_speculative_graph_request_bytes,
                     speculative_graph_request_elements,
                     "cudaMalloc(speculative graph request byte lengths)");
-    check_cuda(cudaMemset(
-                 d_speculative_graph_request_bytes, 0,
-                 speculative_graph_request_elements * sizeof(u32)),
+    check_cuda(cudaMemset(d_speculative_graph_request_bytes, 0,
+                          speculative_graph_request_elements * sizeof(u32)),
                "cudaMemset(speculative graph request byte lengths)");
   }
   if (dynamic_code_arena_capacity >
@@ -581,16 +754,18 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   for (u32 slot = 0; slot < query_dispatch_capacity; ++slot) {
     query_dispatch_sequences[slot] = slot;
   }
-  check_cuda(cudaMemcpy(d_query_dispatch_sequences,
-                        query_dispatch_sequences.data(),
-                        query_dispatch_sequences.size() * sizeof(u64),
-                        cudaMemcpyHostToDevice),
-             "cudaMemcpy(GPU query dispatch sequences)");
+  check_cuda(
+    cudaMemcpy(d_query_dispatch_sequences, query_dispatch_sequences.data(),
+               query_dispatch_sequences.size() * sizeof(u64),
+               cudaMemcpyHostToDevice),
+    "cudaMemcpy(GPU query dispatch sequences)");
 
-  direct_batch_queue_count = direct_view.qps_per_node * direct_view.remote_region_count;
+  direct_batch_queue_count =
+    direct_view.qps_per_node * direct_view.remote_region_count;
   if (direct_batch_queue_count == 0 ||
       direct_batch_queue_count != estimated_direct_queue_count) {
-    throw std::runtime_error("GPUNetIO QP count does not match the GPU owner queues");
+    throw std::runtime_error(
+      "GPUNetIO QP count does not match the GPU owner queues");
   }
   const size_t direct_queue_slots =
     static_cast<size_t>(direct_batch_queue_count) * kDirectBatchQueueCapacity;
@@ -604,18 +779,15 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                   "cudaMalloc(GPUNetIO owner queue entries)");
   device_allocate(d_direct_batch_queues, direct_batch_queue_count,
                   "cudaMalloc(GPUNetIO owner queue views)");
-  device_allocate(d_direct_speculative_batch_enqueue,
-                  direct_batch_queue_count,
+  device_allocate(d_direct_speculative_batch_enqueue, direct_batch_queue_count,
                   "cudaMalloc(GPUNetIO speculative enqueue positions)");
-  device_allocate(d_direct_speculative_batch_dequeue,
-                  direct_batch_queue_count,
+  device_allocate(d_direct_speculative_batch_dequeue, direct_batch_queue_count,
                   "cudaMalloc(GPUNetIO speculative dequeue positions)");
   device_allocate(d_direct_speculative_batch_sequences, direct_queue_slots,
                   "cudaMalloc(GPUNetIO speculative queue sequences)");
   device_allocate(d_direct_speculative_batch_entries, direct_queue_slots,
                   "cudaMalloc(GPUNetIO speculative queue entries)");
-  device_allocate(d_direct_speculative_batch_queues,
-                  direct_batch_queue_count,
+  device_allocate(d_direct_speculative_batch_queues, direct_batch_queue_count,
                   "cudaMalloc(GPUNetIO speculative queue views)");
   device_allocate(d_direct_batch_statuses,
                   static_cast<size_t>(query_slots) * index.shards.size(),
@@ -638,15 +810,13 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                     "cudaMalloc(GPUNetIO owner completion timestamps)");
     device_allocate(d_query_rdma_trace_headers, query_slots,
                     "cudaMalloc(query RDMA trace headers)");
-    device_allocate(
-      d_query_rdma_trace_events,
-      static_cast<size_t>(query_slots) *
-        config.query_rdma_trace_events_per_query,
-      "cudaMalloc(query RDMA trace events)");
-    check_cuda(cudaMemset(
-                 d_query_rdma_trace_headers, 0,
-                 static_cast<size_t>(query_slots) *
-                   sizeof(QueryRdmaTraceHeader)),
+    device_allocate(d_query_rdma_trace_events,
+                    static_cast<size_t>(query_slots) *
+                      config.query_rdma_trace_events_per_query,
+                    "cudaMalloc(query RDMA trace events)");
+    check_cuda(cudaMemset(d_query_rdma_trace_headers, 0,
+                          static_cast<size_t>(query_slots) *
+                            sizeof(QueryRdmaTraceHeader)),
                "cudaMemset(query RDMA trace headers)");
     const std::filesystem::path output(config.query_rdma_trace_output);
     if (output.has_parent_path()) {
@@ -654,50 +824,53 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     }
     query_rdma_trace_stream.open(output, std::ios::out | std::ios::trunc);
     if (!query_rdma_trace_stream) {
-      throw std::runtime_error(
-        "failed to open query RDMA trace output: " + output.string());
+      throw std::runtime_error("failed to open query RDMA trace output: " +
+                               output.string());
     }
   }
   mapped_host_allocate(direct_owner_phases_host, d_direct_owner_phases,
                        direct_batch_queue_count,
                        "cudaHostAlloc(GPUNetIO owner runtime phases)");
-  check_cuda(cudaHostAlloc(
-               reinterpret_cast<void**>(&direct_owner_progress_host),
-               static_cast<size_t>(direct_batch_queue_count) *
-                 sizeof(DirectOwnerProgress),
-               cudaHostAllocPortable),
-             "cudaHostAlloc(GPUNetIO owner watchdog staging)");
+  check_cuda(
+    cudaHostAlloc(reinterpret_cast<void**>(&direct_owner_progress_host),
+                  static_cast<size_t>(direct_batch_queue_count) *
+                    sizeof(DirectOwnerProgress),
+                  cudaHostAllocPortable),
+    "cudaHostAlloc(GPUNetIO owner watchdog staging)");
   device_allocate(d_direct_owner_progress, direct_batch_queue_count,
                   "cudaMalloc(GPUNetIO owner watchdog progress)");
-  check_cuda(cudaMemset(d_direct_batch_enqueue, 0,
-                        static_cast<size_t>(direct_batch_queue_count) * sizeof(u64)),
-             "cudaMemset(GPUNetIO owner enqueue positions)");
-  check_cuda(cudaMemset(d_direct_batch_dequeue, 0,
-                        static_cast<size_t>(direct_batch_queue_count) * sizeof(u64)),
-             "cudaMemset(GPUNetIO owner dequeue positions)");
-  check_cuda(cudaMemset(
-               d_direct_speculative_batch_enqueue, 0,
+  check_cuda(
+    cudaMemset(d_direct_batch_enqueue, 0,
                static_cast<size_t>(direct_batch_queue_count) * sizeof(u64)),
-             "cudaMemset(GPUNetIO speculative enqueue positions)");
-  check_cuda(cudaMemset(
-               d_direct_speculative_batch_dequeue, 0,
+    "cudaMemset(GPUNetIO owner enqueue positions)");
+  check_cuda(
+    cudaMemset(d_direct_batch_dequeue, 0,
                static_cast<size_t>(direct_batch_queue_count) * sizeof(u64)),
-             "cudaMemset(GPUNetIO speculative dequeue positions)");
+    "cudaMemset(GPUNetIO owner dequeue positions)");
+  check_cuda(
+    cudaMemset(d_direct_speculative_batch_enqueue, 0,
+               static_cast<size_t>(direct_batch_queue_count) * sizeof(u64)),
+    "cudaMemset(GPUNetIO speculative enqueue positions)");
+  check_cuda(
+    cudaMemset(d_direct_speculative_batch_dequeue, 0,
+               static_cast<size_t>(direct_batch_queue_count) * sizeof(u64)),
+    "cudaMemset(GPUNetIO speculative dequeue positions)");
   std::vector<u64> direct_sequences(direct_queue_slots);
   std::vector<DeviceRingView<DirectBatchDescriptor>> direct_queues(
     direct_batch_queue_count);
   std::vector<DeviceRingView<DirectBatchDescriptor>> speculative_queues(
     direct_batch_queue_count);
   for (u32 queue = 0; queue < direct_batch_queue_count; ++queue) {
-    const size_t queue_base = static_cast<size_t>(queue) * kDirectBatchQueueCapacity;
+    const size_t queue_base =
+      static_cast<size_t>(queue) * kDirectBatchQueueCapacity;
     for (u32 slot = 0; slot < kDirectBatchQueueCapacity; ++slot) {
       direct_sequences[queue_base + slot] = slot;
     }
     direct_queues[queue] = {
-      .enqueue_position = reinterpret_cast<unsigned long long*>(
-        d_direct_batch_enqueue + queue),
-      .dequeue_position = reinterpret_cast<unsigned long long*>(
-        d_direct_batch_dequeue + queue),
+      .enqueue_position =
+        reinterpret_cast<unsigned long long*>(d_direct_batch_enqueue + queue),
+      .dequeue_position =
+        reinterpret_cast<unsigned long long*>(d_direct_batch_dequeue + queue),
       .sequences = reinterpret_cast<unsigned long long*>(
         d_direct_batch_sequences + queue_base),
       .entries = d_direct_batch_entries + queue_base,
@@ -716,38 +889,35 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       .mask = kDirectBatchQueueCapacity - 1,
     };
   }
-  check_cuda(cudaMemcpy(d_direct_batch_sequences, direct_sequences.data(),
-                        direct_sequences.size() * sizeof(u64), cudaMemcpyHostToDevice),
-             "cudaMemcpy(GPUNetIO owner queue sequences)");
+  check_cuda(
+    cudaMemcpy(d_direct_batch_sequences, direct_sequences.data(),
+               direct_sequences.size() * sizeof(u64), cudaMemcpyHostToDevice),
+    "cudaMemcpy(GPUNetIO owner queue sequences)");
   check_cuda(cudaMemcpy(d_direct_batch_queues, direct_queues.data(),
                         direct_queues.size() *
                           sizeof(DeviceRingView<DirectBatchDescriptor>),
                         cudaMemcpyHostToDevice),
              "cudaMemcpy(GPUNetIO owner queue views)");
-  check_cuda(cudaMemcpy(
-               d_direct_speculative_batch_sequences,
-               direct_sequences.data(),
-               direct_sequences.size() * sizeof(u64),
-               cudaMemcpyHostToDevice),
-             "cudaMemcpy(GPUNetIO speculative queue sequences)");
-  check_cuda(cudaMemcpy(
-               d_direct_speculative_batch_queues,
-               speculative_queues.data(),
-               speculative_queues.size() *
-                 sizeof(DeviceRingView<DirectBatchDescriptor>),
-               cudaMemcpyHostToDevice),
-             "cudaMemcpy(GPUNetIO speculative queue views)");
+  check_cuda(
+    cudaMemcpy(d_direct_speculative_batch_sequences, direct_sequences.data(),
+               direct_sequences.size() * sizeof(u64), cudaMemcpyHostToDevice),
+    "cudaMemcpy(GPUNetIO speculative queue sequences)");
+  check_cuda(
+    cudaMemcpy(
+      d_direct_speculative_batch_queues, speculative_queues.data(),
+      speculative_queues.size() * sizeof(DeviceRingView<DirectBatchDescriptor>),
+      cudaMemcpyHostToDevice),
+    "cudaMemcpy(GPUNetIO speculative queue views)");
 
-  mapped_host_allocate(centroid_route_updates_host,
-                       d_centroid_route_updates,
+  mapped_host_allocate(centroid_route_updates_host, d_centroid_route_updates,
                        centroid_route_shard_capacity,
                        "cudaHostAlloc(centroid route metadata staging)");
-  mapped_host_allocate(centroid_route_centroid_updates_host,
-                       d_centroid_route_centroid_updates,
-                       static_cast<size_t>(centroid_route_shard_capacity) *
-                         config.dim,
-                       "cudaHostAlloc(centroid route vector staging)");
-  const size_t result_elements = static_cast<size_t>(query_slots) * result_capacity;
+  mapped_host_allocate(
+    centroid_route_centroid_updates_host, d_centroid_route_centroid_updates,
+    static_cast<size_t>(centroid_route_shard_capacity) * config.dim,
+    "cudaHostAlloc(centroid route vector staging)");
+  const size_t result_elements =
+    static_cast<size_t>(query_slots) * result_capacity;
   check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&result_ids_host),
                            result_elements * sizeof(u32),
                            cudaHostAllocMapped | cudaHostAllocPortable),
@@ -759,9 +929,10 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                            result_elements * sizeof(f32),
                            cudaHostAllocMapped | cudaHostAllocPortable),
              "cudaHostAlloc(GPU navigation result distances)");
-  check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_result_distances),
-                                      result_distances_host, 0),
-             "cudaHostGetDevicePointer(GPU navigation result distances)");
+  check_cuda(
+    cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_result_distances),
+                             result_distances_host, 0),
+    "cudaHostGetDevicePointer(GPU navigation result distances)");
 
   device_allocate(d_centroid_route_shards, centroid_route_shard_capacity,
                   "cudaMalloc(centroid route shard headers)");
@@ -789,16 +960,16 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   device_allocate(stop_device, 1, "cudaMalloc(GPU navigation stop)");
   check_cuda(cudaMemset(stop_device, 0, sizeof(u32)),
              "cudaMemset(GPU navigation stop)");
-  check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&direct_disabled_host), sizeof(u32),
-                           cudaHostAllocPortable),
+  check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&direct_disabled_host),
+                           sizeof(u32), cudaHostAllocPortable),
              "cudaHostAlloc(GPU navigation direct failure staging)");
   *direct_disabled_host = 0;
   device_allocate(direct_disabled_device, 1,
                   "cudaMalloc(GPU navigation direct failure flag)");
   check_cuda(cudaMemset(direct_disabled_device, 0, sizeof(u32)),
              "cudaMemset(GPU navigation direct failure flag)");
-  check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&direct_error_host), sizeof(i32),
-                           cudaHostAllocPortable),
+  check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&direct_error_host),
+                           sizeof(i32), cudaHostAllocPortable),
              "cudaHostAlloc(GPU navigation direct error staging)");
   *direct_error_host = 0;
   device_allocate(direct_error_device, 1,
@@ -807,9 +978,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
              "cudaMemset(GPU navigation direct error)");
   mapped_host_allocate(query_kernel_ready_host, d_query_kernel_ready, 1,
                        "cudaHostAlloc(GPU query kernel readiness)");
-  mapped_host_allocate(dispatcher_kernel_ready_host,
-                       d_dispatcher_kernel_ready, 1,
-                       "cudaHostAlloc(GPU dispatcher kernel readiness)");
+  mapped_host_allocate(dispatcher_kernel_ready_host, d_dispatcher_kernel_ready,
+                       1, "cudaHostAlloc(GPU dispatcher kernel readiness)");
   mapped_host_allocate(control_kernel_ready_host, d_control_kernel_ready, 1,
                        "cudaHostAlloc(GPU control kernel readiness)");
   check_cuda(cudaStreamCreateWithFlags(&kernel_stream, cudaStreamNonBlocking),
@@ -818,44 +988,16 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
              "cudaStreamCreate(GPU centroid route control)");
   check_cuda(cudaStreamCreateWithFlags(&rdma_stream, cudaStreamNonBlocking),
              "cudaStreamCreate(GPU navigation RDMA owners)");
-  cudaDeviceProp properties{};
-  check_cuda(cudaGetDeviceProperties(&properties, static_cast<int>(config.gpu_device)),
-             "cudaGetDeviceProperties(GPU navigation)");
-  const bool decoupled_search_progression =
-    config.decoupled_gpu_rdma_search_progression_enabled();
-  if (decoupled_search_progression &&
-      config.gpu_graph_issue_width < config.gpu_graph_commit_width) {
-    throw std::logic_error(
-      "exact-frontier progression requires issue width >= commit width");
-  }
-  gpu_clock_khz = static_cast<u64>(std::max(1, properties.clockRate));
-  std::array<PersistentKernelOccupancy, 2> occupancies{};
-  std::array<u32, 2> hardware_blocks_per_sm{};
-  for (size_t index = 0; index < occupancies.size(); ++index) {
-    occupancies[index] =
-      inspect_persistent_search_kernel(
-        kPersistentThreadCandidates[index],
-        decoupled_search_progression);
-    hardware_blocks_per_sm[index] =
-      occupancies[index].active_blocks_per_sm;
-  }
-  persistent_grid_plan = plan_persistent_grid(
-    hardware_blocks_per_sm, config.gpu_persistent_blocks_per_sm,
-    static_cast<u32>(std::max(1, properties.multiProcessorCount)),
-    query_slots, direct_batch_queue_count);
-  kernel_threads = persistent_grid_plan.selected.threads;
-  owner_kernel_blocks = persistent_grid_plan.selected.owner_blocks;
-  kernel_blocks = persistent_grid_plan.selected.query_blocks;
-  const size_t selected_index =
-    kernel_threads == kPersistentThreadCandidates[0] ? 0 : 1;
-  persistent_kernel_occupancy = occupancies[selected_index];
   if (query_rdma_trace_stream.is_open()) {
     query_rdma_trace_stream
       << "{\"type\":\"metadata\",\"schema\":3,"
-         "\"completion_granularity\":\"shard_batch_owner_completion_boundary\","
+         "\"completion_granularity\":\"shard_batch_owner_completion_"
+         "boundary\","
          "\"timestamp_clock\":\"GPU globaltimer nanoseconds\","
-         "\"completion_semantics\":\"owner CTA timestamp after the descriptor's "
-         "priority fence CQE and before status publication; split descriptors "
+         "\"completion_semantics\":\"owner CTA timestamp after the "
+         "descriptor's "
+         "priority fence CQE and before status publication; split "
+         "descriptors "
          "expose independent critical-prefix and speculative-tail fences; "
          "not per-parent, per-WQE, per-descriptor physical, or NIC-internal "
          "completion\","
@@ -867,39 +1009,37 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       << ",\"issue_width_cap\":" << config.gpu_graph_issue_width
       << ",\"traversal_beam_width\":" << config.gpu_traversal_beam_width
       << ",\"max_expansions\":" << config.gpu_max_expansions
-      << ",\"beam_merge_policy\":\""
-      << config.gpu_query_beam_merge_policy
-      << "\",\"graph_read_policy\":\""
-      << config.gpu_query_graph_read_policy
-      << "\",\"graph_extent_quantum\":"
-      << format::kGraphExtentQuantum
+      << ",\"beam_merge_policy\":\"" << config.gpu_query_beam_merge_policy
+      << "\",\"graph_read_policy\":\"" << config.gpu_query_graph_read_policy
+      << "\",\"graph_extent_quantum\":" << format::kGraphExtentQuantum
       << ",\"dynamic_graph_extent_enabled\":"
-      << (live_extent_graph_reads && config.gpu_dynamic_graph_extent
-            ? "true" : "false")
+      << (live_extent_graph_reads && config.gpu_dynamic_graph_extent ? "true"
+                                                                     : "false")
       << ",\"graph_extent_source\":\""
       << (live_extent_graph_reads
             ? (config.gpu_dynamic_graph_extent
                  ? "static_gextent8_plus_dynamic_incarnation_tag"
                  : "offline_global_ordinal_gextent8")
-            : header_neighbor_graph_reads
-              ? "dependent_header_then_exact_neighbor_body"
-              : "fixed_physical_record")
+          : header_neighbor_graph_reads
+            ? "dependent_header_then_exact_neighbor_body"
+            : "fixed_physical_record")
       << "\"}\n";
   }
 
   kernel_params = PersistentKernelParams{
     .submissions = submissions.device_view(),
-    .device_submissions = {
-      .enqueue_position = reinterpret_cast<unsigned long long*>(
-        d_query_dispatch_enqueue),
-      .dequeue_position = reinterpret_cast<unsigned long long*>(
-        d_query_dispatch_dequeue),
-      .sequences = reinterpret_cast<unsigned long long*>(
-        d_query_dispatch_sequences),
-      .entries = d_query_dispatch_entries,
-      .capacity = query_dispatch_capacity,
-      .mask = query_dispatch_capacity - 1,
-    },
+    .device_submissions =
+      {
+        .enqueue_position =
+          reinterpret_cast<unsigned long long*>(d_query_dispatch_enqueue),
+        .dequeue_position =
+          reinterpret_cast<unsigned long long*>(d_query_dispatch_dequeue),
+        .sequences =
+          reinterpret_cast<unsigned long long*>(d_query_dispatch_sequences),
+        .entries = d_query_dispatch_entries,
+        .capacity = query_dispatch_capacity,
+        .mask = query_dispatch_capacity - 1,
+      },
     .completions = completions.device_view(),
     .route_submissions = route_submissions.device_view(),
     .route_completions = route_completions.device_view(),
@@ -914,6 +1054,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .pq_subvector_dim = pq_model.subvector_dim(),
     .pq_code_bytes = pq_model.code_bytes(),
     .dynamic_code_record_bytes = dynamic_code_record_bytes,
+    .dynamic_code_record_stride = dynamic_code_record_stride,
     .graph_entry_bytes = index.layout.graph_entry_bytes,
     .graph_degree = index.layout.graph_degree,
     .graph_entry_capacity = graph_entry_capacity,
@@ -932,10 +1073,9 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .max_expansions = config.gpu_max_expansions,
     .commit_width = config.gpu_graph_commit_width,
     .issue_width = config.gpu_graph_issue_width,
-    .beam_merge_policy =
-      config.gpu_query_beam_merge_policy == "stable-run"
-        ? static_cast<u32>(BeamMergePolicy::stable_run)
-        : static_cast<u32>(BeamMergePolicy::legacy),
+    .beam_merge_policy = config.gpu_query_beam_merge_policy == "stable-run"
+                           ? static_cast<u32>(BeamMergePolicy::stable_run)
+                           : static_cast<u32>(BeamMergePolicy::legacy),
     .visited_capacity = visited_capacity,
     .query_slots = query_slots,
     .direct_region_count = direct_view.remote_region_count,
@@ -945,12 +1085,12 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .direct_timeout_ns =
       static_cast<u64>(config.gpu_direct_timeout_ms) * 1'000'000ULL,
     .route_snapshot_timeout_ns = 100000000ULL,
-    .direct_regions = reinterpret_cast<const DirectRemoteRegion*>(direct_view.remote_regions),
+    .direct_regions =
+      reinterpret_cast<const DirectRemoteRegion*>(direct_view.remote_regions),
     .direct_qps = direct_view.qp_array,
     .direct_qp_locks = direct_view.qp_locks,
     .direct_batch_queues = d_direct_batch_queues,
-    .direct_speculative_batch_queues =
-      d_direct_speculative_batch_queues,
+    .direct_speculative_batch_queues = d_direct_speculative_batch_queues,
     .direct_batch_statuses = d_direct_batch_statuses,
     .direct_batch_completion_timestamps_ns =
       d_direct_batch_completion_timestamps_ns,
@@ -977,33 +1117,29 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .stop = stop_device,
     .graph_scratch = d_graph_scratch,
     .graph_read_policy = header_neighbor_graph_reads
-      ? static_cast<u32>(GraphReadPolicy::header_neighbor)
-      : live_extent_graph_reads
-        ? static_cast<u32>(GraphReadPolicy::live_extent)
-        : static_cast<u32>(GraphReadPolicy::fixed),
+                           ? static_cast<u32>(GraphReadPolicy::header_neighbor)
+                         : live_extent_graph_reads
+                           ? static_cast<u32>(GraphReadPolicy::live_extent)
+                           : static_cast<u32>(GraphReadPolicy::fixed),
     .graph_extent_class_words = d_graph_extent_class_words,
     .dynamic_graph_extent_enabled =
       live_extent_graph_reads && config.gpu_dynamic_graph_extent ? 1u : 0u,
     .graph_request_bytes = d_graph_request_bytes,
-    .speculative_graph_request_shards =
-      d_speculative_graph_request_shards,
-    .speculative_graph_request_offsets =
-      d_speculative_graph_request_offsets,
+    .speculative_graph_request_shards = d_speculative_graph_request_shards,
+    .speculative_graph_request_offsets = d_speculative_graph_request_offsets,
     .speculative_graph_request_local_iovas =
       d_speculative_graph_request_local_iovas,
-    .speculative_graph_request_bytes =
-      d_speculative_graph_request_bytes,
-    .speculative_graph_request_handles =
-      d_speculative_graph_request_handles,
+    .speculative_graph_request_bytes = d_speculative_graph_request_bytes,
+    .speculative_graph_request_handles = d_speculative_graph_request_handles,
     .speculative_graph_validation_states =
       d_speculative_graph_validation_states,
     .query_rdma_trace_headers = d_query_rdma_trace_headers,
     .query_rdma_trace_events = d_query_rdma_trace_events,
     .query_rdma_trace_mode = config.query_rdma_trace_mode == "full"
-      ? static_cast<u32>(QueryRdmaTraceMode::full)
-      : config.query_rdma_trace_mode == "sampled"
-        ? static_cast<u32>(QueryRdmaTraceMode::sampled)
-        : static_cast<u32>(QueryRdmaTraceMode::off),
+                               ? static_cast<u32>(QueryRdmaTraceMode::full)
+                             : config.query_rdma_trace_mode == "sampled"
+                               ? static_cast<u32>(QueryRdmaTraceMode::sampled)
+                               : static_cast<u32>(QueryRdmaTraceMode::off),
     .query_rdma_trace_sample_rate = config.query_rdma_trace_sample_rate,
     .query_rdma_trace_events_per_query =
       config.query_rdma_trace_events_per_query,
@@ -1024,6 +1160,18 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .result_ids = d_result_ids,
     .result_distances = d_result_distances,
   };
+  initialization_complete = true;
+}
+
+void PersistentSearchEngine::Impl::start() {
+  if (!initialization_complete) {
+    throw std::logic_error(
+      "persistent GPU engine was started before initialization");
+  }
+  if (kernel_running || admission_thread.joinable() ||
+      completion_thread.joinable() || maintenance_thread.joinable()) {
+    throw std::logic_error("persistent GPU engine was started more than once");
+  }
   start_persistent_kernel();
   // Query admission has no immutable offline fallback. Install the first
   // complete versioned centroid-entry snapshot before any descriptor can reach

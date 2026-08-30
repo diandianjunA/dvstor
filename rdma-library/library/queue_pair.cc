@@ -1,5 +1,7 @@
 #include "queue_pair.hh"
 
+#include <limits>
+
 #include "utils.hh"
 
 // delegating ctor
@@ -20,10 +22,29 @@ QueuePair::QueuePair(Context* context,
     get_qp_initial_attributes(send_cq, recv_cq);
   queue_pair_ =
     ibv_create_qp(context->get_protection_domain(), &init_attributes);
-  lib_assert(queue_pair_, "Cannot create queue pair");
-  max_send_wr_ = init_attributes.cap.max_send_wr;
+  try {
+    lib_assert(queue_pair_, "Cannot create queue pair");
+    max_send_wr_ = init_attributes.cap.max_send_wr;
+    transition_to_init();
+  } catch (...) {
+    if (queue_pair_ != nullptr) {
+      (void)ibv_destroy_qp(queue_pair_);
+      queue_pair_ = nullptr;
+    }
+    throw;
+  }
+}
 
-  transition_to_init();
+enum ibv_mtu QueuePair::active_mtu() const {
+  return context_->get_active_mtu();
+}
+
+u8 QueuePair::max_qp_read_atomic() const {
+  return static_cast<u8>(context_->max_qp_read_atomic());
+}
+
+u8 QueuePair::max_qp_dest_read_atomic() const {
+  return static_cast<u8>(context_->max_qp_dest_read_atomic());
 }
 
 QueuePair::~QueuePair() {
@@ -74,13 +95,19 @@ void QueuePair::transition_to_init() {
 }
 
 void QueuePair::transition_to_rtr(const QPInfo& remote_buffer) {
+  lib_assert(remote_buffer.wire_valid(),
+             "Invalid or incompatible remote QPInfo wire record");
+  lib_assert(QPInfo::mtu_valid(static_cast<u8>(context_->get_active_mtu())),
+             "Local RDMA port reports an invalid active MTU");
   ibv_qp_attr attributes{};
 
   attributes.qp_state = IBV_QPS_RTR;
-  attributes.path_mtu = IBV_MTU_4096;
+  attributes.path_mtu = remote_buffer.negotiated_mtu(
+    context_->get_active_mtu());
   attributes.dest_qp_num = remote_buffer.qp_number;
   attributes.rq_psn = 0;
-  attributes.max_dest_rd_atomic = context_->max_qp_dest_read_atomic();
+  attributes.max_dest_rd_atomic = remote_buffer.negotiated_max_qp_rd_atom(
+    max_qp_dest_read_atomic());
   attributes.min_rnr_timer = 12;
   attributes.ah_attr.is_global = 0;
   attributes.ah_attr.dlid = remote_buffer.lid;
@@ -98,7 +125,9 @@ void QueuePair::transition_to_rtr(const QPInfo& remote_buffer) {
   lib_debug("Transitioned state to RTR successfully");
 }
 
-void QueuePair::transition_to_rts() {
+void QueuePair::transition_to_rts(const QPInfo& remote_buffer) {
+  lib_assert(remote_buffer.wire_valid(),
+             "Invalid or incompatible remote QPInfo wire record");
   ibv_qp_attr attributes{};
 
   attributes.qp_state = IBV_QPS_RTS;
@@ -106,7 +135,8 @@ void QueuePair::transition_to_rts() {
   attributes.retry_cnt = 7;
   attributes.rnr_retry = 7;
   attributes.sq_psn = 0;
-  attributes.max_rd_atomic = context_->max_qp_read_atomic();
+  attributes.max_rd_atomic = remote_buffer.negotiated_max_qp_init_rd_atom(
+    max_qp_read_atomic());
 
   lib_assert(ibv_modify_qp(queue_pair_,
                            &attributes,
@@ -118,13 +148,21 @@ void QueuePair::transition_to_rts() {
 }
 
 void QueuePair::post_receive(MemoryRegion& region) {
-  post_receive(region, region.get_size_in_bytes());
+  lib_assert(region.get_size_in_bytes() <=
+               std::numeric_limits<u32>::max(),
+             "Receive region exceeds the verbs 32-bit SGE length");
+  post_receive(region, static_cast<u32>(region.get_size_in_bytes()));
 }
 
 void QueuePair::post_receive(MemoryRegion& region,
                              u32 size_in_bytes,
                              u64 wr_id,
                              u64 local_offset) {
+  lib_assert(QueuePairRequestContract::local_range_valid(
+               static_cast<u64>(region.get_size_in_bytes()),
+               local_offset,
+               size_in_bytes),
+             "Receive request exceeds the local memory region or is empty");
   ibv_recv_wr work_request{};
   ibv_sge scatter_gather_entry{};
 
@@ -194,8 +232,12 @@ void QueuePair::post_send(MemoryRegion& region,
                           MemoryRegionToken* token,
                           u64 remote_offset,
                           u64 local_offset) {
+  lib_assert(local_offset == 0,
+             "Whole-region send cannot use a non-zero local offset");
+  lib_assert(region.get_size_in_bytes() <= MESSAGE_SIZE,
+             "Whole-region send exceeds the verbs message limit");
   post_send(region.get_address(),
-            region.get_size_in_bytes(),
+            static_cast<u32>(region.get_size_in_bytes()),
             region.get_lkey(),
             opcode,
             signaled,
@@ -213,6 +255,11 @@ void QueuePair::post_send(MemoryRegion& region,
                           MemoryRegionToken* token,
                           u64 remote_offset,
                           u64 local_offset) {
+  lib_assert(QueuePairRequestContract::local_range_valid(
+               static_cast<u64>(region.get_size_in_bytes()),
+               local_offset,
+               size_in_bytes),
+             "Send request exceeds the local memory region or is empty");
   post_send(region.get_address(),
             size_in_bytes,
             region.get_lkey(),
@@ -233,6 +280,11 @@ void QueuePair::post_send_with_id(MemoryRegion& region,
                                   MemoryRegionToken* token,
                                   u64 remote_offset,
                                   u64 local_offset) {
+  lib_assert(QueuePairRequestContract::local_range_valid(
+               static_cast<u64>(region.get_size_in_bytes()),
+               local_offset,
+               size_in_bytes),
+             "Send request exceeds the local memory region or is empty");
   post_send(region.get_address(),
             size_in_bytes,
             region.get_lkey(),
@@ -255,6 +307,14 @@ void QueuePair::post_send(u64 address,
                           u64 remote_offset,
                           u64 local_offset,
                           u64 wr_id) {
+  lib_assert(QueuePairRequestContract::opcode_supported(opcode),
+             "Unsupported QueuePair message opcode");
+  lib_assert(QueuePairRequestContract::address_range_valid(
+               address, local_offset, size),
+             "Send request has an invalid or overflowing local address range");
+  lib_assert(!inlined ||
+               QueuePairRequestContract::inline_opcode_supported(opcode),
+             "RDMA reads and unsupported opcodes cannot be inlined");
   lib_assert(!inlined || size <= INLINE_SIZE, "Request cannot be inlined");
   lib_assert(size <= MESSAGE_SIZE, "Message size too large");
 
@@ -262,7 +322,7 @@ void QueuePair::post_send(u64 address,
   ibv_sge scatter_gather_entry{};
 
   // points to the SR that failed to be posted (if not successful)
-  struct ibv_send_wr* bad_work_request;
+  struct ibv_send_wr* bad_work_request{nullptr};
 
   scatter_gather_entry.addr = address + local_offset;
   scatter_gather_entry.length = size;
@@ -278,6 +338,8 @@ void QueuePair::post_send(u64 address,
 
   if (opcode != IBV_WR_SEND) {
     lib_assert(token, "MemoryRegionToken does not exist");
+    lib_assert(token->contains(remote_offset, size),
+               "RDMA request exceeds the remote memory region");
     work_request.wr.rdma.remote_addr = token->address + remote_offset;
     work_request.wr.rdma.rkey = token->rkey;
   }
@@ -308,6 +370,8 @@ void QueuePair::post_CAS(MemoryRegion& local_region,
                          u64 swap_with,
                          bool signaled,
                          u64 wr_id) {
+  lib_assert(local_region.get_size_in_bytes() >= sizeof(u64),
+             "CAS local memory region is smaller than 8 bytes");
   post_CAS(local_region.get_address(),
            local_region.get_lkey(),
            remote_token,
@@ -326,12 +390,19 @@ void QueuePair::post_CAS(u64 laddr,
                          u64 swap_with,
                          bool signaled,
                          u64 wr_id) {
-  lib_assert(remote_offset % 8 == 0, "CAS address must be 8B aligned");
+  lib_assert(QueuePairRequestContract::atomic_address_valid(laddr),
+             "CAS local address must be non-zero and 8B aligned");
+  lib_assert(remote_offset % 8 == 0, "CAS offset must be 8B aligned");
+  lib_assert(remote_token != nullptr &&
+               remote_token->contains(remote_offset, sizeof(u64)),
+             "CAS exceeds the remote memory region");
+  lib_assert((remote_token->address + remote_offset) % 8 == 0,
+             "CAS remote address must be 8B aligned");
 
   ibv_send_wr work_request{};
   ibv_sge sge{};
 
-  struct ibv_send_wr* bad_work_request;
+  struct ibv_send_wr* bad_work_request{nullptr};
 
   sge.addr = laddr;
   sge.length = 8;
@@ -362,10 +433,18 @@ void QueuePair::post_FAA(u64 laddress,
                          u64 to_add,
                          bool signaled,
                          u64 wr_id) {
+  lib_assert(QueuePairRequestContract::atomic_address_valid(laddress),
+             "FAA local address must be non-zero and 8B aligned");
+  lib_assert(remote_offset % 8 == 0, "FAA offset must be 8B aligned");
+  lib_assert(remote_token != nullptr &&
+               remote_token->contains(remote_offset, sizeof(u64)),
+             "FAA exceeds the remote memory region");
+  lib_assert((remote_token->address + remote_offset) % 8 == 0,
+             "FAA remote address must be 8B aligned");
   ibv_send_wr work_request{};
   ibv_sge sge{};
 
-  struct ibv_send_wr* bad_work_request;
+  struct ibv_send_wr* bad_work_request{nullptr};
 
   sge.addr = laddress;
   sge.length = 8;

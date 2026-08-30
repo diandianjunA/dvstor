@@ -1,12 +1,15 @@
 #include "tools/vamana_offline/dataset_io.hh"
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 
 #include <library/utils.hh>
+
+#include "common/constants.hh"
 
 #include "tools/vamana_offline/progress.hh"
 
@@ -32,10 +35,18 @@ float l2_float_query_to_raw(const float* query, const byte_t* rhs, VectorDType d
 filepath_t resolve_dataset_file(const filepath_t& input_path) {
   if (std::filesystem::is_regular_file(input_path)) return input_path;
   if (!std::filesystem::is_directory(input_path)) return input_path;
-  static const vec<str> candidates = {"base.fbin", "base.u8bin", "base.i8bin", "base.bin"};
-  for (const auto& c : candidates) {
-    const filepath_t path = input_path / c;
-    if (std::filesystem::exists(path)) return path;
+  static const vec<str> candidates =
+    {"base.fbin", "base.u8bin", "base.i8bin", "base.bin"};
+  vec<filepath_t> matches;
+  for (const auto& candidate : candidates) {
+    const filepath_t path = input_path / candidate;
+    if (std::filesystem::is_regular_file(path)) matches.push_back(path);
+  }
+  if (matches.size() == 1) return matches.front();
+  if (matches.size() > 1) {
+    lib_failure(
+      "dataset directory contains multiple base.* candidates; pass the "
+      "exact dataset file path: " + input_path.string());
   }
   lib_failure("unable to resolve dataset file under " + input_path.string());
   return {};
@@ -50,9 +61,18 @@ Dataset read_dataset(const VamanaBuildConfig& config) {
 
   const str ext = dataset.source_file.extension().string();
   const auto inferred_dtype = infer_vector_dtype_from_path(dataset.source_file);
-  lib_assert(inferred_dtype.has_value(), "unsupported dataset extension: " + ext);
-  dataset.dtype = resolve_vector_dtype_config(config.vector_data_type, dataset.source_file);
-  if (config.vector_data_type != "auto" && inferred_dtype.has_value() && dataset.dtype != *inferred_dtype) {
+  if (config.vector_data_type == "auto") {
+    lib_assert(
+      inferred_dtype.has_value(),
+      "ambiguous or unsupported dataset suffix " + ext +
+        "; pass --vector-data-type=float32, uint8, or int8");
+    dataset.dtype = *inferred_dtype;
+  } else {
+    dataset.dtype =
+      resolve_vector_dtype_config(config.vector_data_type, dataset.source_file);
+  }
+  if (config.vector_data_type != "auto" && inferred_dtype.has_value() &&
+      dataset.dtype != *inferred_dtype) {
     lib_failure("--vector-data-type=" + config.vector_data_type +
                 " does not match dataset suffix " + ext +
                 " (inferred " + vector_dtype_name(*inferred_dtype) + ")");
@@ -63,6 +83,8 @@ Dataset read_dataset(const VamanaBuildConfig& config) {
   dataset.vector_bytes = vector_dtype_bytes(dataset.dtype, dataset.dim);
   lib_assert(dataset.dim > 0, "dataset dimension must be > 0");
   lib_assert(dataset.vector_bytes > 0, "dataset vector byte size must be > 0");
+  lib_assert(dataset.vector_bytes <= std::numeric_limits<u32>::max(),
+             "dataset vector byte width exceeds the runtime node layout");
   lib_assert(static_cast<size_t>(dataset.total_vectors) <=
                  (std::numeric_limits<size_t>::max() - 2 * sizeof(u32)) /
                      dataset.vector_bytes,
@@ -83,8 +105,11 @@ Dataset read_dataset(const VamanaBuildConfig& config) {
                  std::numeric_limits<size_t>::max() / dataset.vector_bytes,
              "dataset memory allocation size overflows");
   lib_assert(dataset.vector_count > 0, "dataset is empty");
-  lib_assert(dataset.vector_count <= static_cast<size_t>(std::numeric_limits<u32>::max()),
-             "offline builder currently supports at most 2^32-1 vectors");
+  lib_assert(dataset.vector_count <= kMaxGpuNavigationNodes,
+             "persistent GPU index supports at most " +
+               std::to_string(kMaxGpuNavigationNodes) + " vectors");
+  lib_assert(config.num_memory_nodes <= dataset.vector_count,
+             "--memory-nodes cannot exceed the resolved vector count");
 
   std::cerr << "reading dataset " << dataset.source_file
             << " (dim=" << dataset.dim << ", vectors=" << dataset.vector_count
@@ -104,11 +129,13 @@ Dataset read_dataset(const VamanaBuildConfig& config) {
     progress.increment(chunk_rows);
   }
   if (dataset.dtype == VectorDType::float32) {
-    const auto* components = reinterpret_cast<const f32*>(
-      dataset.raw_vectors.data());
     const size_t component_count = dataset.vector_count * dataset.dim;
     for (size_t index = 0; index < component_count; ++index) {
-      if (!floating_value_is_finite(components[index])) {
+      f32 component = 0.0f;
+      std::memcpy(&component,
+                  dataset.raw_vectors.data() + index * sizeof(component),
+                  sizeof(component));
+      if (!floating_value_is_finite(component)) {
         lib_failure("float32 dataset contains a non-finite component");
       }
     }

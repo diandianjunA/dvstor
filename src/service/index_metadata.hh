@@ -7,6 +7,7 @@ namespace service::index_metadata {
 
 struct Metadata {
   u32 schema_version{16};
+  str distance{"l2"};
   u32 dim{};
   u32 R{};
   u32 beam_width_construction{};

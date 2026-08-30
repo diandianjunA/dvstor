@@ -4,7 +4,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/spacev100m_common.sh"
 
-BUILD_ROLE="${BUILD_ROLE:-auto}"
+case "${VALIDATE_ONLY:-0}" in
+  0) ;;
+  1)
+    BUILD_DIR="$BUILD_DIR" \
+      "$SCRIPT_DIR/build_spacev100m_index.sh" \
+      "${PROFILE:-04_gpu_persistent_gpunetio}"
+    exit 0
+    ;;
+  *)
+    echo "VALIDATE_ONLY must be 0 or 1: ${VALIDATE_ONLY}" >&2
+    exit 2
+    ;;
+esac
+
+BUILD_ROLE="${BUILD_ROLE:-storage}"
 case "$BUILD_ROLE" in
   auto|all|compute|storage|offline) ;;
   *) echo "BUILD_ROLE must be auto, all, compute, storage, or offline: $BUILD_ROLE" >&2; exit 2 ;;

@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <memory>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -39,10 +41,71 @@ struct NavigationBootstrapper::Impl {
   explicit Impl(const BootstrapContext& context)
       : config_(context.config), channel_context_(context.channel_context),
         connection_manager_(context.connection_manager), remote_regions_(context.remote_regions),
-        data_context_(config_), gpu_region_(data_context_, context.gpu_destination_base,
-                                           context.gpu_destination_bytes),
+        data_context_(config_),
         gpu_base_(reinterpret_cast<u64>(context.gpu_destination_base)),
         gpu_bytes_(context.gpu_destination_bytes), next_qp_(remote_regions_.size(), 0) {
+    if (gpu_base_ == 0 || gpu_bytes_ == 0 ||
+        gpu_base_ > std::numeric_limits<u64>::max() -
+          (static_cast<u64>(gpu_bytes_) - 1u)) {
+      throw std::invalid_argument(
+        "PQ bootstrap requires a non-empty representable GPU destination");
+    }
+    if (remote_regions_.empty() ||
+        remote_regions_.size() != connection_manager_.server_qps.size()) {
+      throw std::invalid_argument(
+        "PQ bootstrap remote-region and storage-connection counts differ");
+    }
+    for (size_t node = 0; node < remote_regions_.size(); ++node) {
+      if (remote_regions_[node] == nullptr ||
+          !remote_regions_[node]->address_range_valid() ||
+          connection_manager_.server_qps[node] == nullptr) {
+        throw std::invalid_argument(
+          "PQ bootstrap received an invalid remote region at node " +
+          std::to_string(node));
+      }
+    }
+    check_cuda(cudaSetDevice(static_cast<int>(config_.gpu_device)),
+               "cudaSetDevice(PQ bootstrap init)");
+    cudaDeviceProp properties{};
+    check_cuda(
+      cudaGetDeviceProperties(&properties, static_cast<int>(config_.gpu_device)),
+      "cudaGetDeviceProperties(PQ bootstrap)");
+    int gdr_supported = 0;
+    check_cuda(
+      cudaDeviceGetAttribute(&gdr_supported,
+                             cudaDevAttrGPUDirectRDMASupported,
+                             static_cast<int>(config_.gpu_device)),
+      "cudaDeviceGetAttribute(PQ bootstrap GPUDirect RDMA support)");
+    if (properties.unifiedAddressing == 0 || gdr_supported == 0) {
+      throw std::runtime_error(
+        "PQ bootstrap requires unified addressing and GPUDirect RDMA; device=" +
+        std::string(properties.name) +
+        " uva=" + std::to_string(properties.unifiedAddressing) +
+        " gdr=" + std::to_string(gdr_supported));
+    }
+    int flush_options = 0;
+    int writes_ordering = cudaGPUDirectRDMAWritesOrderingNone;
+    check_cuda(cudaDeviceGetAttribute(
+                 &flush_options, cudaDevAttrGPUDirectRDMAFlushWritesOptions,
+                 static_cast<int>(config_.gpu_device)),
+               "cudaDeviceGetAttribute(PQ bootstrap GPUDirect flush)");
+    check_cuda(cudaDeviceGetAttribute(
+                 &writes_ordering, cudaDevAttrGPUDirectRDMAWritesOrdering,
+                 static_cast<int>(config_.gpu_device)),
+               "cudaDeviceGetAttribute(PQ bootstrap GPUDirect ordering)");
+    flush_required_ =
+      writes_ordering < cudaGPUDirectRDMAWritesOrderingOwner;
+    if (flush_required_ &&
+        (flush_options & cudaFlushGPUDirectRDMAWritesOptionHost) == 0) {
+      throw std::runtime_error(
+        "GPU has no owner-visible GPUDirect RDMA write ordering and no "
+        "host flush capability");
+    }
+
+    gpu_region_ = std::make_unique<LocalMemoryRegion>(
+      data_context_, context.gpu_destination_base,
+      context.gpu_destination_bytes);
+
     const u32 qps_per_node = std::max<u32>(1, config_.gpu_rdma_qps);
     qps_.resize(remote_regions_.size());
     for (u32 node = 0; node < qps_.size(); ++node) {
@@ -54,15 +117,6 @@ struct NavigationBootstrapper::Impl {
         qps_[node].push_back(std::move(qp));
       }
     }
-    check_cuda(cudaSetDevice(static_cast<int>(config_.gpu_device)),
-               "cudaSetDevice(PQ bootstrap init)");
-    int flush_options = 0;
-    check_cuda(cudaDeviceGetAttribute(
-                 &flush_options, cudaDevAttrGPUDirectRDMAFlushWritesOptions,
-                 static_cast<int>(config_.gpu_device)),
-               "cudaDeviceGetAttribute(PQ bootstrap GPUDirect flush)");
-    flush_supported_ =
-      (flush_options & cudaFlushGPUDirectRDMAWritesOptionHost) != 0;
   }
 
   void read(std::span<const NavigationRead> requests,
@@ -84,8 +138,13 @@ struct NavigationBootstrapper::Impl {
       const u64 destination_offset = request.destination_address >= gpu_base_
         ? request.destination_address - gpu_base_ : gpu_bytes_;
       if (request.memory_node >= qps_.size() || request.bytes == 0 ||
+          remote_regions_[request.memory_node] == nullptr ||
+          request.remote_offset > remote_regions_[request.memory_node]->bytes ||
+          request.bytes >
+            remote_regions_[request.memory_node]->bytes - request.remote_offset ||
           request.destination_address < gpu_base_ ||
-          destination_offset > gpu_bytes_ || request.bytes > gpu_bytes_ - destination_offset) {
+          destination_offset > gpu_bytes_ ||
+          request.bytes > gpu_bytes_ - destination_offset) {
         continue;
       }
       auto& node_qps = qps_[request.memory_node];
@@ -99,7 +158,7 @@ struct NavigationBootstrapper::Impl {
       for (size_t request_index : batch.request_indices) {
         const NavigationRead& request = requests[request_index];
         batch.qp->qp->post_send(
-          request.destination_address, request.bytes, gpu_region_.get_lkey(),
+          request.destination_address, request.bytes, gpu_region_->get_lkey(),
           IBV_WR_RDMA_READ, true, false, remote_regions_[request.memory_node].get(),
           request.remote_offset, 0, request_index + 1);
       }
@@ -134,13 +193,9 @@ struct NavigationBootstrapper::Impl {
         }
       }
     }
-    thread_local int selected_gpu = -1;
-    if (selected_gpu != static_cast<int>(config_.gpu_device)) {
-      check_cuda(cudaSetDevice(static_cast<int>(config_.gpu_device)),
-                 "cudaSetDevice(PQ bootstrap fetch)");
-      selected_gpu = static_cast<int>(config_.gpu_device);
-    }
-    if (flush_supported_) {
+    check_cuda(cudaSetDevice(static_cast<int>(config_.gpu_device)),
+               "cudaSetDevice(PQ bootstrap fetch)");
+    if (flush_required_) {
       check_cuda(cudaDeviceFlushGPUDirectRDMAWrites(
                    cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
                    cudaFlushGPUDirectRDMAWritesToOwner),
@@ -167,8 +222,13 @@ struct NavigationBootstrapper::Impl {
       const u64 source_offset = request.source_address >= gpu_base_
         ? request.source_address - gpu_base_ : gpu_bytes_;
       if (request.memory_node >= qps_.size() || request.bytes == 0 ||
+          remote_regions_[request.memory_node] == nullptr ||
+          request.remote_offset > remote_regions_[request.memory_node]->bytes ||
+          request.bytes >
+            remote_regions_[request.memory_node]->bytes - request.remote_offset ||
           request.source_address < gpu_base_ ||
-          source_offset > gpu_bytes_ || request.bytes > gpu_bytes_ - source_offset) {
+          source_offset > gpu_bytes_ ||
+          request.bytes > gpu_bytes_ - source_offset) {
         continue;
       }
       auto& node_qps = qps_[request.memory_node];
@@ -182,7 +242,7 @@ struct NavigationBootstrapper::Impl {
       for (size_t request_index : batch.request_indices) {
         const NavigationWrite& request = requests[request_index];
         batch.qp->qp->post_send(
-          request.source_address, request.bytes, gpu_region_.get_lkey(),
+          request.source_address, request.bytes, gpu_region_->get_lkey(),
           IBV_WR_RDMA_WRITE, true, false, remote_regions_[request.memory_node].get(),
           request.remote_offset, 0, request_index + 1);
       }
@@ -224,13 +284,13 @@ struct NavigationBootstrapper::Impl {
   ClientConnectionManager& connection_manager_;
   const MemoryRegionTokens& remote_regions_;
   Context data_context_;
-  LocalMemoryRegion gpu_region_;
+  std::unique_ptr<LocalMemoryRegion> gpu_region_;
   u64 gpu_base_{};
   size_t gpu_bytes_{};
   std::vector<std::vector<std::unique_ptr<DetachedQP>>> qps_;
   std::vector<u32> next_qp_;
   std::mutex io_mutex_;
-  bool flush_supported_{};
+  bool flush_required_{};
   bool failed_{};
 };
 

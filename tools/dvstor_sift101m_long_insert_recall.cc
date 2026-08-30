@@ -202,7 +202,12 @@ VectorRows read_header_vector_rows(const std::filesystem::path& path) {
   }
 
   VectorRows rows;
-  rows.dtype = resolve_vector_dtype_config("auto", filepath_t{path});
+  const auto inferred_dtype = infer_vector_dtype_from_path(filepath_t{path});
+  if (!inferred_dtype.has_value()) {
+    fail("ambiguous or unsupported vector suffix; use .fbin, .u8bin, or "
+         ".i8bin: " + path.string());
+  }
+  rows.dtype = *inferred_dtype;
   rows.dim = dim;
   rows.count = count;
   rows.vector_bytes = vector_dtype_bytes(rows.dtype, dim);

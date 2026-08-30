@@ -34,6 +34,7 @@ using ToMicroSeconds =
 #endif
 
 void lib_failure(const str&& message);
+bool is_ipv4_literal(const str& value);
 str get_ip(const str& node_name);
 
 struct Endpoint {

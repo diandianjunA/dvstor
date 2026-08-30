@@ -23,10 +23,10 @@ Usage: ./experiment/deep100m/run_breakdown.sh [PROFILE]
   MIXED_WRITE_THREADS=N                   write_rate_limited 专用写线程数
 
 数据文件与声明范围（在 deep100m_common.sh 集中配置，也可用环境变量覆盖）：
-  PERFORMANCE_QUERY_FILE                 默认 prepared/performance_query.fbin
-  PERFORMANCE_QUERY_START/END            默认 [3334,6667)
-  INSERT_FILE                            默认 prepared/insert.fbin
-  INSERT_VECTOR_START/END                默认 [6667,10000)
+  PERFORMANCE_QUERY_FILE                 默认 DATASET_DIR/deep100m_to_110m_query.fbin
+  PERFORMANCE_QUERY_START/END            默认 [100000000,110000000)
+  INSERT_FILE                            默认 DATASET_DIR/deep110m_to_120m_insert.fbin
+  INSERT_VECTOR_START/END                默认 [110000000,120000000)
 
 数据准备：
   PREPARE_BENCHMARK_DATA=0                默认；只读取预生成 fbin，不需要复制 100M.fbin

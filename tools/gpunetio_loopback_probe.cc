@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <sstream>
@@ -113,6 +114,15 @@ void run_payload_case(
     const u32 second_stage_bytes, const uint64_t timeout_ns,
     const uint64_t remote_span_bytes, const u32 repeat,
     const char* order) {
+  const uint64_t destination_bytes_per_worker =
+    static_cast<uint64_t>(batch_reads) * destination_stride;
+  if (workers == 0 ||
+      destination_bytes_per_worker >
+        std::numeric_limits<size_t>::max() / workers ||
+      destination_bytes_per_worker * workers > view.data_bytes) {
+    throw std::invalid_argument(
+      "GPUNetIO payload destination does not cover every active QP");
+  }
   const size_t latency_count =
     static_cast<size_t>(workers) * measured_batches;
   const size_t storage_latency_count =
@@ -328,9 +338,20 @@ void run_payload_sweep(
     const uint64_t timeout_ns, const u32 repeat, const bool reverse_order,
     const bool print_header, const uint64_t remote_span_bytes) {
   PayloadSweepStorage storage;
-  const size_t latency_count =
-    static_cast<size_t>(workers) *
+  const size_t maximum_batches =
     std::max(warmup_batches, measured_batches);
+  if (workers == 0 || maximum_batches == 0) {
+    throw std::invalid_argument("GPUNetIO payload sweep cannot be empty");
+  }
+  if (workers > std::numeric_limits<size_t>::max() / maximum_batches) {
+    throw std::overflow_error("GPUNetIO payload latency count overflows");
+  }
+  const size_t latency_count =
+    static_cast<size_t>(workers) * maximum_batches;
+  if (latency_count > std::numeric_limits<size_t>::max() /
+                        sizeof(*storage.batch_latency_ns)) {
+    throw std::overflow_error("GPUNetIO payload latency bytes overflow");
+  }
   check_cuda("cudaMalloc(payload statuses)",
              cudaMalloc(&storage.statuses, workers * sizeof(*storage.statuses)));
   check_cuda("cudaMalloc(payload completed)",
@@ -410,13 +431,23 @@ int main(int argc, char** argv) {
     remote_regions[i] = std::make_unique<MemoryRegionToken>();
     LocalMemoryRegion token_region{context, remote_regions[i].get(), sizeof(MemoryRegionToken)};
     connection_manager.server_qps[i]->post_receive(token_region);
-    context.receive();
+    const ReceiveInfo received = context.receive();
+    if (received.bytes_written != MemoryRegionToken::kWireBytes ||
+        !remote_regions[i]->address_range_valid()) {
+      throw std::runtime_error(
+        "storage node returned an invalid RDMA memory-region token; "
+        "restart both sides from the same revision");
+    }
   }
 
   const bool payload_sweep =
     environment_enabled("DVSTOR_GPUNETIO_PAYLOAD_SWEEP");
-  const u32 qp_count =
-    parameters.gpu_rdma_qps *
+  if (connection_manager.server_qps.empty() ||
+      connection_manager.server_qps.size() >
+        std::numeric_limits<u32>::max() / parameters.gpu_rdma_qps) {
+    throw std::runtime_error("GPUNetIO total QP count exceeds u32");
+  }
+  const u32 qp_count = parameters.gpu_rdma_qps *
     static_cast<u32>(connection_manager.server_qps.size());
   const u32 blocks = environment_u32("DVSTOR_GPUNETIO_STRESS_BLOCKS", 64);
   const u32 iterations =
@@ -491,12 +522,13 @@ int main(int argc, char** argv) {
       maximum_stage_bytes = std::max(maximum_stage_bytes, bytes);
     }
     for (const u32 body_bytes : paired_body_bytes) {
-      if (body_bytes + 16 > 832) {
+      if (body_bytes > 832u - 16u) {
         throw std::runtime_error(
           "paired header/body bytes exceed the 832-byte source-record stride");
       }
+      const u32 combined_bytes = body_bytes + 16u;
       maximum_stage_bytes =
-        std::max(maximum_stage_bytes, body_bytes + 16);
+        std::max(maximum_stage_bytes, combined_bytes);
     }
   }
   const u32 payload_destination_stride = payload_sweep

@@ -1,13 +1,56 @@
 #include "tools/breakdown_benchmark/dataset.hh"
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
+#include <limits>
+#include <cstring>
 #include <stdexcept>
 #include <unordered_set>
 
 namespace tools::breakdown_benchmark {
+namespace {
+
+size_t checked_payload_bytes(size_t rows, size_t row_bytes,
+                             const std::string& path) {
+  if (row_bytes == 0 ||
+      rows > (std::numeric_limits<size_t>::max() - 2 * sizeof(uint32_t)) /
+               row_bytes) {
+    throw std::runtime_error("dataset payload size overflows: " + path);
+  }
+  const size_t payload = rows * row_bytes;
+  if (payload > static_cast<size_t>(
+                  std::numeric_limits<std::streamsize>::max())) {
+    throw std::runtime_error("dataset payload exceeds streamsize: " + path);
+  }
+  return payload;
+}
+
+void require_exact_file_size(const std::string& path, size_t payload_bytes,
+                             const char* kind) {
+  std::error_code error;
+  const uintmax_t actual = std::filesystem::file_size(path, error);
+  if (error) {
+    throw std::runtime_error("failed to stat " + std::string(kind) +
+                             " file: " + path + ": " + error.message());
+  }
+  const uintmax_t expected = 2 * sizeof(uint32_t) +
+                             static_cast<uintmax_t>(payload_bytes);
+  if (actual != expected) {
+    throw std::runtime_error(
+      std::string(kind) + " file size mismatch: " + path +
+      " (header requires " + std::to_string(expected) +
+      " bytes, file has " + std::to_string(actual) + ")");
+  }
+}
+
+}  // namespace
+
 
 std::vector<float> make_deterministic_vector(uint32_t seed, size_t dim) {
+  if (dim == 0) {
+    throw std::invalid_argument("deterministic vector dimension must be > 0");
+  }
   std::vector<float> vector(dim, 0.0f);
   uint64_t state = 1469598103934665603ull ^ static_cast<uint64_t>(seed);
   for (size_t index = 0; index < dim; ++index) {
@@ -24,6 +67,9 @@ std::vector<float> make_deterministic_vector(uint32_t seed, size_t dim) {
 }
 
 std::vector<float> make_dataset(const std::vector<uint32_t>& ids, size_t dim) {
+  if (dim != 0 && ids.size() > std::numeric_limits<size_t>::max() / dim) {
+    throw std::overflow_error("deterministic dataset size overflows");
+  }
   std::vector<float> vectors;
   vectors.reserve(ids.size() * dim);
   for (uint32_t id : ids) {
@@ -34,6 +80,7 @@ std::vector<float> make_dataset(const std::vector<uint32_t>& ids, size_t dim) {
 }
 
 const byte_t* VectorRows::raw_row(size_t index) const {
+  if (index >= count) throw std::out_of_range("vector row index out of range");
   return raw.data() + index * vector_bytes;
 }
 
@@ -56,18 +103,44 @@ VectorRows read_vector_rows(const std::string& path, bool decode_rows) {
   }
 
   VectorRows rows;
-  rows.dtype = resolve_vector_dtype_config("auto", filepath_t{path});
+  const auto inferred_dtype = infer_vector_dtype_from_path(filepath_t{path});
+  if (!inferred_dtype.has_value()) {
+    throw std::runtime_error(
+      "ambiguous or unsupported vector suffix; use .fbin, .u8bin, or "
+      ".i8bin: " + path);
+  }
+  rows.dtype = *inferred_dtype;
   rows.dim = dim;
   rows.count = count;
   rows.vector_bytes = vector_dtype_bytes(rows.dtype, dim);
-  rows.raw.resize(static_cast<size_t>(count) * rows.vector_bytes);
+  const size_t payload_bytes =
+    checked_payload_bytes(count, rows.vector_bytes, path);
+  require_exact_file_size(path, payload_bytes, "vector");
+  rows.raw.resize(payload_bytes);
   input.read(reinterpret_cast<char*>(rows.raw.data()),
              static_cast<std::streamsize>(rows.raw.size()));
   if (!input) {
     throw std::runtime_error("failed to read vector payload: " + path);
   }
 
+  if (rows.dtype == VectorDType::float32) {
+    for (size_t component = 0;
+         component < rows.raw.size() / sizeof(float); ++component) {
+      float value = 0.0f;
+      std::memcpy(&value, rows.raw.data() + component * sizeof(float),
+                  sizeof(value));
+      if (!floating_value_is_finite(value)) {
+        throw std::runtime_error(
+          "float32 vector file contains a non-finite component: " + path);
+      }
+    }
+  }
+
   if (decode_rows) {
+    if (static_cast<size_t>(count) >
+        std::numeric_limits<size_t>::max() / dim / sizeof(float)) {
+      throw std::runtime_error("decoded vector size overflows: " + path);
+    }
     rows.decoded.resize(static_cast<size_t>(count) * dim);
     for (size_t row = 0; row < rows.count; ++row) {
       decode_storage_vector_to_float(rows.raw_row(row), rows.dtype, rows.dim,
@@ -103,6 +176,9 @@ size_t SinglePassRowStream::capacity() const {
 }
 
 const uint32_t* GroundTruth::row(size_t index) const {
+  if (index >= rows) {
+    throw std::out_of_range("groundtruth row index out of range");
+  }
   return ids.data() + index * top_k;
 }
 
@@ -121,10 +197,13 @@ GroundTruth read_groundtruth_bin(const std::string& path) {
     throw std::runtime_error("failed to read groundtruth header: " + path);
   }
 
-  groundtruth.ids.resize(
-    static_cast<size_t>(groundtruth.rows) * groundtruth.top_k);
+  const size_t payload_bytes = checked_payload_bytes(
+    groundtruth.rows,
+    static_cast<size_t>(groundtruth.top_k) * sizeof(uint32_t), path);
+  require_exact_file_size(path, payload_bytes, "groundtruth");
+  groundtruth.ids.resize(payload_bytes / sizeof(uint32_t));
   input.read(reinterpret_cast<char*>(groundtruth.ids.data()),
-             static_cast<std::streamsize>(groundtruth.ids.size() * sizeof(uint32_t)));
+             static_cast<std::streamsize>(payload_bytes));
   if (!input) {
     throw std::runtime_error("failed to read groundtruth ids: " + path);
   }

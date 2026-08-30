@@ -28,6 +28,10 @@ void ServerConnectionManager::connect_to_clients() {
   // connect queue pairs and order them by client ids
   for (u32 i = 0; i < config_.num_clients; ++i) {
     auto [qp, client_id] = context_.wait_for_connection();
+    lib_assert(client_id < client_qps.size(),
+               "connecting client ID exceeds --num-clients");
+    lib_assert(client_qps[client_id] == nullptr,
+               "duplicate connecting client ID");
     client_qps[client_id] = std::move(qp);
   }
 

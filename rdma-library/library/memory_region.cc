@@ -15,6 +15,13 @@ MemoryRegion::MemoryRegion(Context& context) : context_(context) {}
 void MemoryRegion::register_memory(void* data,
                                    const size_t size_in_bytes,
                                    bool remote_access) {
+  lib_assert(!is_registered_, "Memory region is already registered");
+  lib_assert(data != nullptr, "Cannot register a null memory region");
+  lib_assert(size_in_bytes > 0, "Cannot register an empty memory region");
+  const u64 address = reinterpret_cast<u64>(data);
+  lib_assert(address <= std::numeric_limits<u64>::max() -
+                          static_cast<u64>(size_in_bytes - 1),
+             "Memory region address range overflows");
   int access = (remote_access)
                  ? IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE |
                      IBV_ACCESS_REMOTE_ATOMIC | IBV_ACCESS_LOCAL_WRITE
@@ -47,5 +54,10 @@ MemoryRegion::~MemoryRegion() {
 }
 
 MemoryRegionToken MemoryRegion::createToken() const {
-  return MemoryRegionToken{get_address(), get_lkey(), get_rkey()};
+  lib_assert(is_registered_ && memory_region_ != nullptr,
+             "Cannot create a token for an unregistered memory region");
+  return MemoryRegionToken{
+    get_address(), get_lkey(), get_rkey(),
+    static_cast<u64>(get_size_in_bytes()), MemoryRegionToken::kWireMagic,
+    MemoryRegionToken::kWireVersion, MemoryRegionToken::kWireBytes};
 }

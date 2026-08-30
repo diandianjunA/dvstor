@@ -32,6 +32,195 @@
 #include "vamana/vamana_node.hh"
 
 namespace tools::breakdown_benchmark {
+namespace {
+
+bool workload_has_performance_queries(const Args& args) {
+  const bool shared_rate_limited = args.mixed_mode == "rate_limited";
+  const bool write_rate_limited = args.mixed_mode == "write_rate_limited";
+  return !args.recall_only &&
+    (args.workload == "query" || args.workload == "both" ||
+     (args.workload == "mixed" &&
+      (shared_rate_limited ? args.target_query_qps > 0.0
+                           : write_rate_limited ? true
+                                                : args.read_ratio > 0.0)));
+}
+
+u32 checked_insert_id(u64 value, u32 exclusive_limit) {
+  // UINT32_MAX is the exhausted sentinel and is deliberately outside the
+  // benchmark namespace, so an atomic counter can never wrap to base ID 0.
+  if (exclusive_limit == 0 || value >= exclusive_limit ||
+      value >= std::numeric_limits<u32>::max()) {
+    throw std::overflow_error("insert ID range exceeds uint32 namespace");
+  }
+  return static_cast<u32>(value);
+}
+
+u32 checked_advance_insert_id(
+    u32 current, u64 delta, u32 exclusive_limit) {
+  // UINT32_MAX is reserved as the exhausted sentinel, so it is not a valid
+  // next ID even when no arithmetic wrap would occur.
+  if (exclusive_limit == 0 || current >= exclusive_limit ||
+      delta >= static_cast<u64>(exclusive_limit) - current) {
+    throw std::overflow_error("next insert ID overflows uint32 namespace");
+  }
+  return static_cast<u32>(static_cast<u64>(current) + delta);
+}
+
+u32 claim_insert_id(
+    std::atomic<u32>& next_id, u32 exclusive_limit) {
+  u32 current = next_id.load(std::memory_order_relaxed);
+  for (;;) {
+    if (exclusive_limit == 0 || current >= exclusive_limit ||
+        current == std::numeric_limits<u32>::max()) {
+      throw std::overflow_error("insert ID namespace is exhausted");
+    }
+    if (next_id.compare_exchange_weak(
+          current, current + 1, std::memory_order_relaxed)) {
+      return current;
+    }
+  }
+}
+
+u64 checked_query_row_sum(u64 first, u64 second) {
+  if (first > std::numeric_limits<u64>::max() - second) {
+    throw std::overflow_error("required performance-query row count overflows");
+  }
+  return first + second;
+}
+
+u64 required_performance_query_rows(const Args& args) {
+  if (args.workload == "mixed" && args.mixed_mode == "rate_limited") {
+    return checked_query_row_sum(
+      PacedOperationDispatcher::scheduled_count(
+        args.target_query_qps, args.warmup_seconds),
+      PacedOperationDispatcher::scheduled_count(
+        args.target_query_qps, args.measure_seconds));
+  }
+  if (args.warmup_seconds == 0 && args.measure_seconds == 0) {
+    return checked_query_row_sum(static_cast<u64>(args.warmup_ops),
+                                 static_cast<u64>(args.measure_ops));
+  }
+  return 0;
+}
+
+void require_matching_dim(const VectorRows& rows, u32 expected,
+                          const char* role) {
+  if (rows.dim != expected) {
+    throw std::runtime_error(
+      std::string(role) + " dimension mismatch: file=" +
+      std::to_string(rows.dim) + " config=" + std::to_string(expected));
+  }
+}
+
+}  // namespace
+
+void preflight_workload_inputs(
+    const configuration::IndexConfiguration& config, const Args& args) {
+  if (config.max_vectors == 0 ||
+      config.max_vectors >= std::numeric_limits<u32>::max()) {
+    throw std::runtime_error(
+      "max-vectors must fit the usable uint32 ID namespace");
+  }
+  const bool rate_limited_writes =
+    args.mixed_mode == "rate_limited" ||
+    args.mixed_mode == "write_rate_limited";
+  const bool workload_has_writes = !args.recall_only &&
+    (args.workload == "insert" || args.workload == "both" ||
+     (args.workload == "mixed" &&
+      (rate_limited_writes ? args.target_write_qps > 0.0
+                           : args.read_ratio < 1.0)));
+  const bool workload_may_insert = workload_has_writes &&
+    (args.workload != "mixed" || args.write_insert_ratio > 0.0);
+  if (workload_may_insert) {
+    const u64 start = args.insert_start_id == 0
+      ? static_cast<u64>(config.max_vectors) + 10000ull
+      : args.insert_start_id;
+    const u32 checked_start =
+      checked_insert_id(start, config.vector_id_namespace_size);
+    if (args.warmup_seconds == 0 && args.measure_seconds == 0) {
+      const u64 fixed_ops = checked_query_row_sum(
+        static_cast<u64>(args.warmup_ops),
+        static_cast<u64>(args.measure_ops));
+      if (fixed_ops > std::numeric_limits<u64>::max() - 1024) {
+        throw std::overflow_error("fixed insert operation range overflows");
+      }
+      (void)checked_advance_insert_id(
+        checked_start, fixed_ops + 1024,
+        config.vector_id_namespace_size);
+    }
+  }
+  if (!args.insert_file.empty()) {
+    require_matching_dim(
+      read_vector_rows(args.insert_file, false), config.dim, "insert file");
+  }
+
+  VectorRows recall_rows;
+  if (!args.recall_query_file.empty()) {
+    recall_rows = read_vector_rows(args.recall_query_file, false);
+    require_matching_dim(recall_rows, config.dim, "recall query file");
+  }
+
+  if (workload_has_performance_queries(args)) {
+    const VectorRows performance_rows =
+      read_vector_rows(args.performance_query_file, false);
+    require_matching_dim(
+      performance_rows, config.dim, "performance query file");
+    const u64 required_rows = required_performance_query_rows(args);
+    if (required_rows > performance_rows.count) {
+      throw std::runtime_error(
+        "performance query file has " +
+        std::to_string(performance_rows.count) + " rows but this workload "
+        "can require " + std::to_string(required_rows) +
+        " unique rows (query rows are never reused)");
+    }
+  }
+
+  if (!args.groundtruth_file.empty()) {
+    if (recall_rows.count == 0) {
+      throw std::runtime_error("groundtruth requires recall query vectors");
+    }
+    const GroundTruth truth = read_groundtruth_bin(args.groundtruth_file);
+    if (truth.rows != recall_rows.count) {
+      throw std::runtime_error(
+        "recall-query/groundtruth row count mismatch: queries=" +
+        std::to_string(recall_rows.count) + " truth=" +
+        std::to_string(truth.rows));
+    }
+    for (u32 id : truth.ids) {
+      if (id >= config.vector_id_namespace_size) {
+        throw std::runtime_error(
+          "groundtruth contains an ID outside the configured vector namespace");
+      }
+    }
+    const u32 recall_k = args.recall_k == 0
+      ? std::min(config.k, truth.top_k) : args.recall_k;
+    if (recall_k == 0 || recall_k > truth.top_k) {
+      throw std::runtime_error("recall-k exceeds groundtruth top-k");
+    }
+    if (args.recall_mode == "base_only" &&
+        config.gpu_final_rerank_width < recall_k) {
+      throw std::runtime_error(
+        "base-only recall requires gpu-final-rerank-width >= recall-k");
+    }
+    const size_t checked_rows = args.recall_queries == 0
+      ? recall_rows.count
+      : std::min(args.recall_queries, recall_rows.count);
+    if (args.recall_mode == "base_only") {
+      for (size_t row = 0; row < checked_rows; ++row) {
+        const u32* ids = truth.row(row);
+        for (u32 rank = 0; rank < recall_k; ++rank) {
+          if (ids[rank] >= args.recall_base_id_limit) {
+            throw std::runtime_error(
+              "base-only groundtruth contains an ID outside the base range");
+          }
+        }
+      }
+    }
+  }
+
+  std::cerr << "[breakdown] workload input preflight passed before service "
+               "startup\n";
+}
 
 struct MixedPhaseStats {
   uint32_t next_insert_id{};
@@ -75,11 +264,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   const bool write_rate_limited =
     args.mixed_mode == "write_rate_limited";
   const bool workload_has_queries =
-    !args.recall_only &&
-    (args.workload == "query" || args.workload == "both" ||
-     (args.workload == "mixed" &&
-      (shared_rate_limited ? args.target_query_qps > 0.0 :
-       write_rate_limited ? true : args.read_ratio > 0.0)));
+    workload_has_performance_queries(args);
   const bool mixed_has_writes = args.workload == "mixed" &&
     ((shared_rate_limited || write_rate_limited)
        ? args.target_write_qps > 0.0 : args.read_ratio < 1.0);
@@ -250,12 +435,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
               << " thread split: reads=" << fixed_read_threads
               << ", writes=" << fixed_write_threads << std::endl;
   }
-  const size_t bootstrap_work = args.measure_seconds > 0
-                                  ? std::max<size_t>(4096, args.client_threads * 256)
-                                  : std::max<size_t>(2048, args.measure_ops);
-  const size_t bootstrap_count = bootstrap_work;
-  std::cerr << "[breakdown] preparing workload: bootstrap_count=" << bootstrap_count
-            << ", workload=" << args.workload << std::endl;
+  std::cerr << "[breakdown] preparing workload: workload="
+            << args.workload << std::endl;
 
   // Load insert vectors from file if specified, otherwise use synthetic data.
   VectorRows insert_rows;
@@ -284,10 +465,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     return get_insert_vector(target_id ^ (0x9e3779b9u * (version + 1u)));
   };
 
-  std::vector<uint32_t> bootstrap_ids(bootstrap_count);
-  std::iota(bootstrap_ids.begin(), bootstrap_ids.end(), 1);
-  const auto bootstrap_vectors = make_dataset(bootstrap_ids, dim);
-  std::cerr << "[breakdown] bootstrap vectors ready (synthetic)" << std::endl;
   std::vector<ProgressSample> measure_windows;
   // `both` executes insert and query as separate sequential phases. Preserve
   // the first phase instead of letting the later query reporter overwrite it,
@@ -314,7 +491,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
           while (!failed.load(std::memory_order_acquire)) {
             const size_t op = next_op.fetch_add(1, std::memory_order_relaxed);
             if (op >= ops) break;
-            const uint32_t id = start_id + static_cast<uint32_t>(op);
+            const uint32_t id = checked_insert_id(
+              static_cast<u64>(start_id) + static_cast<u64>(op),
+              service.config().vector_id_namespace_size);
             vec<element_t> values = get_insert_vector(id);
             vec<ComputeService::InsertItem> insert_items;
             insert_items.reserve(1);
@@ -363,7 +542,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
           while (!failed.load(std::memory_order_acquire) &&
                  can_start_timed_operation(
                    deadline, avg_insert_duration, local_completed)) {
-            const uint32_t id = current_id.fetch_add(1, std::memory_order_relaxed);
+            const uint32_t id = claim_insert_id(
+              current_id, service.config().vector_id_namespace_size);
             vec<element_t> values = get_insert_vector(id);
             vec<ComputeService::InsertItem> insert_items;
             insert_items.reserve(1);
@@ -432,10 +612,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
               << " vector_bytes=" << performance_query_rows.vector_bytes
               << " policy=single_pass_no_reuse" << std::endl;
     if (args.workload == "mixed" && args.mixed_mode == "rate_limited") {
-      const uint64_t required_rows = PacedOperationDispatcher::scheduled_count(
-        args.target_query_qps, args.warmup_seconds) +
-        PacedOperationDispatcher::scheduled_count(
-          args.target_query_qps, args.measure_seconds);
+      const uint64_t required_rows =
+        required_performance_query_rows(args);
       if (required_rows > performance_query_rows.count) {
         throw std::runtime_error(
           "rate-limited workload requires " + std::to_string(required_rows) +
@@ -746,7 +924,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     switch (choose_write_kind(rng)) {
       case WriteKind::insert: {
         issued_inserts.fetch_add(1, std::memory_order_relaxed);
-        const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t id = claim_insert_id(
+          next_insert_id, service.config().vector_id_namespace_size);
         vec<element_t> values = get_insert_vector(id);
         vec<ComputeService::InsertItem> items;
         items.push_back({id, std::move(values)});
@@ -1007,7 +1186,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   if (next_insert_id == 0) {
     const uint64_t default_start =
       static_cast<uint64_t>(service.config().max_vectors) + 10'000ull;
-    if (default_start > std::numeric_limits<uint32_t>::max()) {
+    if (default_start >= std::numeric_limits<uint32_t>::max()) {
       throw std::runtime_error("default insert start id exceeds uint32_t; pass --insert-start-id explicitly");
     }
     next_insert_id = static_cast<uint32_t>(default_start);
@@ -1060,10 +1239,16 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     if (use_time_mode) {
       const auto warmup = run_insert_phase_seconds(
         "warmup-insert", args.warmup_seconds, next_insert_id);
-      next_insert_id = warmup.next_insert_id + 1024;
+      next_insert_id = checked_advance_insert_id(
+        warmup.next_insert_id, 1024,
+        service.config().vector_id_namespace_size);
     } else {
       (void)run_insert_phase_ops("warmup-insert", args.warmup_ops, next_insert_id);
-      next_insert_id += static_cast<uint32_t>(args.warmup_ops + 1024);
+      next_insert_id = checked_advance_insert_id(
+        checked_advance_insert_id(
+          next_insert_id, static_cast<u64>(args.warmup_ops),
+          service.config().vector_id_namespace_size),
+        1024, service.config().vector_id_namespace_size);
     }
   }
   if (!args.recall_only && (args.workload == "query" || args.workload == "both")) {
@@ -1078,10 +1263,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     std::cerr << "[breakdown] starting warmup mixed" << std::endl;
     if (use_time_mode) {
       warmup_mixed_stats = run_mixed_phase_seconds("warmup-mixed", args.warmup_seconds, next_insert_id);
-      next_insert_id = warmup_mixed_stats.next_insert_id + 1024;
+      next_insert_id = checked_advance_insert_id(
+        warmup_mixed_stats.next_insert_id, 1024,
+        service.config().vector_id_namespace_size);
     } else {
       warmup_mixed_stats = run_mixed_phase_ops("warmup-mixed", args.warmup_ops, next_insert_id);
-      next_insert_id = warmup_mixed_stats.next_insert_id + 1024;
+      next_insert_id = checked_advance_insert_id(
+        warmup_mixed_stats.next_insert_id, 1024,
+        service.config().vector_id_namespace_size);
     }
   }
   (void)drain_storage_maintenance("warmup");

@@ -1,15 +1,15 @@
-#include "gpu_search/persistent_kernel.hh"
-#include "gpu_search/persistent_kernel/runtime.cuh"
-
 #include <stdexcept>
 #include <string>
+
+#include "gpu_search/persistent_kernel.hh"
+#include "gpu_search/persistent_kernel/runtime.cuh"
 
 namespace gpu_search {
 
 using namespace persistent_kernel_detail;
 
-PersistentKernelOccupancy inspect_persistent_search_kernel(
-    u32 threads, bool enable_asfe) {
+PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads,
+                                                           bool enable_asfe) {
   if (threads != 128 && threads != 256) {
     throw std::invalid_argument(
       "persistent search kernel supports only 128 or 256 threads");
@@ -17,13 +17,15 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(
   cudaFuncAttributes attributes{};
   const void* kernel = nullptr;
   if (threads == 128) {
-    kernel = enable_asfe
-      ? reinterpret_cast<const void*>(persistent_search_kernel<128, true>)
-      : reinterpret_cast<const void*>(persistent_search_kernel<128, false>);
+    kernel =
+      enable_asfe
+        ? reinterpret_cast<const void*>(persistent_search_kernel<128, true>)
+        : reinterpret_cast<const void*>(persistent_search_kernel<128, false>);
   } else {
-    kernel = enable_asfe
-      ? reinterpret_cast<const void*>(persistent_search_kernel<256, true>)
-      : reinterpret_cast<const void*>(persistent_search_kernel<256, false>);
+    kernel =
+      enable_asfe
+        ? reinterpret_cast<const void*>(persistent_search_kernel<256, true>)
+        : reinterpret_cast<const void*>(persistent_search_kernel<256, false>);
   }
   cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
   if (status != cudaSuccess) {
@@ -33,31 +35,27 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(
   }
   int active_blocks = 0;
   status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-    &active_blocks, kernel,
-    static_cast<int>(threads), 0);
+    &active_blocks, kernel, static_cast<int>(threads), 0);
   if (status != cudaSuccess) {
     throw std::runtime_error(
-      std::string("cudaOccupancyMaxActiveBlocksPerMultiprocessor(persistent search): ") +
+      std::string(
+        "cudaOccupancyMaxActiveBlocksPerMultiprocessor(persistent search): ") +
       cudaGetErrorString(status));
   }
-  if (active_blocks <= 0 ||
-      threads > static_cast<u32>(attributes.maxThreadsPerBlock)) {
-    throw std::runtime_error(
-      "persistent search kernel has zero occupancy for the requested CTA size");
-  }
+  const bool viable = active_blocks > 0 &&
+    threads <= static_cast<u32>(attributes.maxThreadsPerBlock);
   return PersistentKernelOccupancy{
-    .active_blocks_per_sm = static_cast<u32>(active_blocks),
+    .active_blocks_per_sm = viable ? static_cast<u32>(active_blocks) : 0u,
     .registers_per_thread = static_cast<u32>(attributes.numRegs),
     .static_shared_bytes = attributes.sharedSizeBytes,
-    .max_threads_per_block =
-      static_cast<u32>(attributes.maxThreadsPerBlock),
+    .local_bytes_per_thread = attributes.localSizeBytes,
+    .max_threads_per_block = static_cast<u32>(attributes.maxThreadsPerBlock),
   };
 }
 
 void launch_persistent_search(cudaStream_t stream,
-                              const PersistentKernelParams& params,
-                              u32 blocks, u32 threads,
-                              bool decoupled_search_progression) {
+                              const PersistentKernelParams& params, u32 blocks,
+                              u32 threads, bool decoupled_search_progression) {
   if (decoupled_search_progression &&
       params.issue_width < params.commit_width) {
     throw std::invalid_argument(
@@ -65,19 +63,15 @@ void launch_persistent_search(cudaStream_t stream,
   }
   if (threads == 128) {
     if (decoupled_search_progression) {
-      persistent_search_kernel<128, true>
-        <<<blocks, 128, 0, stream>>>(params);
+      persistent_search_kernel<128, true><<<blocks, 128, 0, stream>>>(params);
     } else {
-      persistent_search_kernel<128, false>
-        <<<blocks, 128, 0, stream>>>(params);
+      persistent_search_kernel<128, false><<<blocks, 128, 0, stream>>>(params);
     }
   } else if (threads == 256) {
     if (decoupled_search_progression) {
-      persistent_search_kernel<256, true>
-        <<<blocks, 256, 0, stream>>>(params);
+      persistent_search_kernel<256, true><<<blocks, 256, 0, stream>>>(params);
     } else {
-      persistent_search_kernel<256, false>
-        <<<blocks, 256, 0, stream>>>(params);
+      persistent_search_kernel<256, false><<<blocks, 256, 0, stream>>>(params);
     }
   } else {
     throw std::invalid_argument(
@@ -93,16 +87,18 @@ void launch_direct_read_owners(cudaStream_t stream,
   direct_read_owner_kernel<<<blocks, threads, 0, stream>>>(params, queue_count);
 }
 
-void launch_gpunetio_owner_read_probe(
-    cudaStream_t stream, const PersistentKernelParams& params,
-    u32* request_shards, u64* remote_offsets, u64* local_iova_offsets,
-    u8* destinations, u32 destination_stride, i32* statuses,
-    u32* completed, u32* phases, u32 queue_count) {
+void launch_gpunetio_owner_read_probe(cudaStream_t stream,
+                                      const PersistentKernelParams& params,
+                                      u32* request_shards, u64* remote_offsets,
+                                      u64* local_iova_offsets, u8* destinations,
+                                      u32 destination_stride, i32* statuses,
+                                      u32* completed, u32* phases,
+                                      u32 queue_count) {
   constexpr u32 threads = 128;
   const u32 blocks = (queue_count + threads - 1) / threads;
   gpunetio_owner_read_probe_kernel<<<blocks, threads, 0, stream>>>(
-    params, request_shards, remote_offsets, local_iova_offsets,
-    destinations, destination_stride, statuses, completed, phases, queue_count);
+    params, request_shards, remote_offsets, local_iova_offsets, destinations,
+    destination_stride, statuses, completed, phases, queue_count);
 }
 
 void launch_gpunetio_locked_read_probe(cudaStream_t stream,
@@ -116,9 +112,10 @@ void launch_gpunetio_locked_read_probe(cudaStream_t stream,
 
 void launch_gpunetio_batched_read_probe(cudaStream_t stream,
                                         const PersistentKernelParams& params,
-                                        u8* destinations, u32 destination_stride,
-                                        i32* statuses, u32* completed,
-                                        u32 blocks, u32 batch_size) {
+                                        u8* destinations,
+                                        u32 destination_stride, i32* statuses,
+                                        u32* completed, u32 blocks,
+                                        u32 batch_size) {
   gpunetio_batched_read_probe_kernel<<<blocks, 128, 0, stream>>>(
     params, destinations, destination_stride, statuses, completed, batch_size);
 }

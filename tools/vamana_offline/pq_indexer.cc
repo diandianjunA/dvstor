@@ -1,6 +1,9 @@
 #include "tools/vamana_offline/pq_indexer.hh"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -8,6 +11,9 @@
 #include <limits>
 #include <stdexcept>
 #include <thread>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <faiss/VectorTransform.h>
 #include <faiss/impl/ProductQuantizer.h>
@@ -85,18 +91,31 @@ Layout parse_layout(const nlohmann::json& metadata) {
       layout.shards == 0 ||
       layout.shards > RemotePtr::MEMORY_NODE_MASK + 1 ||
       layout.node_bytes == 0 ||
-      layout.vector_offset + layout.vector_bytes > layout.node_bytes ||
+      static_cast<u64>(layout.vector_offset) + layout.vector_bytes >
+        layout.node_bytes ||
       vector_dtype_bytes(layout.dtype, layout.dim) != layout.vector_bytes ||
       layout.counts.size() != layout.shards ||
       layout.dynamic_offsets.size() != layout.shards ||
       layout.shard_fingerprints.size() != layout.shards ||
+      layout.node_count == 0 ||
+      layout.node_count > kMaxGpuNavigationNodes ||
       std::find(layout.shard_fingerprints.begin(),
                 layout.shard_fingerprints.end(), 0) !=
         layout.shard_fingerprints.end()) {
     throw std::runtime_error("schema-15 index metadata contains an invalid node layout");
   }
   u64 total = 0;
-  for (u64 count : layout.counts) total += count;
+  for (u64 count : layout.counts) {
+    if (count == 0) {
+      throw std::runtime_error(
+        "schema-15 index metadata contains an empty shard");
+    }
+    if (count > std::numeric_limits<u64>::max() - total) {
+      throw std::runtime_error(
+        "schema-15 index metadata node count overflows");
+    }
+    total += count;
+  }
   if (total != layout.node_count || total == 0) {
     throw std::runtime_error("schema-15 index metadata contains an invalid node count");
   }
@@ -114,6 +133,152 @@ void validate_shard_fingerprint(std::ifstream& input,
       expected == 0 || actual != expected) {
     throw std::runtime_error(
       "index shard does not belong to metadata build: " + path.string());
+  }
+}
+
+void preflight_shard_files(const filepath_t& prefix, const Layout& layout) {
+  for (u32 shard = 0; shard < layout.shards; ++shard) {
+    const filepath_t path = index_path::shard_file(
+      prefix, shard + 1, layout.shards);
+    std::error_code size_error;
+    const std::uintmax_t actual_file_bytes =
+      std::filesystem::file_size(path, size_error);
+    const u64 expected_file_bytes = layout.dynamic_offsets[shard];
+    if (size_error ||
+        actual_file_bytes > std::numeric_limits<u64>::max()) {
+      throw std::runtime_error(
+        "failed to inspect index shard: " + path.string() +
+        (size_error ? ": " + size_error.message() : ""));
+    }
+    if (expected_file_bytes < gpu_search::format::kNodeBaseOffset ||
+        layout.counts[shard] >
+          (expected_file_bytes - gpu_search::format::kNodeBaseOffset) /
+            layout.node_bytes) {
+      throw std::runtime_error(
+        "schema-15 metadata fixed-node range exceeds shard file: " +
+        path.string());
+    }
+    if (static_cast<u64>(actual_file_bytes) != expected_file_bytes) {
+      throw std::runtime_error(
+        "index shard file size does not exactly match schema-15 metadata: " +
+        path.string());
+    }
+
+    std::ifstream input(path, std::ios::binary);
+    u64 declared_file_bytes = 0;
+    u64 shard_fingerprint = 0;
+    if (!input.read(reinterpret_cast<char*>(&declared_file_bytes),
+                    sizeof(declared_file_bytes)) ||
+        !input.read(reinterpret_cast<char*>(&shard_fingerprint),
+                    sizeof(shard_fingerprint))) {
+      throw std::runtime_error(
+        "failed to read index shard identity header: " + path.string());
+    }
+    if (declared_file_bytes != expected_file_bytes) {
+      throw std::runtime_error(
+        "index shard declared size does not match schema-15 metadata: " +
+        path.string());
+    }
+    if (shard_fingerprint == 0 ||
+        shard_fingerprint != layout.shard_fingerprints[shard]) {
+      throw std::runtime_error(
+        "index shard does not belong to metadata build: " + path.string());
+    }
+  }
+}
+
+filepath_t temporary_output_path(const filepath_t& final_path) {
+  static std::atomic<u64> sequence{0};
+  return filepath_t{
+    final_path.string() + ".pq-indexer.tmp." +
+    std::to_string(static_cast<unsigned long long>(::getpid())) + "." +
+    std::to_string(sequence.fetch_add(1, std::memory_order_relaxed))};
+}
+
+class TemporaryOutputSet {
+ public:
+  void prepare(const filepath_t& path) {
+    paths_.push_back(path);
+    std::ofstream probe(path, std::ios::binary | std::ios::trunc);
+    if (!probe.good()) {
+      throw std::runtime_error(
+        "failed to create temporary PQ output: " + path.string());
+    }
+    probe.close();
+    if (probe.fail()) {
+      throw std::runtime_error(
+        "failed to close temporary PQ output: " + path.string());
+    }
+  }
+
+  void release() noexcept { paths_.clear(); }
+
+  ~TemporaryOutputSet() {
+    for (const filepath_t& path : paths_) {
+      std::error_code ignored;
+      (void)std::filesystem::remove(path, ignored);
+    }
+  }
+
+ private:
+  vec<filepath_t> paths_;
+};
+
+void publish_temporary_output(const filepath_t& temporary_path,
+                              const filepath_t& final_path) {
+  std::error_code rename_error;
+  std::filesystem::rename(temporary_path, final_path, rename_error);
+  if (rename_error) {
+    throw std::runtime_error(
+      "failed to publish PQ output " + final_path.string() + ": " +
+      rename_error.message());
+  }
+}
+
+void sync_file(const filepath_t& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    throw std::runtime_error(
+      "failed to open PQ output for fsync: " + path.string() + ": " +
+      std::strerror(errno));
+  }
+  const int sync_result = ::fsync(fd);
+  const int sync_error = errno;
+  const int close_result = ::close(fd);
+  const int close_error = errno;
+  if (sync_result != 0) {
+    throw std::runtime_error(
+      "failed to fsync PQ output: " + path.string() + ": " +
+      std::strerror(sync_error));
+  }
+  if (close_result != 0) {
+    throw std::runtime_error(
+      "failed to close PQ output after fsync: " + path.string() + ": " +
+      std::strerror(close_error));
+  }
+}
+
+void sync_directory(const filepath_t& directory) {
+  const filepath_t path = directory.empty() ? filepath_t{"."} : directory;
+  const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    throw std::runtime_error(
+      "failed to open PQ output directory for fsync: " + path.string() +
+      ": " + std::strerror(errno));
+  }
+  const int sync_result = ::fsync(fd);
+  const int sync_error = errno;
+  const int close_result = ::close(fd);
+  const int close_error = errno;
+  if (sync_result != 0) {
+    throw std::runtime_error(
+      "failed to fsync PQ output directory: " + path.string() + ": " +
+      std::strerror(sync_error));
+  }
+  if (close_result != 0) {
+    throw std::runtime_error(
+      "failed to close PQ output directory after fsync: " + path.string() +
+      ": " + std::strerror(close_error));
   }
 }
 
@@ -150,6 +315,11 @@ PersistentLayout make_persistent_layout(const nlohmann::json& metadata,
   result.dynamic_code_offset = static_cast<u32>(dynamic_code_offset);
   result.dynamic_record_bytes = static_cast<u32>(dynamic_record_bytes);
   for (u32 shard = 0; shard < layout.shards; ++shard) {
+    if (!RemotePtr::representable(
+          shard, layout.dynamic_offsets[shard], 1)) {
+      throw std::runtime_error(
+        "schema-15 dynamic base exceeds tagged RemotePtr capacity");
+    }
     const u64 control_offset = gpu_search::format::align_up(
       layout.dynamic_offsets[shard], 64);
     if (control_offset == 0 ||
@@ -179,6 +349,14 @@ PersistentLayout make_persistent_layout(const nlohmann::json& metadata,
     result.code_region_bytes[shard] = region_bytes;
     result.dynamic_node_offsets[shard] =
       layout.dynamic_offsets[shard] + aligned_end;
+    if (!RemotePtr::representable(
+          shard, result.dynamic_node_offsets[shard], 1) ||
+        result.dynamic_node_offsets[shard] >
+          RemotePtr::BYTE_OFFSET_CAPACITY - result.dynamic_record_bytes) {
+      throw std::runtime_error(
+        "persistent PQ/control layout leaves no complete dynamic record "
+        "within tagged RemotePtr capacity");
+    }
   }
   return result;
 }
@@ -206,16 +384,36 @@ void apply_persistent_layout(nlohmann::json& metadata,
 
 void write_metadata_atomic(const filepath_t& path,
                            const nlohmann::json& metadata) {
-  const filepath_t temporary{path.string() + ".schema15.tmp"};
+  const filepath_t temporary = temporary_output_path(path);
+  TemporaryOutputSet cleanup;
+  cleanup.prepare(temporary);
   {
     std::ofstream output(temporary, std::ios::trunc);
     output << std::setw(2) << metadata << '\n';
     if (!output.good()) {
-      std::filesystem::remove(temporary);
       throw std::runtime_error("failed to write final index metadata");
     }
+    output.close();
+    if (output.fail()) {
+      throw std::runtime_error("failed to close final index metadata");
+    }
   }
-  std::filesystem::rename(temporary, path);
+  sync_file(temporary);
+  {
+    std::ifstream input(temporary);
+    nlohmann::json round_trip;
+    input >> round_trip;
+    input >> std::ws;
+    if ((!input.good() && !input.eof()) ||
+        input.peek() != std::char_traits<char>::eof() ||
+        round_trip != metadata) {
+      throw std::runtime_error(
+        "temporary index metadata failed exact round-trip validation");
+    }
+  }
+  publish_temporary_output(temporary, path);
+  cleanup.release();
+  sync_directory(path.parent_path());
 }
 
 u64 mix64(u64 value) {
@@ -402,7 +600,81 @@ void encode_shard(const filepath_t& prefix, const Layout& layout,
     throw std::runtime_error(error);
   }
   output.flush();
-  if (!output.good()) throw std::runtime_error("failed to finalize PQ sidecar");
+  if (!output.good()) {
+    throw std::runtime_error("failed to finalize PQ sidecar");
+  }
+  output.close();
+  if (output.fail()) {
+    throw std::runtime_error("failed to close PQ sidecar: " +
+                             output_path.string());
+  }
+}
+
+void validate_temporary_model(const filepath_t& path,
+                              const gpu_search::pq::Model& expected) {
+  gpu_search::pq::Model actual;
+  std::string error;
+  if (!gpu_search::pq::read_model(path, actual, &error)) {
+    throw std::runtime_error(error);
+  }
+  if (actual.dim != expected.dim ||
+      actual.subquantizers != expected.subquantizers ||
+      actual.bits_per_code != expected.bits_per_code ||
+      actual.checksum() != expected.checksum()) {
+    throw std::runtime_error(
+      "temporary PQ model does not match the trained model: " +
+      path.string());
+  }
+}
+
+void validate_temporary_sidecar(
+    const filepath_t& path, const Layout& layout,
+    const gpu_search::pq::Model& model, u32 shard,
+    const PersistentLayout& persistent) {
+  gpu_search::format::CodeHeader header;
+  std::string error;
+  if (!gpu_search::format::read_code_header(path, header, &error)) {
+    throw std::runtime_error(error);
+  }
+  if (header.memory_node != shard ||
+      header.code_bytes != model.code_bytes() ||
+      header.node_size != layout.node_bytes ||
+      header.vector_dtype != static_cast<u32>(layout.dtype) ||
+      header.entry_count != layout.counts[shard] ||
+      header.remote_offset != persistent.code_offsets[shard] ||
+      header.payload_bytes != persistent.code_region_bytes[shard] ||
+      header.model_checksum != model.checksum() ||
+      header.build_fingerprint != layout.build_fingerprint ||
+      header.shard_fingerprint != layout.shard_fingerprints[shard]) {
+    throw std::runtime_error(
+      "temporary PQ sidecar does not match the index layout: " +
+      path.string());
+  }
+
+  std::ifstream input(path, std::ios::binary);
+  input.seekg(static_cast<std::streamoff>(sizeof(header)));
+  constexpr size_t kValidationChunkBytes = 8ull << 20;
+  vec<byte_t> buffer(static_cast<size_t>(
+    std::min<u64>(kValidationChunkBytes, header.payload_bytes)));
+  u64 checksum = gpu_search::format::checksum64_initial();
+  for (u64 offset = 0; offset < header.payload_bytes;) {
+    const size_t bytes = static_cast<size_t>(std::min<u64>(
+      buffer.size(), header.payload_bytes - offset));
+    input.read(reinterpret_cast<char*>(buffer.data()),
+               static_cast<std::streamsize>(bytes));
+    if (static_cast<size_t>(input.gcount()) != bytes) {
+      throw std::runtime_error(
+        "failed to verify temporary PQ sidecar payload: " +
+        path.string());
+    }
+    checksum = gpu_search::format::checksum64_update(
+      checksum, buffer.data(), bytes);
+    offset += bytes;
+  }
+  if (checksum != header.payload_checksum) {
+    throw std::runtime_error(
+      "temporary PQ sidecar payload checksum mismatch: " + path.string());
+  }
 }
 
 }  // namespace
@@ -416,6 +688,37 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   metadata_input >> metadata;
   const nlohmann::json graph_metadata = metadata;
   const Layout layout = parse_layout(metadata);
+  if (options.subquantizers == 0 ||
+      options.subquantizers > layout.dim ||
+      layout.dim % options.subquantizers != 0) {
+    throw std::invalid_argument(
+      "PQ subquantizers must be in [1,dim] and divide the dimension");
+  }
+  if (options.reuse_model.empty() &&
+      (options.opq_iterations == 0 || options.pq_iterations == 0 ||
+       options.opq_iterations >
+         static_cast<u32>(std::numeric_limits<int>::max()) ||
+       options.pq_iterations >
+         static_cast<u32>(std::numeric_limits<int>::max()))) {
+    throw std::invalid_argument(
+      "OPQ and PQ iteration counts must be in [1,INT_MAX]");
+  }
+  if (options.chunk_vectors == 0) {
+    throw std::invalid_argument("PQ encode chunk size must be greater than zero");
+  }
+  if (options.threads > 32) {
+    throw std::invalid_argument(
+      "PQ training threads must be zero (automatic) or at most 32");
+  }
+  if (options.reuse_model.empty() &&
+      std::min<u64>(options.train_samples, layout.node_count) <
+        gpu_search::pq::kCentroidsPerSubquantizer) {
+    throw std::invalid_argument(
+      "PQ training requires at least 256 available samples");
+  }
+  const PersistentLayout persistent = make_persistent_layout(
+    metadata, layout, options.subquantizers);
+  preflight_shard_files(options.index_prefix, layout);
   const u32 hardware_threads = std::max(1u, std::thread::hardware_concurrency());
   const u32 training_threads = options.threads == 0
     ? std::min<u32>(hardware_threads, 32) : std::min(options.threads, hardware_threads);
@@ -445,6 +748,17 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
     }
   }
 
+  TemporaryOutputSet temporary_outputs;
+  const filepath_t temporary_model_file =
+    temporary_output_path(result.model_file);
+  vec<filepath_t> temporary_code_files(layout.shards);
+  temporary_outputs.prepare(temporary_model_file);
+  for (u32 shard = 0; shard < layout.shards; ++shard) {
+    temporary_code_files[shard] =
+      temporary_output_path(result.code_files[shard]);
+    temporary_outputs.prepare(temporary_code_files[shard]);
+  }
+
   gpu_search::pq::Model model;
   std::string error;
   if (!options.reuse_model.empty()) {
@@ -459,18 +773,40 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
       options.index_prefix, layout, options.train_samples, options.seed);
     model = train_model(samples, layout, options);
   }
-  if (!gpu_search::pq::write_model(result.model_file, model, &error)) {
-    throw std::runtime_error(error);
+  if (model.code_bytes() != options.subquantizers ||
+      model.checksum() == 0) {
+    throw std::runtime_error(
+      "PQ model code width or checksum is incompatible with the sidecar format");
   }
   result.model_checksum = model.checksum();
+  error.clear();
+  if (!gpu_search::pq::write_model(temporary_model_file, model, &error)) {
+    throw std::runtime_error(error);
+  }
+  validate_temporary_model(temporary_model_file, model);
+  sync_file(temporary_model_file);
 
-  const PersistentLayout persistent = make_persistent_layout(
-    metadata, layout, model.code_bytes());
   for (u32 shard = 0; shard < layout.shards; ++shard) {
     encode_shard(options.index_prefix, layout, model, options, shard,
-                 result.code_files[shard], persistent.code_offsets[shard]);
+                 temporary_code_files[shard],
+                 persistent.code_offsets[shard]);
+    validate_temporary_sidecar(
+      temporary_code_files[shard], layout, model, shard, persistent);
+    sync_file(temporary_code_files[shard]);
+    if (persistent.code_region_bytes[shard] >
+        std::numeric_limits<u64>::max() - result.code_bytes) {
+      throw std::runtime_error("total PQ code byte count overflows");
+    }
     result.code_bytes += persistent.code_region_bytes[shard];
   }
+
+  publish_temporary_output(temporary_model_file, result.model_file);
+  for (u32 shard = 0; shard < layout.shards; ++shard) {
+    publish_temporary_output(
+      temporary_code_files[shard], result.code_files[shard]);
+  }
+  sync_directory(metadata_path.parent_path());
+  temporary_outputs.release();
 
   metadata["navigation_quantizer"] = "opq_pq";
   metadata["pq_subquantizers"] = model.subquantizers;

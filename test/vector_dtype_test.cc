@@ -186,6 +186,15 @@ void test_integral_alpha_threshold_exits_early_and_fallbacks_are_unchanged() {
 
 }  // namespace
 
+void test_unaligned_float_component_load() {
+  alignas(float) std::array<byte_t, sizeof(float) + 1> storage{};
+  const float expected = -123.5f;
+  std::memcpy(storage.data() + 1, &expected, sizeof(expected));
+  const float actual = vector_component_as_float(
+    storage.data() + 1, VectorDType::float32, 0);
+  assert(actual == expected);
+}
+
 int main() {
   for (const f32 invalid : {
          std::numeric_limits<f32>::quiet_NaN(),
@@ -242,6 +251,7 @@ int main() {
     }
     assert(rejected);
   }
+  test_unaligned_float_component_load();
   test_integer_simd_matches_canonical_distance_for_arbitrary_dimensions();
   test_integral_alpha_threshold_matches_complete_distance();
   test_integral_alpha_threshold_exits_early_and_fallbacks_are_unchanged();

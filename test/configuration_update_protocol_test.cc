@@ -11,6 +11,15 @@
 
 namespace {
 
+configuration::IndexConfiguration parse_config(
+    std::vector<std::string> arguments) {
+  std::vector<char*> argv;
+  argv.reserve(arguments.size());
+  for (auto& argument : arguments) argv.push_back(argument.data());
+  return configuration::IndexConfiguration(
+    static_cast<int>(argv.size()), argv.data());
+}
+
 configuration::IndexConfiguration make_config(
     bool explicit_disable, bool explicit_namespace = false,
     std::string beam_merge_policy = {},
@@ -75,11 +84,24 @@ configuration::IndexConfiguration make_config(
     arguments.emplace_back("--storage-owner-update-completion-mode");
     arguments.emplace_back(std::move(update_completion_mode));
   }
-  std::vector<char*> argv;
-  argv.reserve(arguments.size());
-  for (auto& argument : arguments) argv.push_back(argument.data());
-  return configuration::IndexConfiguration(
-    static_cast<int>(argv.size()), argv.data());
+  return parse_config(std::move(arguments));
+}
+
+configuration::IndexConfiguration make_config_with_extra(
+    std::vector<std::string> extra) {
+  std::vector<std::string> arguments{
+    "configuration_update_protocol_test",
+    "--servers", "127.0.0.1:1234",
+    "--storage-peers", "127.0.0.1:1234",
+    "--index-prefix", "/tmp/index",
+    "--threads", "1",
+    "--dim", "128",
+    "--k", "10",
+  };
+  for (auto& argument : extra) {
+    arguments.push_back(std::move(argument));
+  }
+  return parse_config(std::move(arguments));
 }
 
 template <typename Function>
@@ -176,6 +198,15 @@ int main() {
   expect_configuration_rejected([] {
     (void)make_config(
       false, false, {}, {}, {}, {}, {}, "decoupled", "16", "16");
+  });
+  expect_configuration_rejected([] {
+    (void)make_config_with_extra({"--alpha", "nan"});
+  });
+  expect_configuration_rejected([] {
+    (void)make_config_with_extra({"--alpha", "0.999"});
+  });
+  expect_configuration_rejected([] {
+    (void)make_config_with_extra({"--gpu-device", "2147483648"});
   });
 
   const auto expanded_namespace = make_config(false, true);
