@@ -1,5 +1,6 @@
 #include "memory_node/peer_rpc/detail.hh"
 #include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
+#include "memory_node/storage_owner_index/stage1_reachability_policy.hh"
 #include "memory_node/storage_owner_index/vector_snapshot_policy.hh"
 
 namespace authority = memory_node_storage_owner_index_detail;
@@ -487,18 +488,23 @@ MemoryNode::prepare_local_stage1_item(
   vec<BeamEntry> stage1_beam;
   vec<RemotePtr> remote_frontier;
   hashset_t<RemotePtr> skip;
+  vec<RemotePtr> bridge_exclusions;
   if (kind == MutationKind::upsert && item.old_raw != 0) {
     // The previous generation is tombstoned before authority commit. It must
     // not become a provisional backlink target for its replacement.
-    skip.insert(RemotePtr{item.old_raw});
+    const RemotePtr old_pointer{item.old_raw};
+    skip.insert(old_pointer);
+    bridge_exclusions.push_back(old_pointer);
   }
   vec<RemotePtr> candidates;
   vec<RemotePtr> neighbors;
+  vec<RemotePtr> bridge_targets;
   const auto refresh_stage1_candidates = [&]() {
     const vec<RemotePtr> entries = local_centroid_route_entries();
     if (entries.empty()) {
       candidates.clear();
       neighbors.clear();
+      bridge_targets.clear();
       stage1_beam.clear();
       remote_frontier.clear();
       return false;
@@ -521,7 +527,20 @@ MemoryNode::prepare_local_stage1_item(
     if (breakdown != nullptr) {
       breakdown->storage_owner_prune_ns += prune_ns;
     }
-    return !neighbors.empty();
+    // RobustPrune determines the new node's outgoing graph, but an incoming
+    // provisional certificate may use any stable, reachable member of the
+    // construction beam.  SpaceV often prunes a wide beam down to 1--4
+    // neighbors; using only that set concentrates every pending insertion in
+    // a handful of protected planes and can never make progress once their
+    // six slots fill.  Keep the two planes independent and distribute bridges
+    // over the complete point-in-time reachability witness.
+    bridge_targets =
+      memory_node_storage_owner_index_detail::
+        make_stage1_reachability_bridge_targets(
+          span<const RemotePtr>{neighbors},
+          span<const RemotePtr>{candidates},
+          span<const RemotePtr>{bridge_exclusions});
+    return !neighbors.empty() && !bridge_targets.empty();
   };
 
   while (!refresh_stage1_candidates()) {
@@ -561,7 +580,7 @@ MemoryNode::prepare_local_stage1_item(
   for (;;) {
     const auto backlink_started = std::chrono::steady_clock::now();
     backlink_targets = install_local_provisional_backlinks(
-      target, span<const RemotePtr>{neighbors});
+      target, span<const RemotePtr>{bridge_targets});
     physical_backlink_ns += elapsed_ns_since(backlink_started);
     if (!backlink_targets.empty()) break;
 
@@ -601,6 +620,7 @@ MemoryNode::prepare_local_stage1_item(
                 << " generation=" << item.generation
                 << " candidate_count=" << candidates.size()
                 << " neighbor_count=" << neighbors.size()
+                << " bridge_target_count=" << bridge_targets.size()
                 << " refresh=" << bridge_refreshes << '\n';
     }
     if (storage_insert_shutdown_.load(std::memory_order_acquire) ||

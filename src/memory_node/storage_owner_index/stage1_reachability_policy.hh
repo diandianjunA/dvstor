@@ -28,6 +28,34 @@ enum class Stage1BridgeInstallDisposition : u8 {
   installed,
 };
 
+// The outgoing RobustPrune result and the incoming reachability certificate
+// have different jobs.  The former controls graph quality; the latter only
+// needs a stable node reached by the construction search.  Keeping the pruned
+// neighbors first preserves locality, then appending the rest of the stable
+// beam spreads protected slots across the capacity the search actually found.
+// In particular, low-dimensional/manifold-like data can legitimately prune a
+// wide beam to only one or two outgoing edges; restricting provisional
+// parents to that tiny set turns those nodes into permanent insertion hubs.
+inline vec<RemotePtr> make_stage1_reachability_bridge_targets(
+    span<const RemotePtr> pruned_neighbors,
+    span<const RemotePtr> searched_candidates,
+    span<const RemotePtr> excluded_targets = {}) {
+  vec<RemotePtr> targets;
+  targets.reserve(pruned_neighbors.size() + searched_candidates.size());
+  const auto append_unique = [&](const RemotePtr target) {
+    if (target.is_null() ||
+        std::find(excluded_targets.begin(), excluded_targets.end(), target) !=
+          excluded_targets.end() ||
+        std::find(targets.begin(), targets.end(), target) != targets.end()) {
+      return;
+    }
+    targets.push_back(target);
+  };
+  for (const RemotePtr target : pruned_neighbors) append_unique(target);
+  for (const RemotePtr target : searched_candidates) append_unique(target);
+  return targets;
+}
+
 // Dynamic records are allocated at a fixed stride.  Dividing the tagged
 // pointer's byte offset by that stride therefore advances by one for adjacent
 // allocations, even when the dynamic arena itself is not stride-aligned.

@@ -10,6 +10,49 @@ RemotePtr pointer(u32 shard, u64 offset, u32 incarnation = 0) {
   return RemotePtr{shard, offset, incarnation};
 }
 
+void test_bridge_targets_decouple_outgoing_prune_from_reachability() {
+  using memory_node_storage_owner_index_detail::
+    make_stage1_reachability_bridge_targets;
+  const RemotePtr first = pointer(0, 0x1000);
+  const RemotePtr second = pointer(0, 0x2000);
+  const RemotePtr third = pointer(0, 0x3000);
+  const RemotePtr old_generation = pointer(0, 0x4000, 7);
+  const vec<RemotePtr> pruned{second};
+  const vec<RemotePtr> searched{
+    first, second, third, first, old_generation, RemotePtr{}};
+  const vec<RemotePtr> excluded{old_generation};
+
+  const vec<RemotePtr> targets = make_stage1_reachability_bridge_targets(
+    span<const RemotePtr>{pruned}, span<const RemotePtr>{searched},
+    span<const RemotePtr>{excluded});
+
+  // The outgoing graph remains the one-element RobustPrune result, while the
+  // independent incoming certificate can consume all other stable beam
+  // capacity. Preferred neighbors stay first and duplicates/old generations
+  // cannot consume a protected slot.
+  assert((targets == vec<RemotePtr>{second, first, third}));
+}
+
+void test_saturated_pruned_hub_uses_search_beam_capacity() {
+  using namespace memory_node_storage_owner_index_detail;
+  constexpr size_t record_bytes = 256;
+  const RemotePtr saturated_hub = pointer(0, 0x1000);
+  const RemotePtr first_available = pointer(0, 0x2000);
+  const RemotePtr second_available = pointer(0, 0x3000);
+  const vec<RemotePtr> pruned{saturated_hub};
+  const vec<RemotePtr> searched{
+    saturated_hub, first_available, second_available};
+  const vec<RemotePtr> targets = make_stage1_reachability_bridge_targets(
+    span<const RemotePtr>{pruned}, span<const RemotePtr>{searched});
+
+  const vec<RemotePtr> accepted = select_stage1_reachability_bridges(
+    pointer(0, 0x8000, 2), span<const RemotePtr>{targets}, record_bytes,
+    [&](RemotePtr target) { return target != saturated_hub; });
+  assert(accepted.size() == 2);
+  assert(std::find(accepted.begin(), accepted.end(), saturated_hub) ==
+         accepted.end());
+}
+
 void test_identical_hot_neighbor_sets_rotate_across_parents() {
   constexpr size_t record_bytes = 256;
   vec<RemotePtr> targets;
@@ -199,6 +242,8 @@ void test_permanent_busy_is_bounded_and_returns_to_snapshot_refresh() {
 }  // namespace
 
 int main() {
+  test_bridge_targets_decouple_outgoing_prune_from_reachability();
+  test_saturated_pruned_hub_uses_search_beam_capacity();
   test_identical_hot_neighbor_sets_rotate_across_parents();
   test_hot_cluster_uses_aggregate_protected_capacity();
   test_only_successful_ack_targets_are_recorded();
