@@ -12,6 +12,26 @@ struct StorageOwnerBatchDecision {
   u32 take{};
 };
 
+// A busy ACK means the authority has exhausted its accepted-batch contexts;
+// sending the same logical tokens again at the roughly 10 us RPC round trip
+// cannot create a context. Back off per authority until either this deadline
+// expires or a real token completion clears it. The short initial delay keeps
+// transient races cheap, while the cap is small relative to foreground Stage1
+// service time and therefore does not reduce a saturated writer's goodput.
+inline u64 storage_owner_busy_retry_delay_ns(u32 consecutive_busy_batches) {
+  constexpr u64 kInitialDelayNs = 50'000;
+  constexpr u64 kMaximumDelayNs = 2'000'000;
+  if (consecutive_busy_batches == 0) return 0;
+  const u32 shift = std::min<u32>(consecutive_busy_batches - 1, 6);
+  return std::min<u64>(kMaximumDelayNs, kInitialDelayNs << shift);
+}
+
+inline bool storage_owner_retry_deadline_elapsed(
+    u64 retry_not_before_ns,
+    u64 now_ns) {
+  return retry_not_before_ns == 0 || now_ns >= retry_not_before_ns;
+}
+
 inline bool storage_owner_batch_wait_elapsed(
     u64 oldest_ready_since_ns,
     u64 now_ns,

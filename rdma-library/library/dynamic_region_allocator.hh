@@ -2,6 +2,7 @@
 #define RDMA_LIBRARY_DYNAMIC_REGION_ALLOCATOR_HH
 
 #include <mutex>
+#include <oneapi/tbb/concurrent_vector.h>
 
 #include "common/debug.hh"
 #include "memory_region.hh"
@@ -49,7 +50,7 @@ public:
 private:
   void allocate_region(bool touch = false) {
     std::scoped_lock lock{mutex_};
-    // note that emplace_back of concurrent_vec returns an iterator
+    // Note that concurrent_vector::emplace_back returns an iterator.
     auto buffer_ptr =
       region_buffers_.emplace_back(new BufferEntryType[region_length_]);
     memory_regions_.emplace_back(std::make_unique<LocalMemoryRegion>(
@@ -67,8 +68,8 @@ private:
   const size_t region_size_;
   const size_t region_length_;
 
-  concurrent_vec<u_ptr<LocalMemoryRegion>> memory_regions_;
-  concurrent_vec<u_ptr<BufferEntryType[]>> region_buffers_;
+  oneapi::tbb::concurrent_vector<u_ptr<LocalMemoryRegion>> memory_regions_;
+  oneapi::tbb::concurrent_vector<u_ptr<BufferEntryType[]>> region_buffers_;
   concurrent_queue<u32> free_list_;
   std::mutex mutex_;
 };

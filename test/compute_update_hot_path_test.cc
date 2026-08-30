@@ -12,6 +12,8 @@ namespace {
 using compute_service_detail::StorageOwnerResponseValidation;
 using compute_service_detail::dequeue_storage_owner_visible_prefix;
 using compute_service_detail::decide_storage_owner_batch;
+using compute_service_detail::storage_owner_busy_retry_delay_ns;
+using compute_service_detail::storage_owner_retry_deadline_elapsed;
 using compute_service_detail::next_storage_owner_batch_observed_ns;
 using compute_service_detail::validate_storage_owner_response;
 using service::storage_owner_client::valid_success_maintenance_sequence;
@@ -216,6 +218,19 @@ void test_batch_policy_never_consumes_rpc_slot_without_credit() {
   assert(reclaimed.take == 7);
 }
 
+void test_busy_admission_retry_uses_bounded_exponential_backoff() {
+  assert(storage_owner_busy_retry_delay_ns(0) == 0);
+  assert(storage_owner_busy_retry_delay_ns(1) == 50'000);
+  assert(storage_owner_busy_retry_delay_ns(2) == 100'000);
+  assert(storage_owner_busy_retry_delay_ns(6) == 1'600'000);
+  assert(storage_owner_busy_retry_delay_ns(7) == 2'000'000);
+  assert(storage_owner_busy_retry_delay_ns(1'000) == 2'000'000);
+
+  assert(storage_owner_retry_deadline_elapsed(0, 100));
+  assert(!storage_owner_retry_deadline_elapsed(200, 199));
+  assert(storage_owner_retry_deadline_elapsed(200, 200));
+}
+
 void test_sender_consumes_only_the_queue_visible_prefix() {
   ScriptedPrefixQueue queue{{10, 11, 12}, 0};
   std::vector<u32> output;
@@ -298,6 +313,7 @@ int main() {
   test_expired_concurrent_tail_is_sent_intact();
   test_zero_hard_wait_flushes_immediately();
   test_batch_policy_never_consumes_rpc_slot_without_credit();
+  test_busy_admission_retry_uses_bounded_exponential_backoff();
   test_sender_consumes_only_the_queue_visible_prefix();
   test_expired_batch_still_waits_for_the_visible_fifo_head();
   test_update_completion_mode_owns_maintenance_sequence();

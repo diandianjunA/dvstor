@@ -45,15 +45,14 @@ def write_rows(source_path: pathlib.Path, target_path: pathlib.Path,
 
 
 def write_groundtruth(source_path: pathlib.Path, target_path: pathlib.Path,
-                      total_rows: int, topk: int, count: int) -> None:
+                      topk: int, count: int) -> None:
+    """Write the benchmark's header-plus-ID-only groundtruth format."""
     row_bytes = topk * 4
     ids_offset = HEADER.size
-    distances_offset = ids_offset + total_rows * row_bytes
     temporary = target_path.with_suffix(target_path.suffix + f".tmp.{os.getpid()}")
     with source_path.open("rb") as source, temporary.open("wb") as target:
         target.write(HEADER.pack(count, topk))
         copy_bytes(source, target, ids_offset, count * row_bytes)
-        copy_bytes(source, target, distances_offset, count * row_bytes)
     os.replace(temporary, target_path)
 
 
@@ -88,7 +87,7 @@ def main() -> None:
     write_rows(queries, args.output_dir / "recall_query.i8bin",
                0, args.recall_rows, query_dim)
     write_groundtruth(truth, args.output_dir / "recall_groundtruth.bin",
-                      gt_rows, gt_topk, args.recall_rows)
+                      gt_topk, args.recall_rows)
     write_rows(queries, args.output_dir / "performance_query.i8bin",
                args.recall_rows, args.performance_rows, query_dim)
     write_rows(queries, args.output_dir / "insert.i8bin",

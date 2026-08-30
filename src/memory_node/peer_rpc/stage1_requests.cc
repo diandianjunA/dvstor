@@ -551,6 +551,12 @@ MemoryNode::prepare_local_stage1_item(
     breakdown->storage_owner_write_node_ns += elapsed_ns_since(write_started);
   }
   vec<RemotePtr> backlink_targets;
+  // A physical-home attempt must remain bounded. In particular, a local
+  // Stage1 attempt runs as overlap work while remote-home Execute responses
+  // are already waiting to be consumed by the authority coordinator. An
+  // unbounded refresh loop here prevents those already-armed remote tokens
+  // from being committed and makes their Stage2 authority gates wait forever.
+  constexpr u64 kBridgeRefreshLimit = 2;
   u64 bridge_refreshes = 0;
   for (;;) {
     const auto backlink_started = std::chrono::steady_clock::now();
@@ -566,6 +572,27 @@ MemoryNode::prepare_local_stage1_item(
     // failure. Refresh the candidates and rewrite the still-private
     // provisional node's outgoing graph before trying a new parent set.
     ++bridge_refreshes;
+    if (bridge_refreshes > kBridgeRefreshLimit) {
+      const u64 retirement_sequence =
+        begin_storage_owner_maintenance_sequence(1);
+      (void)mark_node_deleted(target, item.generation);
+      retire_local_dynamic_node(target, retirement_sequence);
+      complete_storage_owner_maintenance_sequence(retirement_sequence);
+      {
+        std::lock_guard<std::mutex> lock(prepared_shard.mutex);
+        const auto position = prepared_records.find(key);
+        lib_assert(position != prepared_records.end() &&
+                     !position->second.prepared &&
+                     position->second.id == item.id &&
+                     position->second.generation == item.generation,
+                   "retryable Stage1 attempt lost its private reservation");
+        prepared_records.erase(position);
+      }
+      result.status = static_cast<u32>(MutationStatus::retry);
+      record_physical_stage1(
+        candidates.size(), remote_frontier.size(), neighbors.size());
+      return result;
+    }
     if (bridge_refreshes <= 8 ||
         (bridge_refreshes & (bridge_refreshes - 1)) == 0) {
       std::cerr << "[storage-owner] Stage1 reachability snapshot invalidated; "

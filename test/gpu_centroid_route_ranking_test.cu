@@ -231,11 +231,11 @@ __global__ void inspect_query_local_force_full_plan_kernel(
   // The async short is outside this helper's bounded authoritative-full
   // budget. A forced attempt zero therefore still retains three full tries.
   output[3] = gpu_search::graph_record_validation::snapshot_retry_available(
-    0, false, false, 4, 3) ? 1u : 0u;
+    0, 0, false, 4, 3) ? 1u : 0u;
   output[4] = gpu_search::graph_record_validation::snapshot_retry_available(
-    1, false, false, 4, 3) ? 1u : 0u;
+    1, 0, false, 4, 3) ? 1u : 0u;
   output[5] = gpu_search::graph_record_validation::snapshot_retry_available(
-    2, false, false, 4, 3) ? 1u : 0u;
+    2, 0, false, 4, 3) ? 1u : 0u;
 
   u32 state = initial_state;
   u32 authoritative_full_attempts = 0;
@@ -251,13 +251,39 @@ __global__ void inspect_query_local_force_full_plan_kernel(
       state = graph_read_state_after_fallback_admission(state);
     }
     if (!gpu_search::graph_record_validation::snapshot_retry_available(
-          attempt, false, false, 4, 3)) {
+          attempt, 0, false, 4, 3)) {
       break;
     }
   }
   output[6] = authoritative_full_attempts;
   output[7] = fallback_reads;
   output[8] = retry_reads;
+
+  u32 header_neighbor_state =
+    kGraphReadLogical | kGraphReadStartedWithShortExtent |
+    kGraphReadHeaderNeighborBody;
+  header_neighbor_state =
+    graph_read_state_after_header_neighbor_conflict(header_neighbor_state);
+  output[9] = header_neighbor_state;
+  for (u32 attempt = 0; attempt < 5; ++attempt) {
+    output[10 + attempt] =
+      gpu_search::graph_record_validation::snapshot_retry_available(
+        attempt, 2u, attempt < 2u, 5u, 3u) ? 1u : 0u;
+  }
+
+  u32 continued_header_neighbor_state =
+    kGraphReadStartedWithShortExtent | kGraphReadHeaderNeighborBody;
+  continued_header_neighbor_state =
+    graph_read_state_after_header_neighbor_conflict(
+      continued_header_neighbor_state);
+  const u32 continued_partial_attempts =
+    (continued_header_neighbor_state & kGraphReadLogical) != 0 ? 2u : 1u;
+  for (u32 attempt = 0; attempt < 5; ++attempt) {
+    output[15 + attempt] =
+      gpu_search::graph_record_validation::snapshot_retry_available(
+        attempt, continued_partial_attempts, attempt == 0u, 5u, 3u)
+        ? 1u : 0u;
+  }
 }
 
 __global__ void route_contention_query_kernel(PersistentKernelParams params,
@@ -642,7 +668,7 @@ void test_dynamic_graph_extent_hint_lifecycle() {
              "cudaMemset(dynamic extent stop)");
   u32* device_output = nullptr;
   check_cuda(cudaMalloc(
-    reinterpret_cast<void**>(&device_output), 9 * sizeof(u32)),
+    reinterpret_cast<void**>(&device_output), 20 * sizeof(u32)),
     "cudaMalloc(dynamic extent output)");
 
   PersistentKernelParams params{};
@@ -672,7 +698,7 @@ void test_dynamic_graph_extent_hint_lifecycle() {
     params, handle, class_five_bytes, class_two_bytes, device_output);
   check_cuda(cudaGetLastError(), "dynamic extent lifecycle launch");
   check_cuda(cudaDeviceSynchronize(), "dynamic extent lifecycle sync");
-  std::array<u32, 9> output{};
+  std::array<u32, 20> output{};
   check_cuda(cudaMemcpy(
     output.data(), device_output, sizeof(output), cudaMemcpyDeviceToHost),
     "cudaMemcpy(dynamic extent lifecycle output)");
@@ -741,6 +767,23 @@ void test_dynamic_graph_extent_hint_lifecycle() {
       "query-local force-full accounting mismatch: attempts/fallbacks/"
       "retries=" + std::to_string(output[6]) + "/" +
       std::to_string(output[7]) + "/" + std::to_string(output[8]));
+  }
+  const u32 header_neighbor_state = output[9];
+  if ((header_neighbor_state & gpu_search::persistent_kernel_detail::
+       kGraphReadHeaderNeighborBody) != 0 ||
+      (header_neighbor_state & gpu_search::persistent_kernel_detail::
+       kGraphReadNeedsExtentFallback) == 0 ||
+      (header_neighbor_state & gpu_search::persistent_kernel_detail::
+       kGraphReadHeaderNeighborFullFallback) == 0 ||
+      output[10] != 1 || output[11] != 1 || output[12] != 1 ||
+      output[13] != 1 || output[14] != 0) {
+    throw std::runtime_error(
+      "header-neighbor full-fallback retry plan mismatch");
+  }
+  if (output[15] != 1 || output[16] != 1 || output[17] != 1 ||
+      output[18] != 0 || output[19] != 0) {
+    throw std::runtime_error(
+      "continued header-neighbor full-fallback retry plan mismatch");
   }
 
   // The independent gate supports a base-only Live-Extent ablation without

@@ -285,30 +285,106 @@ __device__ bool resolve_handle(const PersistentKernelParams& params, u64 handle,
   return true;
 }
 
+__device__ __forceinline__ f32 accumulate_packed_pq_word(
+    const f32* query_lut, u32 subquantizer, u32 packed, f32 distance) {
+  // Keep the four additions in scalar subquantizer order. Besides preserving
+  // the existing distance/tie contract, this lets one naturally aligned load
+  // serve four independent LUT lookups.
+  distance +=
+    query_lut[static_cast<size_t>(subquantizer) * 256u + (packed & 0xffu)];
+  distance += query_lut[static_cast<size_t>(subquantizer + 1u) * 256u +
+                        ((packed >> 8u) & 0xffu)];
+  distance += query_lut[static_cast<size_t>(subquantizer + 2u) * 256u +
+                        ((packed >> 16u) & 0xffu)];
+  distance += query_lut[static_cast<size_t>(subquantizer + 3u) * 256u +
+                        (packed >> 24u)];
+  return distance;
+}
+
+template <u32 Subquantizers>
+__device__ __forceinline__ f32 approximate_entry_aligned_packed(
+    const f32* query_lut, const u8* code) {
+  static_assert(Subquantizers >= 4);
+  constexpr u32 kPackedWords = Subquantizers / 4u;
+  constexpr u32 kTail = Subquantizers % 4u;
+  const u32* packed_code = reinterpret_cast<const u32*>(code);
+  f32 distance = 0.0f;
+#pragma unroll
+  for (u32 word = 0; word < kPackedWords; ++word) {
+    distance = accumulate_packed_pq_word(
+      query_lut, word * 4u, packed_code[word], distance);
+  }
+  if constexpr (kTail != 0) {
+#pragma unroll
+    for (u32 tail = 0; tail < kTail; ++tail) {
+      const u32 subquantizer = kPackedWords * 4u + tail;
+      distance += query_lut[static_cast<size_t>(subquantizer) * 256u +
+                            code[subquantizer]];
+    }
+  }
+  return distance;
+}
+
+template <u32 Subquantizers>
+__device__ __forceinline__ f32 approximate_entry_mixed_alignment_packed(
+    const f32* query_lut, const u8* code) {
+  static_assert(Subquantizers >= 4);
+  // PQ25 codes are tightly packed: consecutive immutable and arena entries
+  // rotate through all four byte alignments. Consume at most three leading
+  // bytes to reach a natural u32 boundary, score the aligned body four codes
+  // per load, then consume at most three trailing bytes. This avoids both
+  // undefined/misaddressed unaligned u32 reads and padding every 100M-vector
+  // code entry solely for the GPU fast path.
+  const u32 misalignment =
+    static_cast<u32>(reinterpret_cast<uintptr_t>(code) & (alignof(u32) - 1u));
+  const u32 prefix = misalignment == 0 ? 0u : alignof(u32) - misalignment;
+  f32 distance = 0.0f;
+#pragma unroll
+  for (u32 index = 0; index < alignof(u32) - 1u; ++index) {
+    if (index < prefix) {
+      distance += query_lut[static_cast<size_t>(index) * 256u + code[index]];
+    }
+  }
+
+  const u32 packed_words = (Subquantizers - prefix) / 4u;
+  const u32* packed_code = reinterpret_cast<const u32*>(code + prefix);
+#pragma unroll
+  for (u32 word = 0; word < Subquantizers / 4u; ++word) {
+    if (word < packed_words) {
+      distance = accumulate_packed_pq_word(
+        query_lut, prefix + word * 4u, packed_code[word], distance);
+    }
+  }
+
+  const u32 tail_begin = prefix + packed_words * 4u;
+#pragma unroll
+  for (u32 tail = 0; tail < alignof(u32) - 1u; ++tail) {
+    const u32 subquantizer = tail_begin + tail;
+    if (subquantizer < Subquantizers) {
+      distance += query_lut[static_cast<size_t>(subquantizer) * 256u +
+                            code[subquantizer]];
+    }
+  }
+  return distance;
+}
+
 __device__ f32 approximate_entry(const PersistentKernelParams& params,
                                  const f32* query_lut, const u8* code) {
+  const bool aligned =
+    reinterpret_cast<uintptr_t>(code) % alignof(u32) == 0;
   f32 distance = 0.0f;
-  if (params.pq_subquantizers == 32 &&
-      reinterpret_cast<uintptr_t>(code) % alignof(u32) == 0) {
-    // The production PQ32 layout is four-byte aligned for both the immutable
-    // code array and incarnation-published dynamic records. Load one packed
-    // word for four adjacent subquantizers, then retain the exact scalar
-    // accumulation order. This removes 24 code-load instructions per
-    // candidate without changing LUT precision, search work, or tie order.
-    const u32* packed_code = reinterpret_cast<const u32*>(code);
-#pragma unroll
-    for (u32 word = 0; word < 8; ++word) {
-      const u32 packed = packed_code[word];
-      const u32 subquantizer = word * 4u;
-      distance +=
-        query_lut[static_cast<size_t>(subquantizer) * 256u + (packed & 0xffu)];
-      distance += query_lut[static_cast<size_t>(subquantizer + 1u) * 256u +
-                            ((packed >> 8u) & 0xffu)];
-      distance += query_lut[static_cast<size_t>(subquantizer + 2u) * 256u +
-                            ((packed >> 16u) & 0xffu)];
-      distance += query_lut[static_cast<size_t>(subquantizer + 3u) * 256u +
-                            (packed >> 24u)];
-    }
+  if (params.pq_subquantizers == 20 && aligned) {
+    // The 20-byte stride preserves cudaMalloc's natural alignment for base
+    // codes and the dynamic arena; RDMA payloads begin after an aligned tag.
+    distance = approximate_entry_aligned_packed<20>(query_lut, code);
+  } else if (params.pq_subquantizers == 25) {
+    distance = aligned
+      ? approximate_entry_aligned_packed<25>(query_lut, code)
+      : approximate_entry_mixed_alignment_packed<25>(query_lut, code);
+  } else if (params.pq_subquantizers == 32 && aligned) {
+    // Preserve the established fully unrolled PQ32 path: eight code loads
+    // replace 32 scalar loads without changing accumulation order.
+    distance = approximate_entry_aligned_packed<32>(query_lut, code);
   } else {
     for (u32 subquantizer = 0; subquantizer < params.pq_subquantizers;
          ++subquantizer) {

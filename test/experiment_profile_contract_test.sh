@@ -255,20 +255,25 @@ grep -Fq 'gpu-query-beam-merge-policy = legacy' "$manual_ini"
 # adaptive mode does.  Storage validation likewise requires the same bound PQ
 # code sidecar for both profiles.
 artifact_index_dir="$TEST_DIR/artifact-index"
-artifact_prefix="$artifact_index_dir/sift100m_R96_bw128_metis_pmd32_pq32_schema16"
-python3 - "$artifact_prefix" <<'PY_ARTIFACT_FIXTURE'
+artifact_converted_dir="$TEST_DIR/artifact-converted"
+artifact_data_file="$artifact_converted_dir/base_1.u8bin"
+artifact_partition_strategy=balanced
+artifact_prefix="$artifact_index_dir/sift100m_R96_bw128_${artifact_partition_strategy}_pmd32_pq32_schema16"
+python3 - "$artifact_prefix" "$artifact_data_file" \
+  "$artifact_partition_strategy" <<'PY_ARTIFACT_FIXTURE'
 import json
 import os
 import struct
 import sys
 
-prefix = sys.argv[1]
+prefix, data_file, partition_strategy = sys.argv[1:]
 os.makedirs(os.path.dirname(prefix), exist_ok=True)
 fingerprint = 0x123456789ABCDEF0
 entry_bytes = 800
 entry_capacity = (entry_bytes - 16) // 8
 metadata = {
     'output_prefix': prefix,
+    'data_file': data_file,
     'schema_version': 16,
     'distance': 'l2',
     'node_layout': 'plain',
@@ -284,7 +289,9 @@ metadata = {
     'navigation_code_bytes': 32,
     'pq_subquantizers': 32,
     'pq_bits': 8,
-    'partition_strategy': 'metis',
+    'partition_strategy': partition_strategy,
+    'partition_imbalance': 1.03,
+    'alpha': 1.2,
     'partition_max_degree': 32,
     'idmap_format': 'owner_sharded_v2_bound',
     'centroid_state_format': 'physical_shard_centroid_v2_bound',
@@ -355,6 +362,7 @@ validate_profile_artifacts() {
     PATH="$PATH" \
     EXPERIMENT_DIR="$EXPERIMENT_DIR" \
     INDEX_DIR="$artifact_index_dir" \
+    CONVERTED_DIR="$artifact_converted_dir" \
     R=96 \
     BUILD_BEAM=128 \
     DIM=128 \

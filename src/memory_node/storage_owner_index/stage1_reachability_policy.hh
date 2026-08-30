@@ -16,6 +16,12 @@ namespace memory_node_storage_owner_index_detail {
 // retirement without making that cost grow with R.
 inline constexpr u32 kStage1ReachabilityBridgeGoal = 2;
 
+// Lock contention is worth retrying against the same candidate snapshot, but
+// it must not pin a physical Stage1 worker forever.  Once this small bounded
+// window expires, the caller refreshes its search/prune snapshot and tries a
+// different parent set while the still-private provisional node remains safe.
+inline constexpr u32 kStage1BridgeBusyRetryLimit = 8;
+
 enum class Stage1BridgeInstallDisposition : u8 {
   rejected,
   busy,
@@ -87,6 +93,7 @@ vec<RemotePtr> select_stage1_reachability_bridges_retry_busy(
     const size_t dynamic_record_bytes,
     TryInstall&& try_install,
     WaitForRetry&& wait_for_retry) {
+  u32 busy_retries = 0;
   for (;;) {
     bool saw_busy = false;
     vec<RemotePtr> accepted = select_stage1_reachability_bridges(
@@ -98,9 +105,12 @@ vec<RemotePtr> select_stage1_reachability_bridges_retry_busy(
           disposition == Stage1BridgeInstallDisposition::busy;
         return disposition == Stage1BridgeInstallDisposition::installed;
       });
-    if (!accepted.empty() || !saw_busy || !wait_for_retry()) {
+    if (!accepted.empty() || !saw_busy ||
+        busy_retries == kStage1BridgeBusyRetryLimit) {
       return accepted;
     }
+    ++busy_retries;
+    if (!wait_for_retry()) return accepted;
   }
 }
 

@@ -302,21 +302,25 @@ DVSTOR_GRAPH_RECORD_HD ReadAction decide_read_action(
   return attempts_remain ? ReadAction::retry : ReadAction::fail;
 }
 
-// A live-extent hint attempt is outside the authoritative full-record
-// snapshot budget. `batch_attempt` is zero based. Once an entry has upgraded
-// to full, an entry that started short has consumed one fewer full attempt
-// than an entry that started full in the same mixed batch.
+// Optimistic partial attempts are outside the authoritative full-record
+// snapshot budget. `batch_attempt` is zero based. Live-Extent uses one
+// optimistic prefix; Header->Neighbor uses two before falling back after a
+// cross-read checksum conflict. Once an entry has upgraded to full, subtract
+// those partial attempts so it still receives the complete full-read budget.
 DVSTOR_GRAPH_RECORD_HD bool snapshot_retry_available(
     std::uint32_t batch_attempt,
-    bool started_with_short_extent,
+    std::uint32_t optimistic_partial_attempts,
     bool current_read_is_partial,
     std::uint32_t maximum_batch_attempts,
     std::uint32_t maximum_full_attempts) {
   if (batch_attempt + 1u >= maximum_batch_attempts) return false;
   if (current_read_is_partial) return maximum_full_attempts != 0;
-  if (started_with_short_extent && batch_attempt == 0) return false;
+  const std::uint32_t completed_attempts = batch_attempt + 1u;
+  const std::uint32_t completed_optimistic_attempts =
+    optimistic_partial_attempts < completed_attempts
+      ? optimistic_partial_attempts : completed_attempts;
   const std::uint32_t full_attempts_after_current =
-    batch_attempt + 1u - (started_with_short_extent ? 1u : 0u);
+    completed_attempts - completed_optimistic_attempts;
   return full_attempts_after_current < maximum_full_attempts;
 }
 

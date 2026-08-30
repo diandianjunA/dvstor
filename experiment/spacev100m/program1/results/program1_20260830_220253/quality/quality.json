@@ -1,0 +1,81 @@
+{
+  "finalized_self_recall": {
+    "hit_rate": 0.996,
+    "k": 10,
+    "queries": 1000
+  },
+  "input": {
+    "insert_dim": 100,
+    "insert_dtype": "int8",
+    "insert_rows": 10000000,
+    "query_dim": 0,
+    "query_dtype": "none",
+    "query_rows": 0
+  },
+  "insert": {
+    "attempted": 1000,
+    "duration_seconds": 1.394324741,
+    "failed": 0,
+    "inserted": 1000,
+    "inserts_per_second": 717.1930401828823
+  },
+  "meta": {
+    "baseline_groundtruth_file": "",
+    "dim": 100,
+    "fine_grained_breakdown_enabled": true,
+    "insert_batch_size": 16,
+    "insert_count_effective": 1000,
+    "insert_count_requested": 1000,
+    "insert_file": "/data/xjs/datasets/spacev1b/spacev100m/spacev110m_to_120m_insert.i8bin",
+    "insert_row_offset": 0,
+    "insert_start_id": 101000000,
+    "insert_threads": 16,
+    "max_vectors_config": 100000000,
+    "navigation_quantizer": "opq_pq",
+    "post_groundtruth_file": "",
+    "query_file": "",
+    "recall_k": 10,
+    "recall_queries": 10000,
+    "reset_breakdown_every": 50000,
+    "search": "gpu_persistent_opq_pq",
+    "self_recall_k": 10,
+    "self_recall_queries": 1000,
+    "service_config": "/home/xjs/experiment/dvstor/experiment/spacev100m/program1/results/program1_20260830_220253/quality/service.ini",
+    "settle_seconds": 30,
+    "storage_owner_maintenance_workers": 8,
+    "storage_owner_update_protocol": "centroid_home_two_stage"
+  },
+  "self_recall_delta": {
+    "final_minus_stage1": 0.16200000000000003,
+    "stage1_final_result_overlap_at_k": 0.9729999999999972,
+    "stage1_minus_final": -0.16200000000000003
+  },
+  "stage1_only_self_recall": {
+    "hit_rate": 0.834,
+    "k": 10,
+    "queries": 1000
+  },
+  "stage1_only_window": {
+    "configured_stage2_delay_seconds": 15.0,
+    "insert_plus_recall_seconds": 4.438647434,
+    "valid": true
+  },
+  "stage2_finalization": {
+    "complete": true,
+    "drain_seconds_after_settle": 5.538e-05,
+    "durable_sequences": [
+      0,
+      998,
+      2,
+      0,
+      0
+    ],
+    "target_sequences": [
+      0,
+      998,
+      2,
+      0,
+      0
+    ]
+  }
+}

@@ -107,6 +107,12 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
   for (u32 offset = 0; offset < owner_count; ++offset) {
     const u32 owner = (first_owner + offset) % owner_count;
     auto& state = *storage_insert_owners_[owner];
+    const u64 owner_now_ns = now_ns();
+    if (!storage_owner_retry_deadline_elapsed(
+          state.retry_not_before_ns.load(std::memory_order_acquire),
+          owner_now_ns)) {
+      continue;
+    }
     const u32 batch_max = std::max<u32>(
       1, config_.storage_owner_batch_max);
     const u32 initially_ready = state.published_tasks.load(

@@ -180,6 +180,22 @@ void test_permanent_rejection_does_not_retry() {
   assert(waits == 0);
 }
 
+void test_permanent_busy_is_bounded_and_returns_to_snapshot_refresh() {
+  using namespace memory_node_storage_owner_index_detail;
+  const vec<RemotePtr> targets{pointer(0, 0x1000), pointer(0, 0x2000)};
+  u32 waits = 0;
+  const vec<RemotePtr> accepted =
+    select_stage1_reachability_bridges_retry_busy(
+      pointer(0, 0xc000, 2), span<const RemotePtr>{targets}, 256,
+      [](RemotePtr) { return Stage1BridgeInstallDisposition::busy; },
+      [&]() {
+        ++waits;
+        return true;
+      });
+  assert(accepted.empty());
+  assert(waits == kStage1BridgeBusyRetryLimit);
+}
+
 }  // namespace
 
 int main() {
@@ -190,5 +206,6 @@ int main() {
   test_duplicates_do_not_consume_attempt_or_certificate_capacity();
   test_transient_busy_sweep_retries_without_rejecting_insert();
   test_permanent_rejection_does_not_retry();
+  test_permanent_busy_is_bounded_and_returns_to_snapshot_refresh();
   return 0;
 }

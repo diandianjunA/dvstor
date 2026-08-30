@@ -463,15 +463,23 @@ void test_graph_live_extent_reconstructs_canonical_record() {
                                                  promoted_word));
   // The optimistic hint is not charged against the legacy three full-record
   // snapshot attempts. Fixed/full: attempts 0,1 may retry and 2 is final.
-  assert(validation::snapshot_retry_available(0, false, false, 3, 3));
-  assert(validation::snapshot_retry_available(1, false, false, 3, 3));
-  assert(!validation::snapshot_retry_available(2, false, false, 3, 3));
+  assert(validation::snapshot_retry_available(0, 0, false, 3, 3));
+  assert(validation::snapshot_retry_available(1, 0, false, 3, 3));
+  assert(!validation::snapshot_retry_available(2, 0, false, 3, 3));
   // Live: attempt 0 is short; attempts 1,2,3 remain three independent full
   // opportunities, with the third full attempt final.
-  assert(validation::snapshot_retry_available(0, true, true, 4, 3));
-  assert(validation::snapshot_retry_available(1, true, false, 4, 3));
-  assert(validation::snapshot_retry_available(2, true, false, 4, 3));
-  assert(!validation::snapshot_retry_available(3, true, false, 4, 3));
+  assert(validation::snapshot_retry_available(0, 1, true, 4, 3));
+  assert(validation::snapshot_retry_available(1, 1, false, 4, 3));
+  assert(validation::snapshot_retry_available(2, 1, false, 4, 3));
+  assert(!validation::snapshot_retry_available(3, 1, false, 4, 3));
+  // Header->Neighbor consumes two optimistic partial reads. A checksum
+  // conflict between them must still leave all three authoritative full
+  // attempts available: attempts 2,3 may retry and attempt 4 is final.
+  assert(validation::snapshot_retry_available(0, 2, true, 5, 3));
+  assert(validation::snapshot_retry_available(1, 2, true, 5, 3));
+  assert(validation::snapshot_retry_available(2, 2, false, 5, 3));
+  assert(validation::snapshot_retry_available(3, 2, false, 5, 3));
+  assert(!validation::snapshot_retry_available(4, 2, false, 5, 3));
   // R=128 plus eight provisional slots requires 17 classes; a four-bit
   // encoding would silently truncate this supported layout.
   assert(validation::graph_extent_bytes_for_class(

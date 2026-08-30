@@ -2243,6 +2243,7 @@ inline constexpr u32 kGraphReadStartedWithShortExtent = 2u;
 inline constexpr u32 kGraphReadNeedsExtentFallback = 4u;
 inline constexpr u32 kGraphReadExtentUnderhint = 8u;
 inline constexpr u32 kGraphReadHeaderNeighborBody = 16u;
+inline constexpr u32 kGraphReadHeaderNeighborFullFallback = 32u;
 
 #ifdef __CUDACC__
 __host__ __device__
@@ -2267,6 +2268,16 @@ __host__ __device__
   inline constexpr u32
   graph_read_state_after_fallback_admission(u32 state) {
   return state & ~kGraphReadNeedsExtentFallback;
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+  inline constexpr u32
+  graph_read_state_after_header_neighbor_conflict(u32 state) {
+  return (state & ~kGraphReadHeaderNeighborBody) |
+         kGraphReadNeedsExtentFallback |
+         kGraphReadHeaderNeighborFullFallback;
 }
 
 struct GraphReadAdmissionAccounting {
@@ -4268,13 +4279,16 @@ __device__ u32 fetch_graph_records_batch(
   // condition. Re-read only invalid entries and reserve fail-stop for a record
   // that remains invalid after the bounded snapshot attempts.
   constexpr u32 kFullGraphSnapshotAttempts = 3;
-  // A failed optimistic short read is an extent-hint upgrade, not one of the
-  // full-record snapshot retries available to the fixed path. Mixed batches
-  // therefore need at most one short attempt plus the legacy three full
-  // attempts. Entries that began full are still capped at exactly three.
-  const u32 maximum_batch_attempts = live_extent_enabled
-                                       ? kFullGraphSnapshotAttempts + 1u
-                                       : kFullGraphSnapshotAttempts;
+  // Live-Extent needs at most one optimistic prefix plus the legacy three
+  // full attempts. Header->Neighbor normally completes in two partial reads;
+  // if they cross a mutation, preserve all three authoritative full attempts
+  // after the two-read optimistic sequence instead of alternating forever.
+  constexpr u32 kHeaderNeighborOptimisticAttempts = 2;
+  const u32 maximum_batch_attempts =
+    header_neighbor
+      ? kFullGraphSnapshotAttempts + kHeaderNeighborOptimisticAttempts
+      : live_extent_enabled ? kFullGraphSnapshotAttempts + 1u
+                            : kFullGraphSnapshotAttempts;
   for (u32 attempt = 0; attempt < maximum_batch_attempts; ++attempt) {
     if (threadIdx.x == 0) retry_pending = 0;
     for (u32 shard = threadIdx.x; shard < params.num_shards;
@@ -4581,10 +4595,23 @@ __device__ u32 fetch_graph_records_batch(
           : graph_record_validation::SnapshotState::invalid;
       const bool started_with_short =
         (remote_reads[index] & kGraphReadStartedWithShortExtent) != 0;
+      const bool header_neighbor_full_fallback =
+        header_neighbor &&
+        (remote_reads[index] & kGraphReadHeaderNeighborFullFallback) != 0;
+      // A logical bit cleared on entry means the header was already admitted
+      // by the caller's asynchronous prefix path. In that case only the body
+      // attempt belongs to this batch; the ordinary path owns both partial
+      // attempts here.
+      const u32 optimistic_partial_attempts =
+        header_neighbor_full_fallback
+          ? (remote_reads[index] & kGraphReadLogical) != 0
+              ? kHeaderNeighborOptimisticAttempts
+              : 1u
+          : started_with_short ? 1u : 0u;
       const bool attempts_remain =
         graph_record_validation::snapshot_retry_available(
-          attempt, started_with_short, partial_read, maximum_batch_attempts,
-          kFullGraphSnapshotAttempts);
+          attempt, optimistic_partial_attempts, partial_read,
+          maximum_batch_attempts, kFullGraphSnapshotAttempts);
       const graph_record_validation::ReadAction action =
         short_read_requires_full
           ? (attempts_remain ? graph_record_validation::ReadAction::retry
@@ -4633,9 +4660,12 @@ __device__ u32 fetch_graph_records_batch(
               graph_record_validation::kGraphRecordHeaderBytes;
             request_local_iovas[index] -=
               graph_record_validation::kGraphRecordHeaderBytes;
-            remote_reads[index] &= ~kGraphReadHeaderNeighborBody;
-            request_bytes[index] =
-              graph_record_validation::kGraphRecordHeaderBytes;
+            remote_reads[index] =
+              graph_read_state_after_header_neighbor_conflict(
+                remote_reads[index]);
+            request_bytes[index] = params.graph_entry_bytes;
+          } else if (header_neighbor_full_fallback) {
+            request_bytes[index] = params.graph_entry_bytes;
           } else if (extent_underhint) {
             request_offsets[index] +=
               graph_record_validation::kGraphRecordHeaderBytes;

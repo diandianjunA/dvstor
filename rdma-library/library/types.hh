@@ -1,9 +1,6 @@
 #ifndef RDMA_LIBRARY_TYPES_HH
 #define RDMA_LIBRARY_TYPES_HH
 
-#include <oneapi/tbb/concurrent_queue.h>
-#include <oneapi/tbb/concurrent_vector.h>
-
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -85,10 +82,6 @@ private:
 };
 
 template <typename T>
-using concurrent_vec = oneapi::tbb::concurrent_vector<T>;
-
-template <typename T>
 using concurrent_queue = moodycamel::ConcurrentQueue<T>;
-// using concurrent_queue = oneapi::tbb::concurrent_queue<T>;
 
 #endif  // RDMA_LIBRARY_TYPES_HH

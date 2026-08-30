@@ -386,6 +386,25 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     bool stage1_receipt_released{};
   };
   vec<MutationPlan> plans(item_count);
+  // Physical Stage1 may already have armed a runnable Stage2 descriptor when
+  // this coordinator hits a shutdown, transport exception, or another early
+  // return.  Leaving the corresponding authority lease active makes that
+  // descriptor's no-op placement gate return busy forever.  Abort every
+  // uncommitted lease on scope exit; an armed Stage2 then observes stale and
+  // performs its normal provisional-record cleanup, while a public retry can
+  // safely reacquire the same semantic token. Committed plans are durable and
+  // deliberately excluded.
+  const auto abort_uncommitted_leases = [&](void*) {
+    for (size_t index = 0; index < plans.size(); ++index) {
+      MutationPlan& plan = plans[index];
+      if (!plan.active || plan.authority_committed) continue;
+      (void)abort_authority_mutation(ids[index], plan.operation);
+      plan.active = false;
+    }
+  };
+  std::unique_ptr<void, decltype(abort_uncommitted_leases)>
+    uncommitted_lease_guard{
+      reinterpret_cast<void*>(1), abort_uncommitted_leases};
   dense_hashmap_t<u32, vec<size_t>> stage1_groups;
   const auto plan_index_for_token = [&](u32 token_source,
                                         u64 token_operation) -> size_t {
@@ -745,7 +764,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   } catch (...) {
     // A callback can fail after committing only part of a remote home. Drain
     // exactly those committed receipt debts before propagating the exception;
-    // uncommitted prepares remain replayable under their authority leases.
+    // the scope guard aborts uncommitted leases so an already-armed Stage2
+    // descriptor cannot remain behind a permanently busy authority gate.
     auto debt = collect_remote_stage1_release_debt();
     if (!debt.empty()) {
       const auto release_started = std::chrono::steady_clock::now();

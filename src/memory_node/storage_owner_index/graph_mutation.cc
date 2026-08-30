@@ -345,15 +345,11 @@ vec<RemotePtr> MemoryNode::install_local_provisional_backlinks(
     return {};
   }
 
-  // A fresh insert cannot be reported as a permanent mutation failure merely
-  // because maintenance held every eligible parent lock or all eligible
-  // parents temporarily used their bounded provisional slots.  Stage2 frees
-  // those slots when it promotes/removes the corresponding reachability
-  // bridges, so both conditions are ordinary backpressure.  Keep retrying
-  // while at least one live target is busy or capacity-blocked.  A sweep with
-  // neither remains terminal (all candidates are stale, remote, deleted, or
-  // otherwise permanently ineligible), so this cannot spin on an impossible
-  // graph.
+  // Lock contention may clear while this candidate snapshot is still useful,
+  // so retry it briefly. A full provisional plane is different: none of this
+  // snapshot's capacity can improve until Stage2 changes the graph. Report it
+  // as ineligible so prepare_local_stage1_item refreshes search/prune and can
+  // choose another parent set instead of pinning one worker on hot hubs.
   const auto try_install = [&](const RemotePtr target) {
       using InstallDisposition =
         memory_node_storage_owner_index_detail::
@@ -392,7 +388,7 @@ vec<RemotePtr> MemoryNode::install_local_provisional_backlinks(
       if (adjacency.provisional.size() >=
           VamanaNode::provisional_slots()) {
         unlock_node(target);
-        return InstallDisposition::busy;
+        return InstallDisposition::rejected;
       }
 
       adjacency.provisional.push_back(candidate);

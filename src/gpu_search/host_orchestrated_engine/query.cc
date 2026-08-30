@@ -370,8 +370,8 @@ void HostOrchestratedSearchEngine::Impl::fetch_graph_wave(
       }
       const bool attempts_remain =
         graph_record_validation::snapshot_retry_available(
-          attempt, state.started_partial, state.partial, maximum_batch_attempts,
-          kFullGraphSnapshotAttempts);
+          attempt, state.started_partial ? 1u : 0u, state.partial,
+          maximum_batch_attempts, kFullGraphSnapshotAttempts);
       if (!attempts_remain) {
         throw std::runtime_error(
           "host query graph snapshot validation failed after bounded "

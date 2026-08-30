@@ -1,4 +1,5 @@
 #include "service/compute_service/detail.hh"
+#include "service/compute_service/storage_owner/batch_policy.hh"
 #include "service/compute_service/storage_owner/response_validation.hh"
 
 using namespace compute_service_detail;
@@ -149,6 +150,13 @@ void ComputeService::handle_storage_owner_token_completion(
     throw std::runtime_error("malformed storage-owner token completion");
   }
 
+  // The storage worker posts terminal completions immediately before its
+  // accepted-batch context guard returns the admission credit. Let the sender
+  // probe again now; if that tiny race still observes busy, the ordinary
+  // backoff is simply re-established.
+  state.consecutive_busy_batches.store(0, std::memory_order_release);
+  state.retry_not_before_ns.store(0, std::memory_order_release);
+
   const u32 task_id = static_cast<u32>(completion.operation_id);
   const u32 generation = static_cast<u32>(completion.operation_id >> 32);
   if (task_id >= state.task_capacity) {
@@ -260,6 +268,32 @@ void ComputeService::commit_storage_owner_slot(
   }
   if (slot.response_valid &&
       ack_status == service::storage_owner::MutationBatchAckStatus::busy) {
+    const u32 busy_streak =
+      state.consecutive_busy_batches.fetch_add(
+        1, std::memory_order_acq_rel) + 1;
+    const u64 retry_delay_ns =
+      storage_owner_busy_retry_delay_ns(busy_streak);
+    const u64 now_ns = static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    state.retry_not_before_ns.store(
+      now_ns + retry_delay_ns, std::memory_order_release);
+    ++state.busy_batches;
+    state.busy_items += slot.tasks.size();
+    state.max_consecutive_busy_batches = std::max(
+      state.max_consecutive_busy_batches, busy_streak);
+    if (state.busy_batches >= 32 &&
+        (state.busy_batches & (state.busy_batches - 1)) == 0) {
+      std::cerr << "[storage-owner] sender admission backoff owner="
+                << owner_storage
+                << " busy_batches=" << state.busy_batches
+                << " busy_items=" << state.busy_items
+                << " consecutive=" << busy_streak
+                << " max_consecutive="
+                << state.max_consecutive_busy_batches
+                << " retry_delay_us=" << (retry_delay_ns / 1000.0)
+                << std::endl;
+    }
     for (const u32 task_id : slot.tasks) {
       state.tasks[task_id].sender_dequeued_at = {};
       state.queue->push_wait(task_id);

@@ -173,6 +173,13 @@ private:
     // dequeue-visible prefix. The single progress consumer subtracts only the
     // prefix it actually popped.
     std::atomic<u32> published_tasks{0};
+    // Admission backpressure is authority-wide. A busy ACK schedules a short
+    // retry deadline; any real token completion clears it because the remote
+    // batch-context guard is about to return capacity. Both fields are atomic
+    // because ACKs are committed by the response thread while token
+    // completions are consumed by the CQ/progress thread.
+    std::atomic<u32> consecutive_busy_batches{0};
+    std::atomic<u64> retry_not_before_ns{0};
     // One assembler per logical authority. Physical-home fanout happens at
     // the authority after acceptance; splitting this queue by home produces
     // 25 sparse flows and destroys useful foreground batching.
@@ -211,6 +218,9 @@ private:
     u64 max_rpc_wall_ns{};
     u32 max_active_rpcs{};
     u32 max_published_tasks{};
+    u64 busy_batches{};
+    u64 busy_items{};
+    u32 max_consecutive_busy_batches{};
   };
 
   struct StorageOwnerReadySlot {

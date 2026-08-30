@@ -11,6 +11,14 @@ add_test(NAME experiment_profile_contract_test
          COMMAND bash
                  ${CMAKE_SOURCE_DIR}/test/experiment_profile_contract_test.sh)
 
+add_test(NAME spacev_data_preparation_test
+         COMMAND python3
+                 ${CMAKE_SOURCE_DIR}/test/spacev_data_preparation_test.py)
+
+add_test(NAME deep_data_preparation_test
+         COMMAND python3
+                 ${CMAKE_SOURCE_DIR}/test/deep_data_preparation_test.py)
+
 add_executable(breakdown_benchmark_support_test breakdown_benchmark_support_test.cc)
 dvstor_target_tool_includes(breakdown_benchmark_support_test)
 target_link_libraries(breakdown_benchmark_support_test PRIVATE dvstor_breakdown_support)
@@ -290,6 +298,19 @@ if (TARGET dvstor_gpu_kernels)
     add_test(NAME gpu_compact_beam_merge_test
         COMMAND gpu_compact_beam_merge_test)
     set_tests_properties(gpu_compact_beam_merge_test PROPERTIES
+        TIMEOUT 15
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+
+    add_executable(gpu_pq_packed_scoring_test
+        gpu_pq_packed_scoring_test.cu)
+    dvstor_target_common_includes(gpu_pq_packed_scoring_test)
+    target_link_libraries(gpu_pq_packed_scoring_test PRIVATE CUDA::cudart)
+    target_compile_options(gpu_pq_packed_scoring_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    add_test(NAME gpu_pq_packed_scoring_test
+        COMMAND gpu_pq_packed_scoring_test)
+    set_tests_properties(gpu_pq_packed_scoring_test PROPERTIES
         TIMEOUT 15
         SKIP_REGULAR_EXPRESSION "^SKIP:")
 
