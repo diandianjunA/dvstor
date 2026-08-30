@@ -4265,17 +4265,17 @@ __device__ __forceinline__ void process_query(
           const bool resolved =
             resolve_handle(params, handle, raw, shard, graph_offset);
           exact_resolved += resolved ? 1u : 0u;
-          const u8* record =
-            params.exact_records +
-            (static_cast<size_t>(descriptor.query_slot) *
-               params.exact_width + index) *
-              params.node_record_stride;
-          const u64 before = *reinterpret_cast<const u64*>(record);
-          const u64 after = *reinterpret_cast<const u64*>(
-            record + params.node_record_bytes);
+          const u8 *record =
+              params.exact_records +
+              (static_cast<size_t>(descriptor.query_slot) * params.exact_width +
+               index) *
+                  params.node_record_stride;
+          const u64 before = *reinterpret_cast<const u64 *>(record);
+          const u64 after = *reinterpret_cast<const u64 *>(
+              record + exact_record_trailer_offset(params.node_record_bytes));
           exact_equal_headers += before == after ? 1u : 0u;
           const bool visible =
-            resolved && exact_record_visible(params, record, handle);
+              resolved && exact_record_visible(params, record, handle);
           exact_visible += visible ? 1u : 0u;
           if (!visible &&
               first_exact_handle == kInvalidDeviceHandle) {

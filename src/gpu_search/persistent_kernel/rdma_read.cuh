@@ -648,19 +648,19 @@ __device__ i32 wait_direct_batch(const PersistentKernelParams& params,
 #endif
 }
 
-__device__ bool exact_record_visible(const PersistentKernelParams& params,
-                                     const u8* record, u64 handle) {
-  const u64 before = *reinterpret_cast<const u64*>(record);
-  const u64 after = *reinterpret_cast<const u64*>(
-    record + params.node_record_bytes);
+__device__ bool exact_record_visible(const PersistentKernelParams &params,
+                                     const u8 *record, u64 handle) {
+  const u64 before = *reinterpret_cast<const u64 *>(record);
+  const u64 after = *reinterpret_cast<const u64 *>(
+      record + exact_record_trailer_offset(params.node_record_bytes));
   const u32 expected_incarnation = remote_incarnation(handle);
-  const u32 stored_incarnation = *reinterpret_cast<const u32*>(
-    record + params.node_incarnation_offset);
+  const u32 stored_incarnation =
+      *reinterpret_cast<const u32 *>(record + params.node_incarnation_offset);
   return before == after &&
-    (before & (kNodeLockMask | kNodeDeletedMask)) == 0 &&
-    static_cast<u32>(before >> kNodeHeaderIncarnationShift) ==
-      expected_incarnation &&
-    stored_incarnation == expected_incarnation;
+         (before & (kNodeLockMask | kNodeDeletedMask)) == 0 &&
+         static_cast<u32>(before >> kNodeHeaderIncarnationShift) ==
+             expected_incarnation &&
+         stored_incarnation == expected_incarnation;
 }
 
 // A terminal-horizon exact prefetch has a one-round lifetime: it starts only
@@ -745,22 +745,20 @@ terminal_exact_cache_scratch(const PersistentKernelParams& params,
 // the stored incarnation is a complete exact snapshot obtained during this
 // query. A later update linearizes after that snapshot and cannot mutate the
 // retained physical incarnation.
-__device__ __forceinline__ bool terminal_exact_cache_payload_valid(
-    const PersistentKernelParams& params,
-    const u8* record,
-    u64 handle) {
-  const u64 header = *reinterpret_cast<const u64*>(record);
-  const u64 trailer = *reinterpret_cast<const u64*>(
-    record + params.node_record_bytes);
+__device__ __forceinline__ bool
+terminal_exact_cache_payload_valid(const PersistentKernelParams &params,
+                                   const u8 *record, u64 handle) {
+  const u64 header = *reinterpret_cast<const u64 *>(record);
+  const u64 trailer = *reinterpret_cast<const u64 *>(
+      record + exact_record_trailer_offset(params.node_record_bytes));
   const u32 expected_incarnation = remote_incarnation(handle);
-  const u32 stored_incarnation = *reinterpret_cast<const u32*>(
-    record + params.node_incarnation_offset);
-  return
-    header == trailer &&
-    (header & (kNodeLockMask | kNodeDeletedMask)) == 0 &&
-    static_cast<u32>(header >> kNodeHeaderIncarnationShift) ==
-      expected_incarnation &&
-    stored_incarnation == expected_incarnation;
+  const u32 stored_incarnation =
+      *reinterpret_cast<const u32 *>(record + params.node_incarnation_offset);
+  return header == trailer &&
+         (header & (kNodeLockMask | kNodeDeletedMask)) == 0 &&
+         static_cast<u32>(header >> kNodeHeaderIncarnationShift) ==
+             expected_incarnation &&
+         stored_incarnation == expected_incarnation;
 }
 
 // Publish one optional fenced snapshot wave without waiting. This descriptor is
@@ -795,13 +793,14 @@ __device__ void begin_terminal_exact_cache_prefetch(
     return;
   }
 
-  for (u32 index = threadIdx.x;
-       index < 2u * state.candidate_count;
+  for (u32 index = threadIdx.x; index < 2u * state.candidate_count;
        index += blockDim.x) {
     scratch.request_shards[index] = UINT32_MAX;
     scratch.remote_offsets[index] = 0;
     scratch.local_iova_offsets[index] =
-      index < state.candidate_count ? 0u : params.node_record_bytes;
+        index < state.candidate_count
+            ? 0u
+            : exact_record_trailer_offset(params.node_record_bytes);
   }
   for (u32 index = threadIdx.x; index < state.candidate_count;
        index += blockDim.x) {
@@ -815,19 +814,18 @@ __device__ void begin_terminal_exact_cache_prefetch(
     }
     scratch.request_shards[index] = shard;
     scratch.remote_offsets[index] =
-      remote_byte_offset(raw) + params.node_meta_offset;
-    u8* destination =
-      scratch.record_base +
-      static_cast<size_t>(index) * params.node_record_stride;
+        remote_byte_offset(raw) + params.node_meta_offset;
+    u8 *destination = scratch.record_base +
+                      static_cast<size_t>(index) * params.node_record_stride;
     scratch.local_iova_offsets[index] =
-      reinterpret_cast<u64>(destination) -
-      params.direct_local_iova_base;
+        reinterpret_cast<u64>(destination) - params.direct_local_iova_base;
     const u32 trailer = state.candidate_count + index;
     scratch.request_shards[trailer] = shard;
     scratch.remote_offsets[trailer] = scratch.remote_offsets[index];
     scratch.local_iova_offsets[trailer] =
-      reinterpret_cast<u64>(destination + params.node_record_bytes) -
-      params.direct_local_iova_base;
+        reinterpret_cast<u64>(destination + exact_record_trailer_offset(
+                                                params.node_record_bytes)) -
+        params.direct_local_iova_base;
   }
   for (u32 shard = threadIdx.x; shard < kPersistentMaxShards;
        shard += blockDim.x) {
@@ -1323,18 +1321,20 @@ __device__ bool exactify_into_beam(const PersistentKernelParams& params,
     request_offsets[index] =
       remote_byte_offset(raw) + params.node_meta_offset;
     request_shards[index] = shard;
-    const u8* destination =
-      params.exact_records +
-      (static_cast<size_t>(descriptor.query_slot) * params.exact_width +
-       index) * params.node_record_stride;
+    const u8 *destination =
+        params.exact_records +
+        (static_cast<size_t>(descriptor.query_slot) * params.exact_width +
+         index) *
+            params.node_record_stride;
     request_local_iova_offsets[index] =
-      reinterpret_cast<u64>(destination) - params.direct_local_iova_base;
+        reinterpret_cast<u64>(destination) - params.direct_local_iova_base;
     const u32 trailer_index = candidate_count + index;
     request_shards[trailer_index] = shard;
     request_offsets[trailer_index] = request_offsets[index];
     request_local_iova_offsets[trailer_index] =
-      reinterpret_cast<u64>(destination + params.node_record_bytes) -
-      params.direct_local_iova_base;
+        reinterpret_cast<u64>(destination + exact_record_trailer_offset(
+                                                params.node_record_bytes)) -
+        params.direct_local_iova_base;
   }
   for (u32 shard = threadIdx.x; shard < params.num_shards;
        shard += blockDim.x) {
@@ -1459,15 +1459,15 @@ __device__ bool exactify_into_beam(const PersistentKernelParams& params,
           static_cast<size_t>(descriptor.query_slot) * params.num_shards +
           shard;
     shard_status[shard] = direct_fetch_batch(
-      params, shard, request_shards + candidate_count,
-      request_offsets + candidate_count, candidate_count,
-      params.exact_records +
-        static_cast<size_t>(descriptor.query_slot) *
-          params.exact_width * params.node_record_stride +
-        params.node_record_bytes,
-      params.node_record_stride, sizeof(u64),
-      (descriptor.query_slot + shard) % params.direct_qps_per_node,
-      request_local_iova_offsets + candidate_count, owner_completion, true);
+        params, shard, request_shards + candidate_count,
+        request_offsets + candidate_count, candidate_count,
+        params.exact_records +
+            static_cast<size_t>(descriptor.query_slot) * params.exact_width *
+                params.node_record_stride +
+            exact_record_trailer_offset(params.node_record_bytes),
+        params.node_record_stride, sizeof(u64),
+        (descriptor.query_slot + shard) % params.direct_qps_per_node,
+        request_local_iova_offsets + candidate_count, owner_completion, true);
   }
   __syncthreads();
   for (u32 shard = threadIdx.x; shard < params.num_shards;
@@ -1805,12 +1805,13 @@ __device__ bool exactify_into_beam_with_terminal_cache(
         request_shards[prefix] = shard;
         request_offsets[prefix] = remote_offset;
         request_local_iova_offsets[prefix] =
-          reinterpret_cast<u64>(record) - params.direct_local_iova_base;
+            reinterpret_cast<u64>(record) - params.direct_local_iova_base;
         request_shards[trailer] = shard;
         request_offsets[trailer] = remote_offset;
         request_local_iova_offsets[trailer] =
-          reinterpret_cast<u64>(record + params.node_record_bytes) -
-          params.direct_local_iova_base;
+            reinterpret_cast<u64>(record + exact_record_trailer_offset(
+                                               params.node_record_bytes)) -
+            params.direct_local_iova_base;
       }
     }
   }

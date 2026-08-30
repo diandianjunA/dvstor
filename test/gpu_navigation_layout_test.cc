@@ -746,13 +746,32 @@ void test_centroid_route_publication(
   std::free(allocation);
 }
 
-}  // namespace
+void test_exact_record_trailer_alignment() {
+  constexpr u32 spacev_record_bytes = 24u + 100u;
+  constexpr u32 deep_record_bytes = 24u + 96u * sizeof(float);
+  constexpr u32 sift_record_bytes = 24u + 128u;
+  static_assert(gpu_search::exact_record_trailer_offset(spacev_record_bytes) ==
+                128u);
+  static_assert(gpu_search::exact_record_trailer_offset(deep_record_bytes) ==
+                deep_record_bytes);
+  static_assert(gpu_search::exact_record_trailer_offset(sift_record_bytes) ==
+                sift_record_bytes);
+  static_assert(gpu_search::exact_record_trailer_offset(spacev_record_bytes) %
+                    alignof(u64) ==
+                0u);
+  static_assert(gpu_search::exact_record_trailer_offset(spacev_record_bytes) +
+                    sizeof(u64) ==
+                136u);
+}
+
+} // namespace
 
 int main() {
   namespace format = gpu_search::format;
   test_dynamic_pq_arena_mapping_and_incarnation_order();
   test_dynamic_navigation_code_width_semantics();
   test_dynamic_navigation_code_torn_snapshot_detection();
+  test_exact_record_trailer_alignment();
   test_supported_gpu_layout_limits();
   test_tagged_remote_pointer();
   test_graph_record_stale_incarnation_is_not_transport_failure();

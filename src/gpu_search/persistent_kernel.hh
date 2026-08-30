@@ -32,6 +32,15 @@ inline constexpr u32 kPersistentMaxMergeCandidates = 2048;
 inline constexpr u32 kPersistentMaxShards = 64;
 inline constexpr u32 kPersistentGraphReadBytes = 2048;
 inline constexpr u64 kInvalidDeviceHandle = ~u64{0};
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+    inline constexpr u32
+    exact_record_trailer_offset(u32 record_bytes) {
+  return static_cast<u32>((static_cast<u64>(record_bytes) + alignof(u64) - 1u) &
+                          ~static_cast<u64>(alignof(u64) - 1u));
+}
 inline constexpr u32 kRemoteOffsetUnitBits = 34;
 inline constexpr u32 kRemoteShardBits = 6;
 inline constexpr u32 kRemoteIncarnationShift = 40;
