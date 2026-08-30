@@ -11,7 +11,7 @@ Motivation 实验所需的数据准备、schema-16 索引构建、运行 profile
 | dtype / metric | `int8` / L2 |
 | Query | `query.i8bin`，29,316 × 100 |
 | Ground truth | `msspacev-gt-100M`，29,316 × top-100 |
-| 图 / 分片 | R=96，build beam=128，balanced，5 shards |
+| 图 / 分片 | R=96，build beam=128，METIS，5 shards |
 | OPQ/PQ | PQ20（100 维可整除，每子空间 5 维） |
 
 ## 1. 修改机器配置
@@ -76,7 +76,33 @@ BUILD_DIR="$PWD/build-compute" BUILD_ROLE=compute BUILD_INDEX=0 \
 `OVERWRITE_INDEX=1` 不再删除 graph。只有明确需要从零重建时才使用 `REBUILD_GRAPH=1`；仅重做 PQ 或 extent 可分别使用 `REBUILD_PQ=1`、`REBUILD_EXTENT=1`。每次正式构建前还会运行 LocalIdSet/beam-search 回归、数据头、分片参数、磁盘和内存预检。仅编译程序和准备输入、不构建昂贵索引时使用
 `BUILD_INDEX=0 ./experiment/spacev100m/build.sh`。
 
-## 4. 运行 Motivation
+## 4. 将已有 balanced 索引转换为 METIS
+
+本目录的配置和脚本只依赖 SPACEV100M 自己的文件：
+`repartition_to_metis.env` 与 `repartition_to_metis.sh`。转换器保留原 Vamana
+逻辑邻接关系，只重新计算物理 placement；因此会重新生成 shard、idmap、每个物理分片的
+centroid、PQ codes 和 graph extent。OPQ/PQ 模型与向量 ID 不依赖物理分片，可以复用，
+转换器会校验 checksum 后复制模型。
+
+不要并行转换 SPACEV100M 和 Deep100M；两个 100M METIS 任务都需要较大的峰值内存。
+推荐在 `tmux` 中运行。若要在完整校验通过后删除 balanced 版本：
+
+```bash
+DELETE_BALANCED_AFTER_SUCCESS=1 \
+  ./experiment/spacev100m/repartition_to_metis.sh
+```
+
+也可先保留源索引（默认），确认实验启动正常后用相同命令设置
+`DELETE_BALANCED_AFTER_SUCCESS=1` 重跑；已完成的 METIS 目标会被完整校验而不会重算。
+脚本仅精确删除 `SOURCE_INDEX_PREFIX` 的已知索引产物，不删除 base 数据集。转换中断时直接
+重跑同一命令：schema-15 后从 PQ 继续，schema-16 后只补 extent，未提交的目标文件会安全清理。
+目标默认是：
+
+```text
+/data/xjs/index/dvstor_spacev100m/index/spacev100m_R96_bw128_metis_pmd32_pq20_schema16
+```
+
+## 5. 运行 Motivation
 
 三项入口均为本目录内的独立实现：
 
@@ -111,7 +137,7 @@ GPU_COMMIT_WIDTH=16 ./experiment/spacev100m/program3/start_storage_case.sh early
 WORKLOAD=query ./experiment/spacev100m/run_breakdown.sh 04_gpu_persistent_gpunetio
 ```
 
-## 5. 常用覆盖项
+## 6. 常用覆盖项
 
 ```bash
 # 更换构建目录或索引位置

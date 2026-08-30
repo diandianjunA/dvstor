@@ -1,0 +1,176 @@
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1237
+QP handshake timeout (ms):    10000
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         64
+max send work requests:       4096
+max receive work requests:    4096
+============================================================
+index prefix:                     "/data/xjs/index/dvstor_spacev100m/index/spacev100m_R96_bw128_balanced_pmd32_pq20_schema16"
+storage shard:                    "/data/xjs/index/dvstor_spacev100m/index/spacev100m_R96_bw128_balanced_pmd32_pq20_schema16_node4_of5.dat"
+storage id:                       3
+base vectors:                     100000000
+vector ID namespace [0,N):        4294967295
+registered memory GiB:            22
+====================================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8, active_mtu: 5
+interleaved policy
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+local process CPU partition: rank 3/5 logical_cpus=22
+pairing: 77983 -- 8042
+[STATUS]: loaded index metadata from /data/xjs/index/dvstor_spacev100m/index/spacev100m_R96_bw128_balanced_pmd32_pq20_schema16 (layout=plain, vector_data_type=int8)
+[STATUS]: storage-owner stage2 candidate width L=128 per shard
+allocation size: 23622320128
+allocated ALIGNED MEM (no hugepage) at 129231965126720 with buffer size 23622320128
+[STATUS]: loading index (19200000128 Bytes) from /data/xjs/index/dvstor_spacev100m/index/spacev100m_R96_bw128_balanced_pmd32_pq20_schema16_node4_of5.dat
+[STATUS]: loaded GPU PQ codes (400000000 Bytes) at remote offset 19200004224
+[STATUS]: storage-owner idmap loaded entries=20000000 format=owner_sharded_v2_bound immutable_base=true dynamic_shards=256 dynamic_reserved=65536
+[STATUS]: compensated physical centroid restored on shard 3: vectors=20000000 entries=4
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+[STATUS]: reserving 64 GPU/bootstrap QPs per compute node
+pairing: 77988 -- 8047
+pairing: 77993 -- 8052
+pairing: 77998 -- 8057
+pairing: 78003 -- 8062
+pairing: 78008 -- 8067
+pairing: 78013 -- 8072
+pairing: 78018 -- 8077
+pairing: 78023 -- 8082
+pairing: 78028 -- 8087
+pairing: 78033 -- 8092
+pairing: 78038 -- 8097
+pairing: 78043 -- 8102
+pairing: 78048 -- 8107
+pairing: 78053 -- 8112
+pairing: 78058 -- 8117
+pairing: 78063 -- 8122
+pairing: 78068 -- 8127
+pairing: 78073 -- 8132
+pairing: 78078 -- 8137
+pairing: 78083 -- 8142
+pairing: 78088 -- 8147
+pairing: 78093 -- 8152
+pairing: 78098 -- 8157
+pairing: 78103 -- 8162
+pairing: 78108 -- 8167
+pairing: 78113 -- 8172
+pairing: 78118 -- 8177
+pairing: 78123 -- 8182
+pairing: 78128 -- 8187
+pairing: 78133 -- 8192
+pairing: 78138 -- 8197
+pairing: 78143 -- 8202
+pairing: 78148 -- 8300
+pairing: 78243 -- 8301
+pairing: 78244 -- 8302
+pairing: 78245 -- 8303
+pairing: 78246 -- 8304
+pairing: 78247 -- 8305
+pairing: 78248 -- 8306
+pairing: 78249 -- 8307
+pairing: 78250 -- 8308
+pairing: 78251 -- 8309
+pairing: 78252 -- 8310
+pairing: 78253 -- 8311
+pairing: 78254 -- 8312
+pairing: 78255 -- 8313
+pairing: 78256 -- 8314
+pairing: 78257 -- 8315
+pairing: 78258 -- 8316
+pairing: 78259 -- 8317
+pairing: 78260 -- 8318
+pairing: 78261 -- 8319
+pairing: 78262 -- 8320
+pairing: 78263 -- 8321
+pairing: 78264 -- 8322
+pairing: 78265 -- 8323
+pairing: 78266 -- 8324
+pairing: 78267 -- 8325
+pairing: 78268 -- 8326
+pairing: 78269 -- 8327
+pairing: 78270 -- 8328
+pairing: 78271 -- 8329
+pairing: 78272 -- 8330
+pairing: 78273 -- 8331
+[STATUS]: waiting for compute-node startup barrier
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8, active_mtu: 5
+pairing: 78308 -- 78313
+pairing: 78315 -- 78320
+pairing: 78323 -- 78328
+pairing: 78331 -- 78336
+pairing: 78339 -- 78344
+pairing: 78347 -- 78352
+pairing: 78355 -- 78360
+pairing: 78363 -- 78368
+pairing: 78371 -- 78373
+pairing: 78376 -- 78379
+pairing: 78382 -- 78385
+pairing: 78387 -- 78391
+pairing: 78394 -- 78397
+pairing: 78400 -- 78403
+pairing: 78406 -- 78409
+pairing: 78412 -- 78415
+pairing: 78418 -- 78414
+pairing: 78420 -- 78422
+pairing: 78425 -- 78426
+pairing: 78429 -- 78430
+pairing: 78432 -- 78434
+pairing: 78436 -- 78438
+pairing: 78440 -- 78442
+pairing: 78444 -- 78446
+pairing: 78448 -- 78450
+pairing: 78452 -- 78451
+pairing: 78453 -- 78454
+pairing: 78456 -- 78455
+pairing: 78457 -- 78458
+pairing: 78459 -- 78460
+pairing: 78461 -- 78462
+pairing: 78463 -- 78464
+[STATUS]: storage-owner peer RDMA QPs per peer: 8
+[STATUS]: storage-owner peer QP0 reserved for RPC; data RDMA uses QP1..7
+allocated ALIGNED MEM (no hugepage) at 129230897676352 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129230857830464 with buffer size 39839040
+[STATUS]: storage-owner peer RPC receive slots per peer: 64 (requested=64)
+[STATUS]: storage-owner peer RPC concurrent sends per peer: 16
+[STATUS]: storage-owner peer RPC send credits: Stage1/graph are split at depth >= 2; responses use a dedicated sync buffer
+[STATUS]: storage-owner peer async response capacity: 32768
+[STATUS]: storage-owner Stage2 home RPC combining: enabled logical_capacity=18432 aggregate_capacity=4608 byte_budget=33586224
+allocated ALIGNED MEM (no hugepage) at 94341971723776 with buffer size 96256
+allocated ALIGNED MEM (no hugepage) at 129231124754496 with buffer size 212992
+allocated ALIGNED MEM (no hugepage) at 129231124336704 with buffer size 212992
+[STATUS]: storage-owner peer reverse-update workers: 2
+[STATUS]: storage-owner peer Stage1 workers: 3; Stage2-home workers: 1 (one reserved; shared lanes borrow authoritative work only)
+[STATUS]: storage-owner physical control workers: cleanup=1 placement=1 (separate blocking domains)
+[STATUS]: storage-owner peer progress threads: cq=1 response_dispatch=1
+[STATUS]: storage-owner Stage1 artifact capacity: 67584 (64-way, per shard=1056) cleanup replay per shard=2048 active migration receipts=131072
+[STATUS]: storage-owner peer reverse-update tuning: queue_depth=65536 coalesce_max=256
+allocated ALIGNED MEM (no hugepage) at 129231115968576 with buffer size 855296
+allocated ALIGNED MEM (no hugepage) at 129231112826944 with buffer size 855296
+allocated ALIGNED MEM (no hugepage) at 129231111970880 with buffer size 855296
+allocated ALIGNED MEM (no hugepage) at 129231108632640 with buffer size 855296
+allocated ALIGNED MEM (no hugepage) at 129231107776576 with buffer size 855296
+allocated ALIGNED MEM (no hugepage) at 129231104438336 with buffer size 855296
+allocated ALIGNED MEM (no hugepage) at 129231103582272 with buffer size 855296
+allocated ALIGNED MEM (no hugepage) at 129231100244032 with buffer size 855296
+[STATUS]: storage-owner peer scratch: snapshot_slot=192 graph_slot=832 batch=256 lane_peak_rdma_wrs=56 lane_useful_wave_rdma_wrs=56 global_read_window=224 search_lanes_global=32 search_lanes_credit_derived=16 search_lane_lease_cap=32 search_lanes_physical_per_worker=4 ready_context_runtime_epoch=1 bytes_per_lane=213824 bytes_total=6842368
+[STATUS]: storage-owner maintenance workers: 8 (configured=8, admission_baseline_workers=2, context_limit=32, semantic_execution_batch=8, work_conserving=true)
+[STATUS]: storage-owner stage2 reverse outbox descriptors: 128 aggregates=128 wire_max_ops=3072 (shared per-peer work-conserving aggregation)
+[STATUS]: storage-owner maintenance tuning: protocol=centroid-home-two-stage compaction_batch_target=32 packing_policy=deterministic_b8 packing_tail_wait_us=arrival_adaptive_capped_25000 packing_context_limit=8 backlog_limit=65536 admission_credit=bounded_accepted_backlog admission_window=65536 physical_completion_capacity=65536
+[STATUS]: storage-owner peer RDMA read credits: per_data_qp=8 data_qps_per_peer=7 per_peer=56 global=224 shared_cq_read_budget=8095 ordered_snapshot_pairs_per_chain=4 (requested_per_data_qp=16)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=256 protocol=centroid-home-two-stage
+[STATUS]: storage-owner stage1=physical-home local search and backlinks; stage2=generation-fenced home expand+score continuation
+[STATUS]: storage-owner responses=foreground direct post; completion=repost by service poller
+[STATUS]: storage-owner foreground pipeline: coordinators=12 cpu_lanes=3 (assigned_cpus=22, rpc_parallelism=16)
+[STATUS]: storage-owner CPU plan: foreground_cpu=3 foreground_coordinators=12 maintenance=8 peer_stage1=4 (split into isolated Stage1/Stage2-home domains) peer_reverse=2 peer_cleanup=1 peer_placement=1 peer_progress=2 foreground_progress=1
+[STATUS]: storage-owner insert runtime enabled on shard 3

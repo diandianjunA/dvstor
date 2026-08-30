@@ -229,6 +229,24 @@ function(dvstor_add_offline_tools)
     target_link_libraries(vamana_legacy_index_converter
         rdma_library FaissCPU::FaissCPU)
 
+    add_executable(vamana_metis_repartitioner
+        tools/vamana_metis_repartitioner.cc
+        tools/vamana_offline/metis_repartitioner.cc
+        tools/vamana_offline/dataset_io.cc
+        tools/vamana_offline/graph.cc
+        tools/vamana_offline/partitioning.cc
+        tools/vamana_offline/progress.cc
+        tools/vamana_offline/shard_writer.cc
+        tools/vamana_offline/pq_indexer.cc
+        tools/vamana_offline/graph_extent_indexer.cc
+        src/service/index_metadata.cc
+        src/gpu_search/index_format.cc
+        src/gpu_search/pq_index.cc)
+    dvstor_target_tool_includes(vamana_metis_repartitioner)
+    target_link_libraries(vamana_metis_repartitioner
+        rdma_library FaissCPU::FaissCPU)
+    target_link_metis(vamana_metis_repartitioner)
+
 endfunction()
 
 if (DVSTOR_STORAGE_NODE_ONLY)
@@ -310,6 +328,28 @@ if (DVSTOR_STORAGE_NODE_ONLY)
         add_test(NAME vamana_offline_graph_test
                  COMMAND vamana_offline_graph_test)
         set_tests_properties(vamana_offline_graph_test PROPERTIES TIMEOUT 10)
+
+        add_executable(metis_repartitioner_test
+            test/metis_repartitioner_test.cc
+            tools/vamana_offline/metis_repartitioner.cc
+            tools/vamana_offline/dataset_io.cc
+            tools/vamana_offline/graph.cc
+            tools/vamana_offline/partitioning.cc
+            tools/vamana_offline/progress.cc
+            tools/vamana_offline/shard_writer.cc
+            tools/vamana_offline/pq_indexer.cc
+            tools/vamana_offline/graph_extent_indexer.cc
+            src/service/index_metadata.cc
+            src/gpu_search/index_format.cc
+            src/gpu_search/pq_index.cc)
+        dvstor_target_tool_includes(metis_repartitioner_test)
+        target_link_libraries(metis_repartitioner_test
+            rdma_library FaissCPU::FaissCPU)
+        target_link_metis(metis_repartitioner_test)
+        target_compile_options(metis_repartitioner_test PRIVATE -UNDEBUG)
+        add_test(NAME metis_repartitioner_test
+                 COMMAND metis_repartitioner_test)
+        set_tests_properties(metis_repartitioner_test PROPERTIES TIMEOUT 180)
     endif ()
 else ()
     find_path(DVSTOR_DOCA_INCLUDE_DIR doca_gpunetio.h

@@ -61,12 +61,12 @@ fi
 case "$resolved_role" in
   storage)
     targets=(dvstor_memory_node vamana_offline_builder vamana_pq_indexer
-             vamana_graph_extent_indexer)
+             vamana_graph_extent_indexer vamana_metis_repartitioner)
     default_build_index=1
     ;;
   offline)
     targets=(vamana_offline_builder vamana_pq_indexer
-             vamana_graph_extent_indexer)
+             vamana_graph_extent_indexer vamana_metis_repartitioner)
     default_build_index=1
     ;;
   compute)
@@ -77,7 +77,8 @@ case "$resolved_role" in
   all)
     targets=(dvstor_compute_node dvstor_memory_node dvstor_breakdown_benchmark
              dvstor_sift101m_long_insert_recall vamana_offline_builder
-             vamana_pq_indexer vamana_graph_extent_indexer)
+             vamana_pq_indexer vamana_graph_extent_indexer
+             vamana_metis_repartitioner)
     default_build_index=1
     ;;
 esac
