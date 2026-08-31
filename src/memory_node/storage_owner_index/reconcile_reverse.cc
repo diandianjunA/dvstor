@@ -107,6 +107,28 @@ bool MemoryNode::reconcile_reverse_ops_one_sided(
       structurally_valid = false;
       continue;
     }
+    vec<RemotePtr> mandatory_promotions;
+    mandatory_promotions.reserve(op_indices.size());
+    for (const size_t op_index : op_indices) {
+      const auto kind = static_cast<ReconcileReverseOpKind>(
+        ops[op_index].kind);
+      if (kind != ReconcileReverseOpKind::promote_stable_bridge) continue;
+      const RemotePtr candidate{ops[op_index].new_candidate_raw};
+      if (candidate.is_null() || candidate == target ||
+          std::find(mandatory_promotions.begin(),
+                    mandatory_promotions.end(), candidate) !=
+            mandatory_promotions.end()) {
+        continue;
+      }
+      mandatory_promotions.push_back(candidate);
+    }
+    if (mandatory_promotions.size() > config.R) {
+      // The complete mandatory set cannot fit in this target's bounded graph.
+      // Valid Stage2 contexts are capped below R; treat an oversized wire
+      // transaction as malformed without publishing a partial certificate.
+      structurally_valid = false;
+      continue;
+    }
     vec<size_t> reordered_indices;
     span<const size_t> execution_indices{op_indices};
     if (needs_reorder) {
@@ -254,11 +276,27 @@ bool MemoryNode::reconcile_reverse_ops_one_sided(
       }
       hashset_t<RemotePtr> skip;
       skip.insert(target);
-      return robust_prune_snapshots_cpu(
+      vec<RemotePtr> selected = robust_prune_snapshots_cpu(
         target_vector_data,
         VamanaNode::vector_dtype(),
         span<const NodeSnapshot>{snapshots.data(), snapshots.size()},
         skip, config, config.R);
+      vec<RemotePtr> eligible_candidates;
+      eligible_candidates.reserve(snapshots.size());
+      for (const NodeSnapshot& snapshot : snapshots) {
+        eligible_candidates.push_back(snapshot.rptr);
+      }
+      u64 forced = 0;
+      if (!preserve_reconcile_mandatory_candidates(
+            span<const RemotePtr>{eligible_candidates},
+            span<const RemotePtr>{mandatory_promotions}, config.R,
+            selected, &forced)) {
+        robust_prune_retryable = true;
+        return candidates;
+      }
+      storage_owner_stage2_mandatory_promotions_preserved_.fetch_add(
+        forced, std::memory_order_relaxed);
+      return selected;
     };
 
     bool publish_allowed = false;

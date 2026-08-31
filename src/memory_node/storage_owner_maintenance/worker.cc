@@ -1806,6 +1806,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   const auto reset_reconcile_for_semantic_retry = [&](Stage2Context& context) {
     cancel_context_reconcile(context);
     context.finalize_subphase = Stage2FinalizeSubphase::prepare;
+    storage_owner_stage2_reconcile_retries_.fetch_add(
+      1, std::memory_order_relaxed);
     storage_owner_maintenance_pressure_yields_.fetch_add(
       1, std::memory_order_relaxed);
     defer_stage2_retry(context);
@@ -1926,6 +1928,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           span<const u32>{gate_authorities},
           span<const protocol::AuthorityPlacementItem>{gates},
           gate_results, config)) {
+      storage_owner_stage2_gate_transport_retries_.fetch_add(
+        1, std::memory_order_relaxed);
       storage_owner_maintenance_pressure_yields_.fetch_add(
         1, std::memory_order_relaxed);
       defer_stage2_retry(context);
@@ -1940,6 +1944,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       const auto status = static_cast<
         protocol::AuthorityPlacementStatus>(gate_result.status);
       if (status == protocol::AuthorityPlacementStatus::busy) {
+        storage_owner_stage2_gate_busy_retries_.fetch_add(
+          1, std::memory_order_relaxed);
         storage_owner_maintenance_pressure_yields_.fetch_add(
           1, std::memory_order_relaxed);
         defer_stage2_retry(context);
@@ -2018,6 +2024,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         storage_owner_physical_node_state(
           task.id, task.generation, current_physical);
       if (current_physical_state == StableNodeSnapshotState::retryable) {
+        storage_owner_stage2_physical_retries_.fetch_add(
+          1, std::memory_order_relaxed);
         storage_owner_maintenance_pressure_yields_.fetch_add(
           1, std::memory_order_relaxed);
         defer_stage2_retry(context);
@@ -2073,6 +2081,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           const IncarnationLockResult target_lock =
             try_lock_node(task.target);
           if (target_lock == IncarnationLockResult::busy) {
+            storage_owner_stage2_source_lock_retries_.fetch_add(
+              1, std::memory_order_relaxed);
             storage_owner_maintenance_pressure_yields_.fetch_add(
               1, std::memory_order_relaxed);
             defer_stage2_retry(context);
@@ -2129,6 +2139,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           unlock_node(task.target);
         }
         if (adjacency_retryable) {
+          storage_owner_stage2_source_adjacency_retries_.fetch_add(
+            1, std::memory_order_relaxed);
           storage_owner_maintenance_pressure_yields_.fetch_add(
             1, std::memory_order_relaxed);
           defer_stage2_retry(context);
@@ -2224,6 +2236,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           protocol::DynamicNodeControlResult allocation_result;
           if (!control_dynamic_node_on_shard(
                 task.final_home, allocation, allocation_result, config)) {
+            storage_owner_stage2_allocation_retries_.fetch_add(
+              1, std::memory_order_relaxed);
             storage_owner_maintenance_pressure_yields_.fetch_add(
               1, std::memory_order_relaxed);
             defer_stage2_retry(context);
@@ -2232,6 +2246,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           if (static_cast<protocol::DynamicNodeControlStatus>(
                 allocation_result.status) !=
                 protocol::DynamicNodeControlStatus::ok) {
+            storage_owner_stage2_allocation_retries_.fetch_add(
+              1, std::memory_order_relaxed);
             storage_owner_maintenance_pressure_yields_.fetch_add(
               1, std::memory_order_relaxed);
             defer_stage2_retry(context);
@@ -2271,6 +2287,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           const IncarnationLockResult target_lock =
             try_lock_node(task.target);
           if (target_lock == IncarnationLockResult::busy) {
+            storage_owner_stage2_publish_lock_retries_.fetch_add(
+              1, std::memory_order_relaxed);
             storage_owner_maintenance_pressure_yields_.fetch_add(
               1, std::memory_order_relaxed);
             defer_stage2_retry(context);

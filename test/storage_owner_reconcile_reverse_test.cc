@@ -1276,6 +1276,98 @@ void test_final_target_audit_rejects_evicted_mandatory_certificate() {
     span<const RemotePtr>{empty}, span<const RemotePtr>{protected_first}));
 }
 
+void test_hot_parent_prune_preserves_every_mandatory_promotion() {
+  using memory_node_storage_owner_index_detail::
+    preserve_reconcile_mandatory_candidates;
+  const RemotePtr ordinary = pointer(0, 0x1000);
+  const RemotePtr first = pointer(1, 0x2000);
+  const RemotePtr second = pointer(1, 0x3000);
+  const vec<RemotePtr> eligible{ordinary, first, second};
+  const vec<RemotePtr> mandatory{first, second};
+
+  // Model the failure observed with clustered SpaceV inserts: pruning the
+  // second promotion keeps it and an ordinary edge but evicts the first
+  // promotion that was ACKed earlier in the same target transaction.
+  vec<RemotePtr> selected{ordinary, second};
+  u64 forced = 0;
+  assert(preserve_reconcile_mandatory_candidates(
+    span<const RemotePtr>{eligible}, span<const RemotePtr>{mandatory}, 2,
+    selected, &forced));
+  assert((selected == vec<RemotePtr>{first, second}));
+  assert(forced == 1);
+
+  // An unreadable candidate is not manufactured into the graph, and a truly
+  // impossible mandatory set is rejected before any partial publication.
+  selected = {ordinary};
+  const vec<RemotePtr> only_first_eligible{ordinary, first};
+  assert(preserve_reconcile_mandatory_candidates(
+    span<const RemotePtr>{only_first_eligible},
+    span<const RemotePtr>{mandatory}, 2, selected, &forced));
+  assert((selected == vec<RemotePtr>{ordinary, first}));
+  assert(forced == 1);
+
+  selected = {ordinary};
+  const vec<RemotePtr> three_mandatory{ordinary, first, second};
+  assert(!preserve_reconcile_mandatory_candidates(
+    span<const RemotePtr>{eligible},
+    span<const RemotePtr>{three_mandatory}, 2, selected));
+}
+
+void test_hot_parent_transaction_does_not_evict_earlier_promotion() {
+  using memory_node_storage_owner_index_detail::
+    preserve_reconcile_mandatory_candidates;
+  using memory_node_storage_owner_index_detail::
+    reconcile_reverse_final_reachability_holds;
+  const RemotePtr parent = pointer(0, 0x1000);
+  const RemotePtr ordinary_first = pointer(0, 0x2000);
+  const RemotePtr ordinary_second = pointer(0, 0x3000);
+  const RemotePtr first = pointer(1, 0x4000);
+  const RemotePtr second = pointer(1, 0x5000);
+  const vec<ReconcileReverseOp> promotions{
+    operation(ReconcileReverseOpKind::promote_stable_bridge,
+              parent, first, first, 61),
+    operation(ReconcileReverseOpKind::promote_stable_bridge,
+              parent, second, second, 62),
+  };
+  const vec<RemotePtr> mandatory{first, second};
+  vec<RemotePtr> stable{ordinary_first, ordinary_second};
+  vec<RemotePtr> provisional{first, second};
+  u64 forced = 0;
+  const auto clustered_prune = [&](const vec<RemotePtr>& candidates) {
+    vec<RemotePtr> selected;
+    if (std::find(candidates.begin(), candidates.end(), second) !=
+        candidates.end()) {
+      // The second prune prefers its new child and would deterministically
+      // evict the first promotion without transaction-wide protection.
+      selected = {ordinary_first, second};
+    } else {
+      selected = {ordinary_first, ordinary_second};
+    }
+    u64 pass_forced = 0;
+    assert(preserve_reconcile_mandatory_candidates(
+      span<const RemotePtr>{candidates}, span<const RemotePtr>{mandatory}, 2,
+      selected, &pass_forced));
+    forced += pass_forced;
+    return selected;
+  };
+
+  vec<service::storage_owner::ReconcileReverseResult> results;
+  for (const ReconcileReverseOp& promotion : promotions) {
+    results.push_back(
+      memory_node_storage_owner_index_detail::reconcile_reverse_adjacency(
+        promotion, true, true, true, true, 2, 2,
+        stable, provisional, clustered_prune));
+  }
+  assert((stable == vec<RemotePtr>{first, second}));
+  assert(provisional.empty());
+  assert(forced == 2);
+  const vec<size_t> indexes{0, 1};
+  assert(reconcile_reverse_final_reachability_holds(
+    span<const ReconcileReverseOp>{promotions}, span<const size_t>{indexes},
+    span<const service::storage_owner::ReconcileReverseResult>{results},
+    span<const RemotePtr>{stable}, span<const RemotePtr>{provisional}));
+}
+
 void test_receiver_orders_install_transaction_before_mandatory_audit() {
   using memory_node_storage_owner_index_detail::
     reconcile_reverse_target_execution_order;
@@ -1359,6 +1451,8 @@ int main() {
   test_stable_then_promotion_closes_hot_parent_eviction_window();
   test_ordinary_rejection_cannot_substitute_for_promotion_ack();
   test_final_target_audit_rejects_evicted_mandatory_certificate();
+  test_hot_parent_prune_preserves_every_mandatory_promotion();
+  test_hot_parent_transaction_does_not_evict_earlier_promotion();
   test_receiver_orders_install_transaction_before_mandatory_audit();
   return 0;
 }

@@ -189,6 +189,28 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_maintenance_cleanup_processed_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_max_backlog_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_pressure_yields_.store(0, std::memory_order_relaxed);
+  storage_owner_stage2_prune_contention_excluded_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_parent_contention_excluded_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_mandatory_promotions_preserved_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_gate_transport_retries_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_gate_busy_retries_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_physical_retries_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_source_lock_retries_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_source_adjacency_retries_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_allocation_retries_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_publish_lock_retries_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_reconcile_retries_.store(
+    0, std::memory_order_relaxed);
   storage_owner_stage2_batches_.store(0, std::memory_order_relaxed);
   storage_owner_stage2_batched_items_.store(0, std::memory_order_relaxed);
   storage_owner_stage2_home_rpc_batches_.store(0, std::memory_order_relaxed);
@@ -871,6 +893,33 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   const u64 stage2_parent_contention_excluded =
     storage_owner_stage2_parent_contention_excluded_.load(
       std::memory_order_relaxed);
+  const u64 stage2_mandatory_promotions_preserved =
+    storage_owner_stage2_mandatory_promotions_preserved_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_gate_transport_retries =
+    storage_owner_stage2_gate_transport_retries_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_gate_busy_retries =
+    storage_owner_stage2_gate_busy_retries_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_physical_retries =
+    storage_owner_stage2_physical_retries_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_source_lock_retries =
+    storage_owner_stage2_source_lock_retries_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_source_adjacency_retries =
+    storage_owner_stage2_source_adjacency_retries_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_allocation_retries =
+    storage_owner_stage2_allocation_retries_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_publish_lock_retries =
+    storage_owner_stage2_publish_lock_retries_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_reconcile_retries =
+    storage_owner_stage2_reconcile_retries_.load(
+      std::memory_order_relaxed);
   const u64 reverse_aggregate_batches =
     storage_owner_reverse_aggregate_batches_.load(std::memory_order_relaxed);
   const u64 reverse_aggregate_logical_requests =
@@ -1232,6 +1281,24 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(stage2_prune_contention_excluded) +
                " stage2_parent_contention_excluded=" +
                std::to_string(stage2_parent_contention_excluded) +
+               " stage2_mandatory_promotions_preserved=" +
+               std::to_string(stage2_mandatory_promotions_preserved) +
+               " stage2_gate_transport_retries=" +
+               std::to_string(stage2_gate_transport_retries) +
+               " stage2_gate_busy_retries=" +
+               std::to_string(stage2_gate_busy_retries) +
+               " stage2_physical_retries=" +
+               std::to_string(stage2_physical_retries) +
+               " stage2_source_lock_retries=" +
+               std::to_string(stage2_source_lock_retries) +
+               " stage2_source_adjacency_retries=" +
+               std::to_string(stage2_source_adjacency_retries) +
+               " stage2_allocation_retries=" +
+               std::to_string(stage2_allocation_retries) +
+               " stage2_publish_lock_retries=" +
+               std::to_string(stage2_publish_lock_retries) +
+               " stage2_reconcile_retries=" +
+               std::to_string(stage2_reconcile_retries) +
                " cross_edge_reduction_ratio=" +
                std::to_string(stage2_cross_edges_stage1_home == 0 ? 0.0 :
                  1.0 - ratio_or_zero(stage2_cross_edges_final_home,

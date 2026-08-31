@@ -1486,6 +1486,21 @@ private:
   // weakening any publication/reconciliation postcondition.
   std::atomic<u64> storage_owner_stage2_prune_contention_excluded_{0};
   std::atomic<u64> storage_owner_stage2_parent_contention_excluded_{0};
+  // Multiple tasks in one context may promote through the same hot parent.
+  // Count certificates that had to be restored after RobustPrune so a
+  // workload-specific hub collision is visible in storage-node logs.
+  std::atomic<u64> storage_owner_stage2_mandatory_promotions_preserved_{0};
+  // Retry sites before the reverse barrier used to collapse into one generic
+  // pressure counter.  Keep the causes separate so a future durable-watermark
+  // stall identifies its state-machine boundary in a single observation.
+  std::atomic<u64> storage_owner_stage2_gate_transport_retries_{0};
+  std::atomic<u64> storage_owner_stage2_gate_busy_retries_{0};
+  std::atomic<u64> storage_owner_stage2_physical_retries_{0};
+  std::atomic<u64> storage_owner_stage2_source_lock_retries_{0};
+  std::atomic<u64> storage_owner_stage2_source_adjacency_retries_{0};
+  std::atomic<u64> storage_owner_stage2_allocation_retries_{0};
+  std::atomic<u64> storage_owner_stage2_publish_lock_retries_{0};
+  std::atomic<u64> storage_owner_stage2_reconcile_retries_{0};
   // Stage2 timings are aggregated once per context phase/attempt.  Keeping
   // these counters at the batch boundary makes the diagnostic cost
   // independent of L, R, vector dimension, and the number of RDMA reads.

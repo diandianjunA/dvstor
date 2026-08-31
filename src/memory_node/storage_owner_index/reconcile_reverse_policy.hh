@@ -93,6 +93,85 @@ inline bool reconcile_reverse_final_reachability_holds(
   return true;
 }
 
+// A target transaction may contain several Stage2 promotions when a batch of
+// nearby insertions chooses the same hot parent.  Each promotion is mandatory:
+// the provisional-removal barrier is allowed to run only after every promoted
+// child remains in the target's final stable adjacency.  Applying promotions
+// one at a time with an ordinary RobustPrune is insufficient because pruning
+// promotion N can evict the certificate installed for promotion N-1.  The
+// sender then retries the identical deterministic transaction forever.
+//
+// Preserve RobustPrune order for ordinary candidates, but reserve one of the
+// bounded R slots for every mandatory candidate participating in this prune.
+// `eligible_candidates` is the coherently snapshotted subset of the current
+// prune input, so this helper never manufactures an edge to an unreadable or
+// stale identity.  Returning false means that the requested mandatory set is
+// structurally larger than the degree bound.
+inline bool preserve_reconcile_mandatory_candidates(
+    span<const RemotePtr> eligible_candidates,
+    span<const RemotePtr> mandatory_candidates,
+    u32 degree_limit,
+    vec<RemotePtr>& selected,
+    u64* forced = nullptr) {
+  if (forced != nullptr) *forced = 0;
+  if (degree_limit == 0) return mandatory_candidates.empty();
+
+  const auto eligible = [&](RemotePtr candidate) {
+    return !candidate.is_null() &&
+      std::find(eligible_candidates.begin(), eligible_candidates.end(),
+                candidate) != eligible_candidates.end();
+  };
+
+  vec<RemotePtr> mandatory;
+  mandatory.reserve(mandatory_candidates.size());
+  for (const RemotePtr candidate : mandatory_candidates) {
+    if (!eligible(candidate) ||
+        std::find(mandatory.begin(), mandatory.end(), candidate) !=
+          mandatory.end()) {
+      continue;
+    }
+    mandatory.push_back(candidate);
+  }
+  if (mandatory.size() > degree_limit) return false;
+
+  vec<RemotePtr> bounded;
+  bounded.reserve(degree_limit);
+  for (const RemotePtr candidate : selected) {
+    if (!eligible(candidate) ||
+        std::find(bounded.begin(), bounded.end(), candidate) !=
+          bounded.end()) {
+      continue;
+    }
+    bounded.push_back(candidate);
+    if (bounded.size() == degree_limit) break;
+  }
+
+  const auto is_mandatory = [&](RemotePtr candidate) {
+    return std::find(mandatory.begin(), mandatory.end(), candidate) !=
+      mandatory.end();
+  };
+  for (const RemotePtr candidate : mandatory) {
+    if (std::find(bounded.begin(), bounded.end(), candidate) !=
+        bounded.end()) {
+      continue;
+    }
+    if (bounded.size() < degree_limit) {
+      bounded.push_back(candidate);
+    } else {
+      const auto replace = std::find_if(
+        bounded.rbegin(), bounded.rend(),
+        [&](RemotePtr survivor) { return !is_mandatory(survivor); });
+      // mandatory.size() <= degree_limit guarantees a replaceable ordinary
+      // survivor whenever the bounded output is already full.
+      if (replace == bounded.rend()) return false;
+      *replace = candidate;
+    }
+    if (forced != nullptr) ++*forced;
+  }
+  selected = std::move(bounded);
+  return true;
+}
+
 // A tagged target whose physical incarnation has already retired cannot
 // contain any edge owned by that incarnation.  Ordinary reverse additions
 // are only bounded-degree proposals, so losing their target is a completed
