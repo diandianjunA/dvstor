@@ -61,14 +61,17 @@ int main(int argc, char** argv) {
       return 0;
     }
     check_cuda(cudaSetDevice(0), "cudaSetDevice");
-    for (const u32 threads : {128u, 256u}) {
-      const auto occupancy =
-        gpu_search::inspect_persistent_search_kernel(threads);
-      if (occupancy.active_blocks_per_sm == 0 ||
-          occupancy.registers_per_thread == 0 ||
-          occupancy.max_threads_per_block < threads) {
-        throw std::runtime_error(
-          "persistent search occupancy inspection returned invalid data");
+    for (const u32 pq_subquantizers : {20u, 25u, 32u}) {
+      for (const u32 threads : {128u, 256u}) {
+        const auto occupancy = gpu_search::inspect_persistent_search_kernel(
+          threads, true, pq_subquantizers);
+        if (occupancy.active_blocks_per_sm == 0 ||
+            occupancy.registers_per_thread == 0 ||
+            occupancy.max_threads_per_block < threads) {
+          throw std::runtime_error(
+            "specialized persistent search occupancy inspection returned "
+            "invalid data");
+        }
       }
     }
 
@@ -126,6 +129,9 @@ int main(int argc, char** argv) {
                                         stop_host, 0),
                "cudaHostGetDevicePointer(stop)");
 
+    const u32 pq_subquantizers = argc > 4
+      ? static_cast<u32>(std::max(1, std::atoi(argv[4])))
+      : gpu_search::kPersistentPq32Subquantizers;
     gpu_search::PersistentKernelParams params{
       .submissions = submissions.device_view(),
       .device_submissions = {},
@@ -134,6 +140,8 @@ int main(int argc, char** argv) {
       .route_completions = route_completions.device_view(),
       .num_shards = kShardCount,
       .dim = kDim,
+      .pq_subquantizers = pq_subquantizers,
+      .pq_code_bytes = pq_subquantizers,
       .query_slots = 1,
       .centroid_route_updates = route_updates,
       .centroid_route_centroid_updates = centroid_updates,

@@ -20,11 +20,15 @@ inline std::size_t saturating_admission_multiply(
   return lhs * rhs;
 }
 
-// Stage2 execution is fixed at four semantic-B8 contexts per worker.  This
-// bound is deliberately independent of the much larger accepted descriptor
-// window: Stage1 can acknowledge into that window while Stage2 drains it in
-// bounded background cohorts.
-inline constexpr std::size_t kStage2ContextsPerWorker = 4;
+// Stage2 execution is fixed at six semantic-B8 contexts per worker. Four
+// contexts leave SpaceV's long home-RPC dependency chains with no suspended
+// continuation headroom: all four contexts can be waiting while the worker
+// has nothing ready to run, even though the node-wide 32-lane lease and RDMA
+// credit managers still have capacity. Six is the bounded ceiling previously
+// exercised by the adaptive controller; unlike the old rpc-depth expansion it
+// can move at most 48 B8 contexts out of the visible queue on an eight-worker
+// node. The accepted descriptor window remains independently bounded below.
+inline constexpr std::size_t kStage2ContextsPerWorker = 6;
 
 // Bound accepted Stage2 descriptors independently of active execution
 // resources. Stage1 may acknowledge every descriptor in this window after it

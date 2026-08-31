@@ -817,11 +817,11 @@ void test_stage2_pressure_retains_a_dedicated_progress_floor() {
   using memory_node_storage_owner_maintenance_detail::
     stage2_worker_context_admission_limit;
 
-  // Four bounded contexts per worker remain stable across foreground work
-  // and drain. Going idle must not expand to the configured depth and move a
-  // deep visible queue into hundreds of whole-context barrier chains.
-  assert(stage2_context_admission_limit(2, 16) == 8);
-  assert(stage2_context_admission_limit(1, 16) == 4);
+  // Six bounded contexts per worker remain stable across foreground work and
+  // drain. Going idle must not expand to the configured depth and move a deep
+  // visible queue into hundreds of whole-context barrier chains.
+  assert(stage2_context_admission_limit(2, 16) == 12);
+  assert(stage2_context_admission_limit(1, 16) == 6);
   assert(stage2_context_admission_limit(3, 1) == 3);
   assert(stage2_context_admission_limit(0, 0) == 1);
 
@@ -829,7 +829,7 @@ void test_stage2_pressure_retains_a_dedicated_progress_floor() {
   // otherwise claim all bounded contexts while owning only its own RDMA
   // lanes. Each executor applies the matching local share before the global
   // CAS, so all workers can expose their preallocated lanes.
-  assert(stage2_worker_context_admission_limit(16) == 4);
+  assert(stage2_worker_context_admission_limit(16) == 6);
   assert(stage2_worker_context_admission_limit(1) == 1);
   assert(stage2_worker_context_admission_limit(0) == 1);
 }
@@ -874,7 +874,7 @@ void test_stage2_accepted_window_is_independent_of_execution_capacity() {
   assert(stage2_accepted_sequence_limit(queue_depth, 0) == 0);
 
   const std::size_t active_contexts = stage2_context_admission_limit(8, 16);
-  assert(active_contexts == 32);
+  assert(active_contexts == 48);
   assert(stage2_accepted_sequence_limit(
            queue_depth, completion_capacity) > active_contexts);
 

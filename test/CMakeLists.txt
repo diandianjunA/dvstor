@@ -417,6 +417,16 @@ if (TARGET dvstor_gpu_kernels)
     set_tests_properties(gpu_persistent_dispatch_pq32_test PROPERTIES
         TIMEOUT 15
         SKIP_REGULAR_EXPRESSION "^SKIP:")
+    add_test(NAME gpu_persistent_dispatch_pq20_test
+        COMMAND gpu_persistent_dispatch_test 128 10 8 20)
+    set_tests_properties(gpu_persistent_dispatch_pq20_test PROPERTIES
+        TIMEOUT 15
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+    add_test(NAME gpu_persistent_dispatch_pq25_test
+        COMMAND gpu_persistent_dispatch_test 128 10 8 25)
+    set_tests_properties(gpu_persistent_dispatch_pq25_test PROPERTIES
+        TIMEOUT 15
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
     add_test(NAME gpu_persistent_dispatch_256_test
         COMMAND gpu_persistent_dispatch_test 128 10 8 32 256)
     set_tests_properties(gpu_persistent_dispatch_256_test PROPERTIES

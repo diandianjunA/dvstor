@@ -1914,7 +1914,8 @@ __device__ __noinline__ void reserve_critical_fetch_destinations(
   __syncthreads();
 }
 
-template <bool EnableAsfe>
+template <bool EnableAsfe,
+          u32 PqSubquantizers = kPersistentRuntimePqSubquantizers>
 __device__ __forceinline__ void process_query(
     const PersistentKernelParams& params,
     const QueryDescriptor& descriptor,
@@ -2056,9 +2057,11 @@ __device__ __forceinline__ void process_query(
   __syncthreads();
   f32* transformed = params.transformed_queries +
     static_cast<size_t>(query_slot) * params.dim;
+  const u32 pq_subquantizers =
+    resolved_pq_subquantizers<PqSubquantizers>(params);
   f32* query_lut = params.query_luts +
-    static_cast<size_t>(query_slot) * params.pq_subquantizers * 256;
-  const u32 table_entries = params.pq_subquantizers * 256;
+    static_cast<size_t>(query_slot) * pq_subquantizers * 256;
+  const u32 table_entries = pq_subquantizers * 256;
   for (u32 row = threadIdx.x; row < params.dim; row += blockDim.x) {
     if (params.opq_matrix == nullptr) {
       transformed[row] = query[row];
@@ -2338,7 +2341,7 @@ __device__ __forceinline__ void process_query(
     __syncthreads();
 
     if (route_entry_count != 0 &&
-        !approximate_handles_batch(
+        !approximate_handles_batch<PqSubquantizers>(
           params, descriptor, query_lut, navigation_handles,
           route_entry_count, navigation_distances, &dynamic_code_cycles,
           &dynamic_code_candidates, &dynamic_code_reads,
@@ -3384,7 +3387,7 @@ __device__ __forceinline__ void process_query(
       }
       if (threadIdx.x == 0) phase_started_cycles = clock64();
       if (candidate_count != 0 &&
-          !approximate_handles_batch(
+          !approximate_handles_batch<PqSubquantizers>(
             params, descriptor, query_lut,
             navigation_handles, candidate_count,
             navigation_distances,

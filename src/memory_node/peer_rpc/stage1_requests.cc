@@ -449,6 +449,17 @@ MemoryNode::prepare_local_stage1_item(
       vec<byte_t>{}.swap(prepared.vector_data);
     }
   };
+  const auto release_retryable_reservation = [&]() {
+    std::lock_guard<std::mutex> lock(prepared_shard.mutex);
+    const auto position = prepared_records.find(key);
+    lib_assert(position != prepared_records.end() &&
+                 !position->second.prepared &&
+                 position->second.id == item.id &&
+                 position->second.generation == item.generation,
+               "retryable Stage1 attempt lost its private reservation");
+    prepared_records.erase(position);
+    result.status = static_cast<u32>(MutationStatus::retry);
+  };
 
   // From this point onward this semantic token owns a new physical-home
   // execution. Duplicate/retry receipts returned above must not be charged a
@@ -543,6 +554,12 @@ MemoryNode::prepare_local_stage1_item(
     return !neighbors.empty() && !bridge_targets.empty();
   };
 
+  // A route/prune snapshot can transiently contain no usable stable parent.
+  // Do not hold the physical Stage1 RPC thread (and an authority fanout token)
+  // forever waiting for that snapshot to change. The authority retries the
+  // same semantic operation after the bounded control backoff.
+  constexpr u32 kCandidateRefreshLimit = 2;
+  u32 candidate_refreshes = 0;
   while (!refresh_stage1_candidates()) {
     if (storage_insert_shutdown_.load(std::memory_order_acquire) ||
         storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
@@ -551,6 +568,13 @@ MemoryNode::prepare_local_stage1_item(
       record_physical_stage1(0, 0, 0);
       return result;
     }
+    if (candidate_refreshes == kCandidateRefreshLimit) {
+      release_retryable_reservation();
+      record_physical_stage1(
+        candidates.size(), remote_frontier.size(), neighbors.size());
+      return result;
+    }
+    ++candidate_refreshes;
     std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
     storage_owner_maintenance_cv_.wait_for(
       lock, std::chrono::microseconds(100));
@@ -597,17 +621,7 @@ MemoryNode::prepare_local_stage1_item(
       (void)mark_node_deleted(target, item.generation);
       retire_local_dynamic_node(target, retirement_sequence);
       complete_storage_owner_maintenance_sequence(retirement_sequence);
-      {
-        std::lock_guard<std::mutex> lock(prepared_shard.mutex);
-        const auto position = prepared_records.find(key);
-        lib_assert(position != prepared_records.end() &&
-                     !position->second.prepared &&
-                     position->second.id == item.id &&
-                     position->second.generation == item.generation,
-                   "retryable Stage1 attempt lost its private reservation");
-        prepared_records.erase(position);
-      }
-      result.status = static_cast<u32>(MutationStatus::retry);
+      release_retryable_reservation();
       record_physical_stage1(
         candidates.size(), remote_frontier.size(), neighbors.size());
       return result;

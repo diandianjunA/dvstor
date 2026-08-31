@@ -55,24 +55,26 @@ __device__ f32 scalar_reference(const f32* query_lut, const u8* code,
   return distance;
 }
 
+template <u32 PqSubquantizers>
 __global__ void compare_scoring_kernel(PersistentKernelParams params,
                                        const f32* query_lut,
-                                       const u8* codes,
-                                       u32 cases,
-                                       u32* mismatches) {
+                                       const u8* codes, u32 code_stride,
+                                       u32 cases, u32* mismatches) {
   const u32 index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= cases) return;
-  // Consecutive byte shifts repeatedly cover every alignment. PQ25 encounters
-  // all four in production because its packed code stride is odd.
-  const u8* code = codes + index;
+  // Production codes are tightly packed. PQ25 therefore encounters all four
+  // alignments, while the PQ20/PQ32 strides preserve cudaMalloc alignment.
+  const u8* code = codes + static_cast<size_t>(index) * code_stride;
   const f32 expected =
     scalar_reference(query_lut, code, params.pq_subquantizers);
-  const f32 actual = approximate_entry(params, query_lut, code);
+  const f32 actual =
+    approximate_entry<PqSubquantizers>(params, query_lut, code);
   if (__float_as_uint(expected) != __float_as_uint(actual)) {
     atomicAdd(mismatches, 1u);
   }
 }
 
+template <u32 PqSubquantizers>
 void run_case(u32 subquantizers) {
   constexpr u32 kCases = 4096;
   constexpr u32 kMaximumSubquantizers = 32;
@@ -87,7 +89,9 @@ void run_case(u32 subquantizers) {
         1024.0f;
     }
   }
-  std::vector<u8> codes(kMaximumSubquantizers + kCases);
+  std::vector<u8> codes(
+    static_cast<size_t>(kCases) * subquantizers +
+    kMaximumSubquantizers);
   for (u32 index = 0; index < codes.size(); ++index) {
     codes[index] = static_cast<u8>((index * 73u + 19u) & 0xffu);
   }
@@ -106,8 +110,9 @@ void run_case(u32 subquantizers) {
 
   PersistentKernelParams params{};
   params.pq_subquantizers = subquantizers;
-  compare_scoring_kernel<<<(kCases + 127u) / 128u, 128>>>(
-    params, device_lut.get(), device_codes.get(), kCases,
+  compare_scoring_kernel<PqSubquantizers>
+    <<<(kCases + 127u) / 128u, 128>>>(
+    params, device_lut.get(), device_codes.get(), subquantizers, kCases,
     device_mismatches.get());
   check_cuda(cudaGetLastError(), "compare_scoring_kernel launch");
   check_cuda(cudaDeviceSynchronize(), "compare_scoring_kernel completion");
@@ -134,9 +139,10 @@ int main() {
       return 0;
     }
     check_cuda(cudaSetDevice(0), "cudaSetDevice");
-    run_case(20);
-    run_case(25);
-    run_case(32);
+    run_case<gpu_search::kPersistentPq20Subquantizers>(20);
+    run_case<gpu_search::kPersistentPq25Subquantizers>(25);
+    run_case<gpu_search::kPersistentPq32Subquantizers>(32);
+    run_case<gpu_search::kPersistentRuntimePqSubquantizers>(17);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

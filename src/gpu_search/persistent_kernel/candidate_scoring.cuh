@@ -368,38 +368,69 @@ __device__ __forceinline__ f32 approximate_entry_mixed_alignment_packed(
   return distance;
 }
 
-__device__ f32 approximate_entry(const PersistentKernelParams& params,
-                                 const f32* query_lut, const u8* code) {
-  const bool aligned =
-    reinterpret_cast<uintptr_t>(code) % alignof(u32) == 0;
+template <u32 PqSubquantizers>
+__device__ __forceinline__ u32 resolved_pq_subquantizers(
+    const PersistentKernelParams& params) {
+  static_assert(
+    PqSubquantizers == kPersistentRuntimePqSubquantizers ||
+    PqSubquantizers == kPersistentPq20Subquantizers ||
+    PqSubquantizers == kPersistentPq25Subquantizers ||
+    PqSubquantizers == kPersistentPq32Subquantizers);
+  if constexpr (PqSubquantizers == kPersistentRuntimePqSubquantizers) {
+    return params.pq_subquantizers;
+  }
+  return PqSubquantizers;
+}
+
+__device__ __noinline__ f32 approximate_entry_wide_fallback(
+    const f32* query_lut, const u8* code, u32 subquantizers) {
+  double wide_distance = 0.0;
+  for (u32 subquantizer = 0; subquantizer < subquantizers; ++subquantizer) {
+    wide_distance += static_cast<double>(
+      query_lut[static_cast<size_t>(subquantizer) * 256u +
+                code[subquantizer]]);
+  }
+  return saturate_device_squared_l2(wide_distance);
+}
+
+template <u32 PqSubquantizers = kPersistentRuntimePqSubquantizers>
+__device__ __forceinline__ f32 approximate_entry(
+    const PersistentKernelParams& params, const f32* query_lut,
+    const u8* code) {
+  const u32 subquantizers =
+    resolved_pq_subquantizers<PqSubquantizers>(params);
   f32 distance = 0.0f;
-  if (params.pq_subquantizers == 20 && aligned) {
-    // The 20-byte stride preserves cudaMalloc's natural alignment for base
-    // codes and the dynamic arena; RDMA payloads begin after an aligned tag.
-    distance = approximate_entry_aligned_packed<20>(query_lut, code);
-  } else if (params.pq_subquantizers == 25) {
+  if constexpr (PqSubquantizers == kPersistentPq20Subquantizers ||
+                PqSubquantizers == kPersistentPq32Subquantizers) {
+    // cudaMalloc bases, the dynamic arena, and the RDMA scratch records are
+    // naturally aligned. PQ20/PQ32 strides preserve that alignment and the
+    // RDMA payload begins after a four-byte aligned incarnation tag. Removing
+    // the redundant per-candidate alignment/PQ dispatch is the purpose of the
+    // production specializations.
+    distance = approximate_entry_aligned_packed<PqSubquantizers>(
+      query_lut, code);
+  } else if constexpr (PqSubquantizers ==
+                       kPersistentPq25Subquantizers) {
+    const bool aligned =
+      reinterpret_cast<uintptr_t>(code) % alignof(u32) == 0;
     distance = aligned
-      ? approximate_entry_aligned_packed<25>(query_lut, code)
-      : approximate_entry_mixed_alignment_packed<25>(query_lut, code);
-  } else if (params.pq_subquantizers == 32 && aligned) {
-    // Preserve the established fully unrolled PQ32 path: eight code loads
-    // replace 32 scalar loads without changing accumulation order.
-    distance = approximate_entry_aligned_packed<32>(query_lut, code);
+      ? approximate_entry_aligned_packed<kPersistentPq25Subquantizers>(
+          query_lut, code)
+      : approximate_entry_mixed_alignment_packed<
+          kPersistentPq25Subquantizers>(query_lut, code);
   } else {
-    for (u32 subquantizer = 0; subquantizer < params.pq_subquantizers;
-         ++subquantizer) {
+    for (u32 subquantizer = 0; subquantizer < subquantizers; ++subquantizer) {
       distance +=
-        query_lut[static_cast<size_t>(subquantizer) * 256 + code[subquantizer]];
+        query_lut[static_cast<size_t>(subquantizer) * 256u +
+                  code[subquantizer]];
     }
   }
   if (finite_f32_bits(distance) && distance < FLT_MAX) return distance;
-  double wide_distance = 0.0;
-  for (u32 subquantizer = 0; subquantizer < params.pq_subquantizers;
-       ++subquantizer) {
-    wide_distance += static_cast<double>(
-      query_lut[static_cast<size_t>(subquantizer) * 256 + code[subquantizer]]);
-  }
-  return saturate_device_squared_l2(wide_distance);
+  // Keep the exceptional non-finite recovery out of every production hot
+  // path. A single runtime-sized noinline body avoids triplicating/unrolling
+  // the double-precision loop in PQ20/PQ25/PQ32 kernels.
+  return approximate_entry_wide_fallback(
+    query_lut, code, subquantizers);
 }
 
 __device__ void beam_insert(u64* handles, u32* ids, f32* distances,
