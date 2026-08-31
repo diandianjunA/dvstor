@@ -8,8 +8,65 @@ namespace gpu_search {
 
 using namespace persistent_kernel_detail;
 
+namespace {
+
+template <u32 Threads, bool EnableAsfe, u32 PqSubquantizers>
+const void* persistent_search_kernel_address() {
+  return reinterpret_cast<const void*>(
+    persistent_search_kernel<Threads, EnableAsfe, PqSubquantizers>);
+}
+
+template <u32 Threads, bool EnableAsfe>
+const void* select_persistent_search_kernel(u32 pq_subquantizers) {
+  switch (persistent_pq_kernel_specialization(pq_subquantizers)) {
+    case kPersistentPq20Subquantizers:
+      return persistent_search_kernel_address<
+        Threads, EnableAsfe, kPersistentPq20Subquantizers>();
+    case kPersistentPq25Subquantizers:
+      return persistent_search_kernel_address<
+        Threads, EnableAsfe, kPersistentPq25Subquantizers>();
+    case kPersistentPq32Subquantizers:
+      return persistent_search_kernel_address<
+        Threads, EnableAsfe, kPersistentPq32Subquantizers>();
+    default:
+      return persistent_search_kernel_address<
+        Threads, EnableAsfe, kPersistentRuntimePqSubquantizers>();
+  }
+}
+
+template <u32 Threads, bool EnableAsfe>
+void launch_persistent_search_kernel(cudaStream_t stream,
+                                     const PersistentKernelParams& params,
+                                     u32 blocks) {
+  switch (persistent_pq_kernel_specialization(params.pq_subquantizers)) {
+    case kPersistentPq20Subquantizers:
+      persistent_search_kernel<Threads, EnableAsfe,
+                               kPersistentPq20Subquantizers>
+        <<<blocks, Threads, 0, stream>>>(params);
+      return;
+    case kPersistentPq25Subquantizers:
+      persistent_search_kernel<Threads, EnableAsfe,
+                               kPersistentPq25Subquantizers>
+        <<<blocks, Threads, 0, stream>>>(params);
+      return;
+    case kPersistentPq32Subquantizers:
+      persistent_search_kernel<Threads, EnableAsfe,
+                               kPersistentPq32Subquantizers>
+        <<<blocks, Threads, 0, stream>>>(params);
+      return;
+    default:
+      persistent_search_kernel<Threads, EnableAsfe,
+                               kPersistentRuntimePqSubquantizers>
+        <<<blocks, Threads, 0, stream>>>(params);
+      return;
+  }
+}
+
+}  // namespace
+
 PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads,
-                                                           bool enable_asfe) {
+                                                           bool enable_asfe,
+                                                           u32 pq_subquantizers) {
   if (threads != 128 && threads != 256) {
     throw std::invalid_argument(
       "persistent search kernel supports only 128 or 256 threads");
@@ -19,13 +76,13 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads,
   if (threads == 128) {
     kernel =
       enable_asfe
-        ? reinterpret_cast<const void*>(persistent_search_kernel<128, true>)
-        : reinterpret_cast<const void*>(persistent_search_kernel<128, false>);
+        ? select_persistent_search_kernel<128, true>(pq_subquantizers)
+        : select_persistent_search_kernel<128, false>(pq_subquantizers);
   } else {
     kernel =
       enable_asfe
-        ? reinterpret_cast<const void*>(persistent_search_kernel<256, true>)
-        : reinterpret_cast<const void*>(persistent_search_kernel<256, false>);
+        ? select_persistent_search_kernel<256, true>(pq_subquantizers)
+        : select_persistent_search_kernel<256, false>(pq_subquantizers);
   }
   cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
   if (status != cudaSuccess) {
@@ -63,15 +120,15 @@ void launch_persistent_search(cudaStream_t stream,
   }
   if (threads == 128) {
     if (decoupled_search_progression) {
-      persistent_search_kernel<128, true><<<blocks, 128, 0, stream>>>(params);
+      launch_persistent_search_kernel<128, true>(stream, params, blocks);
     } else {
-      persistent_search_kernel<128, false><<<blocks, 128, 0, stream>>>(params);
+      launch_persistent_search_kernel<128, false>(stream, params, blocks);
     }
   } else if (threads == 256) {
     if (decoupled_search_progression) {
-      persistent_search_kernel<256, true><<<blocks, 256, 0, stream>>>(params);
+      launch_persistent_search_kernel<256, true>(stream, params, blocks);
     } else {
-      persistent_search_kernel<256, false><<<blocks, 256, 0, stream>>>(params);
+      launch_persistent_search_kernel<256, false>(stream, params, blocks);
     }
   } else {
     throw std::invalid_argument(

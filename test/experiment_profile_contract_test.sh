@@ -257,7 +257,11 @@ grep -Fq 'gpu-query-beam-merge-policy = legacy' "$manual_ini"
 artifact_index_dir="$TEST_DIR/artifact-index"
 artifact_converted_dir="$TEST_DIR/artifact-converted"
 artifact_data_file="$artifact_converted_dir/base_1.u8bin"
-artifact_partition_strategy=balanced
+# Keep the fixture bound to the dataset default selected by sift100m_common.sh.
+# Profiles inherit that value (their fallback applies only when the dataset did
+# not choose one), so a balanced fixture would silently stop testing the
+# production Metis artifact path.
+artifact_partition_strategy=metis
 artifact_prefix="$artifact_index_dir/sift100m_R96_bw128_${artifact_partition_strategy}_pmd32_pq32_schema16"
 python3 - "$artifact_prefix" "$artifact_data_file" \
   "$artifact_partition_strategy" <<'PY_ARTIFACT_FIXTURE'

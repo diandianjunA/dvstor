@@ -8,7 +8,8 @@ template <bool EnableAsfe>
 __device__ void direct_read_owner_loop(const PersistentKernelParams& params,
                                        u32 queue_count, u32 owner_block);
 
-template <u32 Threads, bool EnableAsfe>
+template <u32 Threads, bool EnableAsfe,
+          u32 PqSubquantizers = kPersistentRuntimePqSubquantizers>
 __global__ __launch_bounds__(
   Threads,
   Threads == 128
@@ -323,7 +324,8 @@ __global__ __launch_bounds__(
       idle_cycles = 256u + ((blockIdx.x * 131u) & 1023u);
     }
     __syncthreads();
-    process_query<EnableAsfe>(params, descriptor, frontier_controller);
+    process_query<EnableAsfe, PqSubquantizers>(
+      params, descriptor, frontier_controller);
     __syncthreads();
   }
 }
@@ -639,10 +641,7 @@ __device__ void direct_read_owner_loop(const PersistentKernelParams& params,
               direct_batch_request_length(descriptor, index);
             request_lengths_valid &=
               request_length != 0 && request_length <= descriptor.bytes &&
-              request_length <= DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE &&
-              descriptor.remote_offsets[index] <= region.bytes &&
-              request_length <=
-                region.bytes - descriptor.remote_offsets[index];
+              request_length <= DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE;
           }
           if (mandatory_fenced_tail) {
             for (u32 index = 0; index < split; ++index) {
@@ -813,7 +812,21 @@ __device__ void direct_read_owner_loop(const PersistentKernelParams& params,
           index < critical_count &&
           descriptor.request_shards[index] == memory_node;
         const u32 matching_mask = __ballot_sync(0xffffffffu, matching_request);
-        if (matching_request) {
+        const u32 request_length = matching_request
+          ? direct_batch_request_length(descriptor, index) : 0u;
+        const bool remote_range_valid = !matching_request ||
+          direct_remote_range_valid(
+            region.bytes, descriptor.remote_offsets[index], request_length);
+        const u32 invalid_mask = __ballot_sync(
+          0xffffffffu, matching_request && !remote_range_valid);
+        if (lane == 0 && invalid_mask != 0) {
+          // batch_count was copied into a register above and is never loaded
+          // from shared memory again. Reuse its otherwise-dead high bit for
+          // the pre-doorbell range error instead of extending a predicate's
+          // live range across the complete WQE construction loop.
+          shared_batch_counts[warp_in_block] |= 0x80000000u;
+        }
+        if (matching_request && remote_range_valid) {
           const u32 lower_lanes = lane == 0 ? 0u : ((1u << lane) - 1u);
           const u32 rank = __popc(matching_mask & lower_lanes);
           const u32 matched = matched_before + rank;
@@ -830,7 +843,7 @@ __device__ void direct_read_owner_loop(const PersistentKernelParams& params,
             qp, wqe, ticket, flags,
             region.address + descriptor.remote_offsets[index], region.rkey,
             descriptor.local_iova_offsets[index], params.direct_local_mkey,
-            direct_batch_request_length(descriptor, index));
+            request_length);
         }
         matched_before += __popc(matching_mask);
       }
@@ -858,7 +871,17 @@ __device__ void direct_read_owner_loop(const PersistentKernelParams& params,
             descriptor.request_shards[index] == memory_node;
           const u32 matching_mask =
             __ballot_sync(0xffffffffu, matching_request);
-          if (matching_request) {
+          const u32 request_length = matching_request
+            ? direct_batch_request_length(descriptor, index) : 0u;
+          const bool remote_range_valid = !matching_request ||
+            direct_remote_range_valid(
+              region.bytes, descriptor.remote_offsets[index], request_length);
+          const u32 invalid_mask = __ballot_sync(
+            0xffffffffu, matching_request && !remote_range_valid);
+          if (lane == 0 && invalid_mask != 0) {
+            shared_batch_counts[warp_in_block] |= 0x80000000u;
+          }
+          if (matching_request && remote_range_valid) {
             const u32 lower_lanes = lane == 0 ? 0u : ((1u << lane) - 1u);
             const u32 rank = __popc(matching_mask & lower_lanes);
             const u32 matched = matched_before + rank;
@@ -884,13 +907,40 @@ __device__ void direct_read_owner_loop(const PersistentKernelParams& params,
               qp, wqe, ticket, flags,
               region.address + descriptor.remote_offsets[index], region.rkey,
               descriptor.local_iova_offsets[index], params.direct_local_mkey,
-              direct_batch_request_length(descriptor, index));
+              request_length);
           }
           matched_before += __popc(matching_mask);
         }
       }
     }
     __syncwarp();
+
+    // Range validation is deliberately fused into the warp-parallel WQE
+    // preparation pass above.  The owner used to repeat every 64-bit bounds
+    // check serially in lane 0 while counting the descriptor, extending the
+    // critical owner/CQ path for all valid queries.  A bad address leaves its
+    // WQE slot unprepared and the whole SQ train is rejected before the
+    // doorbell, so no invalid READ can reach the NIC.  Complete independently
+    // announced ASFE tails as well or the owner watchdog would retain debt.
+    if ((shared_batch_counts[warp_in_block] & 0x80000000u) != 0) {
+      if (lane == 0) {
+        for (u32 batch = 0; batch < batch_count; ++batch) {
+          const DirectBatchDescriptor descriptor =
+            shared_batches[warp_in_block][batch];
+          complete_direct_batch(descriptor, -ERANGE, owner_progress);
+          if constexpr (EnableAsfe) {
+            if (!is_mandatory_fenced_tail(descriptor) &&
+                shared_tail_matching_counts[warp_in_block][batch] != 0) {
+              complete_direct_batch(
+                make_speculative_tail_descriptor(descriptor), -ERANGE,
+                owner_progress);
+            }
+          }
+        }
+      }
+      __syncwarp();
+      continue;
+    }
 
     if (lane == 0) {
       const u32 critical_fence_wqes =

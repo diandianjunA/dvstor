@@ -127,22 +127,6 @@ void PersistentSearchEngine::Impl::initialize(
   }
   std::array<PersistentKernelOccupancy, 2> occupancies{};
   std::array<u32, 2> hardware_blocks_per_sm{};
-  for (size_t candidate = 0; candidate < occupancies.size(); ++candidate) {
-    occupancies[candidate] = inspect_persistent_search_kernel(
-      kPersistentThreadCandidates[candidate], decoupled_search_progression);
-    hardware_blocks_per_sm[candidate] =
-      occupancies[candidate].active_blocks_per_sm;
-  }
-  if (hardware_blocks_per_sm[0] == 0 && hardware_blocks_per_sm[1] == 0) {
-    throw std::runtime_error(
-      "selected GPU cannot make either persistent CUDA kernel resident; "
-      "threads128_regs=" + std::to_string(occupancies[0].registers_per_thread) +
-      " threads128_shared=" +
-      std::to_string(occupancies[0].static_shared_bytes) +
-      " threads256_regs=" + std::to_string(occupancies[1].registers_per_thread) +
-      " threads256_shared=" +
-      std::to_string(occupancies[1].static_shared_bytes));
-  }
   if (config.gpu_query_slots > std::numeric_limits<u32>::max() / 2u) {
     throw std::invalid_argument("GPU query ring capacity overflows u32");
   }
@@ -199,6 +183,33 @@ void PersistentSearchEngine::Impl::initialize(
     throw std::runtime_error(
       "GPU navigation manifest does not match runtime metadata");
   }
+  const u32 pq_kernel_specialization =
+    persistent_pq_kernel_specialization(pq_model.subquantizers);
+  for (size_t candidate = 0; candidate < occupancies.size(); ++candidate) {
+    occupancies[candidate] = inspect_persistent_search_kernel(
+      kPersistentThreadCandidates[candidate], decoupled_search_progression,
+      pq_model.subquantizers);
+    hardware_blocks_per_sm[candidate] =
+      occupancies[candidate].active_blocks_per_sm;
+  }
+  if (hardware_blocks_per_sm[0] == 0 && hardware_blocks_per_sm[1] == 0) {
+    throw std::runtime_error(
+      "selected GPU cannot make either persistent CUDA kernel resident; "
+      "pq_specialization=" + std::to_string(pq_kernel_specialization) +
+      " threads128_regs=" +
+      std::to_string(occupancies[0].registers_per_thread) +
+      " threads128_shared=" +
+      std::to_string(occupancies[0].static_shared_bytes) +
+      " threads256_regs=" +
+      std::to_string(occupancies[1].registers_per_thread) +
+      " threads256_shared=" +
+      std::to_string(occupancies[1].static_shared_bytes));
+  }
+  std::cerr << "[gpu-search] persistent PQ kernel specialization="
+            << (pq_kernel_specialization == kPersistentRuntimePqSubquantizers
+                  ? "runtime"
+                  : "PQ" + std::to_string(pq_kernel_specialization))
+            << " model_subquantizers=" << pq_model.subquantizers << '\n';
   const u32 graph_entry_capacity = VamanaNode::graph_entry_capacity();
   if (graph_entry_capacity < config.R ||
       index.layout.graph_entry_bytes <

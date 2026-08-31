@@ -431,6 +431,17 @@ void test_exact_snapshot_final_transport_policy() {
   assert(!exact_rerank_should_retry_route(false, 1));
 }
 
+void test_remote_range_validation_is_overflow_safe() {
+  using gpu_search::direct_remote_range_valid;
+  constexpr std::uint64_t region_bytes = 4096;
+  assert(direct_remote_range_valid(region_bytes, 0, 4096));
+  assert(direct_remote_range_valid(region_bytes, 4096, 0));
+  assert(!direct_remote_range_valid(region_bytes, 4096, 1));
+  assert(!direct_remote_range_valid(region_bytes, 4097, 0));
+  assert(!direct_remote_range_valid(
+    region_bytes, std::numeric_limits<std::uint64_t>::max(), 1));
+}
+
 }  // namespace
 
 int main() {
@@ -449,5 +460,6 @@ int main() {
   test_mandatory_snapshot_train_never_partially_admits();
   test_mandatory_enqueue_watchdog_balance();
   test_exact_snapshot_final_transport_policy();
+  test_remote_range_validation_is_overflow_safe();
   return 0;
 }

@@ -95,7 +95,7 @@ __device__ i32 direct_fetch(const PersistentKernelParams& params,
   auto* qp =
     reinterpret_cast<doca_gpu_dev_verbs_qp*>(params.direct_qps[qp_index]);
   const DirectRemoteRegion& region = params.direct_regions[memory_node];
-  if (remote_offset > region.bytes || bytes > region.bytes - remote_offset) {
+  if (!direct_remote_range_valid(region.bytes, remote_offset, bytes)) {
     return -ERANGE;
   }
   doca_gpu_dev_verbs_addr remote{.addr = region.address + remote_offset,
@@ -198,22 +198,6 @@ __device__ i32 direct_fetch_batch(
       params.direct_qps_per_node == 0 || params.direct_disabled == nullptr ||
       *reinterpret_cast<volatile u32*>(params.direct_disabled) != 0)
     return -EHOSTDOWN;
-  const DirectRemoteRegion& requested_region =
-    params.direct_regions[memory_node];
-  for (u32 index = 0; index < request_count; ++index) {
-    if (request_shards[index] != memory_node) continue;
-    const u32 request_length =
-      request_bytes == nullptr ? bytes : request_bytes[index];
-    if (request_length == 0 || request_length > bytes ||
-        request_length > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE) {
-      return request_length > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE
-               ? -E2BIG : -EINVAL;
-    }
-    if (remote_offsets[index] > requested_region.bytes ||
-        request_length > requested_region.bytes - remote_offsets[index]) {
-      return -ERANGE;
-    }
-  }
   // Narrow-frontier callers already pass a normalized QP lane. Avoid a second
   // runtime integer remainder in every populated shard publication.
   u32 qp_lane =
@@ -339,6 +323,12 @@ __device__ i32 direct_fetch_batch(
   if (bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE ||
       matching + (qp->need_dump ? 1u : 0u) > qp->sq_wqe_num)
     return -E2BIG;
+  // Queued persistent batches are range-checked by the exclusive owner while
+  // it counts the descriptor's matching requests.  Only the inline fallback
+  // reaches this point, so validate here before it directly builds any WQE.
+  // Keeping this below the owner-queue return avoids making every producer
+  // rescan a descriptor that the owner must validate authoritatively anyway.
+  const DirectRemoteRegion& region = params.direct_regions[memory_node];
   for (u32 index = 0; index < request_count; ++index) {
     if (request_shards[index] != memory_node) continue;
     const u32 request_length =
@@ -348,11 +338,14 @@ __device__ i32 direct_fetch_batch(
       return request_length > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE ? -E2BIG
                                                                     : -EINVAL;
     }
+    if (!direct_remote_range_valid(
+          region.bytes, remote_offsets[index], request_length)) {
+      return -ERANGE;
+    }
   }
   i32 status = lock_direct_qp(params.direct_qp_locks + qp_index, params.stop,
                               params.direct_disabled);
   if (status != 0) return status;
-  const DirectRemoteRegion& region = params.direct_regions[memory_node];
   auto* completion_queue = doca_gpu_dev_verbs_qp_get_cq_sq(qp);
   const doca_gpu_dev_verbs_ticket_t completion_ticket =
     doca_gpu_dev_verbs_load_relaxed<
@@ -898,6 +891,7 @@ __device__ void drain_terminal_exact_cache_prefetch(
   __syncthreads();
 }
 
+template <u32 PqSubquantizers = kPersistentRuntimePqSubquantizers>
 __device__ bool approximate_handles_batch(
   const PersistentKernelParams& params, const QueryDescriptor& descriptor,
   const f32* query_lut, u64* handles, u32 count, f32* distances,
@@ -908,6 +902,8 @@ __device__ bool approximate_handles_batch(
   u32* total_cache_publish_races, u32* total_lookup_probe_exhaustions,
   u32* total_publish_probe_exhaustions, u32* total_lookup_probes,
   u32* max_lookup_probes) {
+  const u32 pq_code_bytes =
+    resolved_pq_subquantizers<PqSubquantizers>(params);
   __shared__ i32 shard_status[kPersistentMaxShards];
   __shared__ u32 failed;
   __shared__ u32 call_dynamic_candidates;
@@ -958,10 +954,10 @@ __device__ bool approximate_handles_batch(
     u32 static_ordinal = 0;
     if (static_ordinal_from_raw(params, handle, static_ordinal)) {
       if (static_ordinal < params.num_nodes) {
-        distances[index] = approximate_entry(
+        distances[index] = approximate_entry<PqSubquantizers>(
           params, query_lut,
           params.pq_codes +
-            static_cast<size_t>(static_ordinal) * params.pq_code_bytes);
+            static_cast<size_t>(static_ordinal) * pq_code_bytes);
       }
       continue;
     }
@@ -993,8 +989,9 @@ __device__ bool approximate_handles_batch(
                                            remote_incarnation(handle))) {
         const u8* resident =
           params.dynamic_code_arena_records +
-          static_cast<size_t>(arena_slot) * params.pq_code_bytes;
-        distances[index] = approximate_entry(params, query_lut, resident);
+          static_cast<size_t>(arena_slot) * pq_code_bytes;
+        distances[index] = approximate_entry<PqSubquantizers>(
+          params, query_lut, resident);
         // Keep every payload load before the second state sample. Together
         // with the publisher's release store this is the device-scope
         // seqlock read side; legacy relaxed atomics are intentionally avoided.
@@ -1118,12 +1115,13 @@ __device__ bool approximate_handles_batch(
                      (request_base + index) * params.dynamic_code_record_stride;
     const u32 dynamic_tag = vamana::dynamic_navigation_code::load_u32_le(code);
     const u8* payload = code + sizeof(u32);
-    const u8* checksum = payload + params.pq_code_bytes;
+    const u8* checksum = payload + pq_code_bytes;
     if (dynamic_code_tag_incarnation(dynamic_tag) ==
           remote_incarnation(handles[index]) &&
         vamana::dynamic_navigation_code::validate(
-          dynamic_tag, payload, params.pq_code_bytes, checksum)) {
-      distances[index] = approximate_entry(params, query_lut, payload);
+          dynamic_tag, payload, pq_code_bytes, checksum)) {
+      distances[index] = approximate_entry<PqSubquantizers>(
+        params, query_lut, payload);
     } else {
       atomicAdd(&call_incarnation_rejects, 1u);
     }
@@ -1191,8 +1189,8 @@ __device__ bool approximate_handles_batch(
         continue;
       }
       u8* destination = params.dynamic_code_arena_records +
-                        static_cast<size_t>(arena_slot) * params.pq_code_bytes;
-      for (u32 byte = 0; byte < params.pq_code_bytes; ++byte) {
+                        static_cast<size_t>(arena_slot) * pq_code_bytes;
+      for (u32 byte = 0; byte < pq_code_bytes; ++byte) {
         destination[byte] = source[sizeof(u32) + byte];
       }
       dynamic_arena_state_publish(state, desired);

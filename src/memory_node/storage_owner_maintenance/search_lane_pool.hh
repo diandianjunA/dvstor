@@ -242,6 +242,7 @@ static_assert(stage2_search_lane_count(16, 8, 96) == 12);
 static_assert(stage2_search_lane_count(16, 0, 0) == 1);
 static_assert(stage2_search_lane_peak_rdma_wrs(32, 96, 48) == 64);
 static_assert(stage2_search_lane_peak_rdma_wrs(32, 24, 0) == 24);
+static_assert(stage2_global_search_lane_lease_limit(8, 6, 16) == 32);
 static_assert(stage2_global_search_lane_lease_limit(8, 16, 16) == 32);
 static_assert(stage2_global_search_lane_lease_limit(8, 2, 16) == 16);
 static_assert(stage2_global_search_lane_lease_limit(4, 16, 8) == 16);

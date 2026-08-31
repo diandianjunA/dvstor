@@ -14,6 +14,22 @@ namespace gpu_search {
 inline constexpr u32 kPersistentMaxBeam = kMaxPersistentTraversalBeam;
 inline constexpr u32 kPersistentMaxExact = 256;
 inline constexpr u32 kPersistentMaxSubquantizers = kMaxPersistentSubquantizers;
+// Zero selects the compatibility kernel whose PQ loop remains runtime-sized.
+// The production datasets use one of the three compile-time specializations
+// below so their persistent query kernel contains only the active scorer.
+inline constexpr u32 kPersistentRuntimePqSubquantizers = 0;
+inline constexpr u32 kPersistentPq20Subquantizers = 20;
+inline constexpr u32 kPersistentPq25Subquantizers = 25;
+inline constexpr u32 kPersistentPq32Subquantizers = 32;
+
+inline constexpr u32 persistent_pq_kernel_specialization(
+  u32 pq_subquantizers) {
+  return pq_subquantizers == kPersistentPq20Subquantizers ||
+      pq_subquantizers == kPersistentPq25Subquantizers ||
+      pq_subquantizers == kPersistentPq32Subquantizers
+    ? pq_subquantizers
+    : kPersistentRuntimePqSubquantizers;
+}
 inline constexpr u32 kPersistentMaxGraphDegree = 128;
 // The authoritative commit frontier preserves the legacy maximum batch width.
 // The speculative ROB is independently bounded by the same compile-time
@@ -162,6 +178,18 @@ __host__ __device__
 }
 
 using DirectRemoteRegion = gpu::GpuNetioRemoteMemoryRegion;
+
+// Overflow-safe containment check shared by inline reads and the persistent
+// owner. Keeping it host/device also makes the pre-doorbell safety contract
+// directly testable at both ends of the registered region.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+  inline constexpr bool
+  direct_remote_range_valid(u64 region_bytes, u64 remote_offset, u32 bytes) {
+  return remote_offset <= region_bytes &&
+         bytes <= region_bytes - remote_offset;
+}
 
 inline constexpr u32 kCentroidRouteMaxLiveEntries = 4;
 inline constexpr u32 kCentroidRouteLive = 1u;
@@ -729,7 +757,8 @@ struct PersistentKernelOccupancy {
 // analytical register-only estimate is not sufficient because CUDA also
 // accounts for allocation granularity and every other per-CTA resource.
 PersistentKernelOccupancy inspect_persistent_search_kernel(
-  u32 threads, bool enable_asfe = true);
+  u32 threads, bool enable_asfe = true,
+  u32 pq_subquantizers = kPersistentRuntimePqSubquantizers);
 
 void launch_persistent_search(cudaStream_t stream,
                               const PersistentKernelParams& params, u32 blocks,

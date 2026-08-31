@@ -477,9 +477,11 @@ void test_search_lane_budget_is_global_and_evenly_distributed() {
   assert(detail::stage2_global_search_lane_count(5, 1, 1, 4096) == 5);
 
   // The active lease is a continuation/scratch bound, not a reservation of a
-  // worst-case RDMA wave. Production's eight workers and sixteen allocated
-  // lanes per worker retain a 32-context pipeline while every actual wave is
-  // still checked by the independent RDMA credit manager.
+  // worst-case RDMA wave. Production's eight workers and six bounded contexts
+  // per worker retain a 32-context pipeline while every actual wave is still
+  // checked by the independent RDMA credit manager.
+  assert(detail::stage2_global_search_lane_lease_limit(
+           8, 6, 16) == 32);
   assert(detail::stage2_global_search_lane_lease_limit(
            8, 16, 16) == 32);
   assert(detail::stage2_global_search_lane_lease_limit(

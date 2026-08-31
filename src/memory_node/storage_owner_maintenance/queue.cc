@@ -425,7 +425,7 @@ bool MemoryNode::try_acquire_storage_owner_maintenance_slot(
   // This counter is the global number of live stage2 contexts, not the number
   // of physical workers. Each maintenance executor owns a fixed rpc-depth
   // context pool; peer send credits are independently bounded and try-only.
-  // Foreground and drain use the same fixed four-context worker share.
+  // Foreground and drain use the same fixed bounded worker share.
   const size_t admitted_contexts = stage2_context_admission_limit(
     storage_owner_maintenance_worker_states_.size(),
     config.storage_owner_rpc_depth);
