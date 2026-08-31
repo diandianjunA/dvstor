@@ -371,11 +371,21 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       snapshot_storage, "stage2_freeze_prune_wave", &snapshot_states);
     lib_assert(snapshot_states.size() == snapshot_plan.targets.size(),
                "Stage2 snapshot wave lost per-target read state");
-    if (std::find(snapshot_states.begin(), snapshot_states.end(),
-                  StableNodeSnapshotState::retryable) !=
-        snapshot_states.end()) {
-      return false;
-    }
+    storage_owner_stage2_prune_contention_excluded_.fetch_add(
+      static_cast<u64>(std::count(
+        snapshot_states.begin(), snapshot_states.end(),
+        StableNodeSnapshotState::retryable)),
+      std::memory_order_relaxed);
+    // This wave builds a RobustPrune candidate set; it is not a commit
+    // barrier.  Requiring every independent candidate to be unlocked in the
+    // same observation creates an all-or-nothing livelock on hub-heavy
+    // graphs: one hot neighbor makes the complete semantic B8 discard all of
+    // its successful snapshots forever.  A contended record is conservatively
+    // ineligible for this prune snapshot, exactly like a record that retired
+    // before the observation.  Reachability does not depend on retaining it:
+    // the independently revalidated promotion certificate below is mandatory,
+    // and the reconciliation receiver rechecks every selected parent while
+    // holding its incarnation lock.
     snapshot_by_raw.clear();
     snapshot_by_raw.reserve(snapshot_count);
     for (size_t snapshot_index = 0; snapshot_index < snapshot_count;
@@ -402,7 +412,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         if (found != snapshot_by_raw.end()) snapshots.push_back(found->second);
       }
     }
-    return true;
   };
 
   const auto materialize_stable_identity_wave = [&](size_t task_count) {
@@ -415,11 +424,17 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       identity_storage, &identity_states);
     lib_assert(identity_states.size() == snapshot_plan.targets.size(),
                "Stage2 identity wave lost per-target read state");
-    if (std::find(identity_states.begin(), identity_states.end(),
-                  StableNodeSnapshotState::retryable) !=
-        identity_states.end()) {
-      return false;
-    }
+    storage_owner_stage2_parent_contention_excluded_.fetch_add(
+      static_cast<u64>(std::count(
+        identity_states.begin(), identity_states.end(),
+        StableNodeSnapshotState::retryable)),
+      std::memory_order_relaxed);
+    // Parent selection is also conservative: a neighbor whose coherent
+    // identity cannot be captured now must not hold the whole context behind
+    // a global retry barrier.  Exclude it from this planner view and choose a
+    // different live parent.  The receiver-side incarnation/lifecycle check
+    // remains the authoritative publication boundary, so contention is never
+    // mistaken for a successful edge mutation.
     stable_identity_targets.clear();
     stable_identity_targets.reserve(identity_count);
     for (size_t index = 0; index < identity_count; ++index) {
@@ -443,7 +458,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         }
       }
     }
-    return true;
   };
 
   const auto record_finalized_live = [this](
@@ -2159,12 +2173,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
 
     }
 
-    if (!materialize_stable_snapshot_wave(context.tasks.size())) {
-      storage_owner_maintenance_pressure_yields_.fetch_add(
-        1, std::memory_order_relaxed);
-      defer_stage2_retry(context);
-      return false;
-    }
+    materialize_stable_snapshot_wave(context.tasks.size());
     for (size_t item = 0; item < context.tasks.size(); ++item) {
       if (!snapshot_task_active[item]) continue;
       StorageOwnerMaintenanceTask& task = context.tasks[item];
@@ -2376,12 +2385,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // Liveness revalidation needs only the coherent header/incarnation pair,
     // not another copy of every D-byte vector. The compact identity wave also
     // fits several times more requests in the same registered scratch plane.
-    if (!materialize_stable_identity_wave(context.tasks.size())) {
-      storage_owner_maintenance_pressure_yields_.fetch_add(
-        1, std::memory_order_relaxed);
-      defer_stage2_retry(context);
-      return false;
-    }
+    materialize_stable_identity_wave(context.tasks.size());
 
     const auto publish_recovery_outgoing = [&](
         StorageOwnerMaintenanceTask& task,
@@ -2439,15 +2443,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       const vec<NodeSnapshot> snapshots = read_node_snapshots_batched(
         candidates, config, "stage2_recovery_outgoing",
         &recovery_outgoing_states);
-      if (std::find(recovery_outgoing_states.begin(),
-                    recovery_outgoing_states.end(),
-                    StableNodeSnapshotState::retryable) !=
-          recovery_outgoing_states.end()) {
-        lib_assert(publish_locked_node_header(
-                     task.final_target, final_header, 0, 0),
-                   "failed to release retryable Stage2 recovery target");
-        return false;
-      }
+      // Recovery needs one verified live bridge, not an atomic observation of
+      // every old outgoing candidate.  Ignore independently contended
+      // candidates and derive eligibility only from coherent snapshots; the
+      // chosen bridge is checked again by reverse reconciliation.
       hashset_t<RemotePtr> eligible;
       eligible.reserve(snapshots.size());
       for (const NodeSnapshot& snapshot : snapshots) {
@@ -2548,12 +2547,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           read_node_snapshots_batched(
             recovery_candidates, config,
             "stage2_reachability_recovery", &recovery_states);
-        if (std::find(recovery_states.begin(), recovery_states.end(),
-                      StableNodeSnapshotState::retryable) !=
-            recovery_states.end()) {
-          defer_stage2_retry(context);
-          return false;
-        }
+        // Select from the coherent subset.  One hot route entry must not
+        // suppress another independently verified recovery parent.
         RemotePtr recovery_parent;
         for (const NodeSnapshot& candidate : recovery_snapshots) {
           if (!stage2_parent_is_stable(

@@ -1481,6 +1481,11 @@ private:
   std::atomic<u64> storage_owner_stage2_final_edges_{0};
   std::atomic<u64> storage_owner_stage2_cross_edges_stage1_home_{0};
   std::atomic<u64> storage_owner_stage2_cross_edges_final_home_{0};
+  // Planner-only observations may conservatively exclude a contended
+  // candidate.  These counters make that liveness escape visible without
+  // weakening any publication/reconciliation postcondition.
+  std::atomic<u64> storage_owner_stage2_prune_contention_excluded_{0};
+  std::atomic<u64> storage_owner_stage2_parent_contention_excluded_{0};
   // Stage2 timings are aggregated once per context phase/attempt.  Keeping
   // these counters at the batch boundary makes the diagnostic cost
   // independent of L, R, vector dimension, and the number of RDMA reads.

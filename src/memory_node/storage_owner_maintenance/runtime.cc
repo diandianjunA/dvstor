@@ -865,6 +865,12 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   const u64 stage2_cross_edges_final_home =
     storage_owner_stage2_cross_edges_final_home_.load(
       std::memory_order_relaxed);
+  const u64 stage2_prune_contention_excluded =
+    storage_owner_stage2_prune_contention_excluded_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_parent_contention_excluded =
+    storage_owner_stage2_parent_contention_excluded_.load(
+      std::memory_order_relaxed);
   const u64 reverse_aggregate_batches =
     storage_owner_reverse_aggregate_batches_.load(std::memory_order_relaxed);
   const u64 reverse_aggregate_logical_requests =
@@ -1222,6 +1228,10 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(stage2_cross_edges_stage1_home) +
                " stage2_cross_edges_final_home=" +
                std::to_string(stage2_cross_edges_final_home) +
+               " stage2_prune_contention_excluded=" +
+               std::to_string(stage2_prune_contention_excluded) +
+               " stage2_parent_contention_excluded=" +
+               std::to_string(stage2_parent_contention_excluded) +
                " cross_edge_reduction_ratio=" +
                std::to_string(stage2_cross_edges_stage1_home == 0 ? 0.0 :
                  1.0 - ratio_or_zero(stage2_cross_edges_final_home,
