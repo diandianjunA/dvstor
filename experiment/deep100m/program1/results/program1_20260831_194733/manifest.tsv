@@ -1,0 +1,4 @@
+case	report
+baseline	/home/xjs/experiment/dvstor/experiment/deep100m/program1/results/program1_20260831_194733/baseline/04_gpu_persistent_gpunetio_baseline/deep100m_04_gpu_persistent_gpunetio_baseline_20260831_194753.json
+solution	/home/xjs/experiment/dvstor/experiment/deep100m/program1/results/program1_20260831_194733/solution/04_gpu_persistent_gpunetio_baseline/deep100m_04_gpu_persistent_gpunetio_baseline_20260831_194956.json
+quality	/home/xjs/experiment/dvstor/experiment/deep100m/program1/results/program1_20260831_194733/quality/quality.json

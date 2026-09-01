@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="650" height="405" viewBox="0 0 650 405">
+<style>
+  text { font-family: Arial, sans-serif; fill: #222; }
+  .tick { font-size: 13px; fill: #444; }
+  .axis-title { font-size: 14px; fill: #333; }
+  .dataset { font-size: 14px; font-weight: 700; }
+  .inside { font-size: 12px; font-weight: 700; fill: #25313b; text-anchor: middle; }
+  .value { font-size: 10px; font-weight: 700; fill: #25313b; text-anchor: middle; }
+  .legend { font-size: 13px; fill: #333; }
+  .grid { stroke: #dfe3e8; stroke-width: 1; }
+  .axis { stroke: #555; stroke-width: 1.2; }
+</style>
+<rect width="100%" height="100%" fill="white"/>
+<line class="grid" x1="72" y1="330.00" x2="625" y2="330.00"/>
+<text class="tick" x="68" y="334.00" text-anchor="end">0</text>
+<line class="grid" x1="72" y1="262.00" x2="625" y2="262.00"/>
+<text class="tick" x="68" y="266.00" text-anchor="end">25</text>
+<line class="grid" x1="72" y1="194.00" x2="625" y2="194.00"/>
+<text class="tick" x="68" y="198.00" text-anchor="end">50</text>
+<line class="grid" x1="72" y1="126.00" x2="625" y2="126.00"/>
+<text class="tick" x="68" y="130.00" text-anchor="end">75</text>
+<line class="grid" x1="72" y1="58.00" x2="625" y2="58.00"/>
+<text class="tick" x="68" y="62.00" text-anchor="end">100</text>
+<line class="axis" x1="72" y1="58" x2="72" y2="330"/>
+<line class="axis" x1="72" y1="330" x2="625" y2="330"/>
+<text class="axis-title" x="0" y="0" text-anchor="middle" transform="translate(22 194.0) rotate(-90)">Insertion time (%)</text>
+<rect x="119.0" y="58.00" width="92" height="220.12" fill="#9ecae1" stroke="white"/>
+<rect x="119.0" y="278.12" width="92" height="51.88" fill="#d9dde3" stroke="white"/>
+<text class="inside" x="165" y="155.06">RDMA</text>
+<text class="value" x="165" y="170.06">37.72 ms</text>
+<text class="value" x="165" y="183.06">(80.9%)</text>
+<text class="inside" x="165" y="292.06">CPU</text>
+<text class="value" x="165" y="307.06">8.89 ms</text>
+<text class="value" x="165" y="320.06">(19.1%)</text>
+<text class="dataset" x="165" y="354" text-anchor="middle">SIFT100M</text>
+<rect x="284.0" y="58.00" width="92" height="203.14" fill="#9ecae1" stroke="white"/>
+<rect x="284.0" y="261.14" width="92" height="68.86" fill="#d9dde3" stroke="white"/>
+<text class="inside" x="330" y="146.57">RDMA</text>
+<text class="value" x="330" y="161.57">29.67 ms</text>
+<text class="value" x="330" y="174.57">(74.7%)</text>
+<text class="inside" x="330" y="283.57">CPU</text>
+<text class="value" x="330" y="298.57">10.06 ms</text>
+<text class="value" x="330" y="311.57">(25.3%)</text>
+<text class="dataset" x="330" y="354" text-anchor="middle">DEEP100M</text>
+<rect x="449.0" y="58.00" width="92" height="209.62" fill="#9ecae1" stroke="white"/>
+<rect x="449.0" y="267.62" width="92" height="62.38" fill="#d9dde3" stroke="white"/>
+<text class="inside" x="495" y="149.81">RDMA</text>
+<text class="value" x="495" y="164.81">30.06 ms</text>
+<text class="value" x="495" y="177.81">(77.1%)</text>
+<text class="inside" x="495" y="286.81">CPU</text>
+<text class="value" x="495" y="301.81">8.94 ms</text>
+<text class="value" x="495" y="314.81">(22.9%)</text>
+<text class="dataset" x="495" y="354" text-anchor="middle">SPACEV100M</text>
+<g transform="translate(232,386)">
+<rect x="0" y="-12" width="16" height="16" fill="#9ecae1"/>
+<text class="legend" x="23" y="1">RDMA wait</text>
+<rect x="116" y="-12" width="16" height="16" fill="#d9dde3"/>
+<text class="legend" x="139" y="1">CPU</text>
+</g>
+</svg>

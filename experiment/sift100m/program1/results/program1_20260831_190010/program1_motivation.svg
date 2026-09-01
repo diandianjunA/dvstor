@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="350" viewBox="0 0 1320 350">
+<style>
+  text { font-family: Arial, "Noto Sans", sans-serif; fill: #222; }
+  .title { font-size: 17px; font-weight: 700; }
+  .subtitle { font-size: 13px; fill: #555; }
+  .axis { font-size: 11px; fill: #444; }
+  .axis-title { font-size: 12px; fill: #333; }
+  .label { font-size: 14px; }
+  .value { font-size: 13px; font-weight: 700; }
+  .inside { font-size: 11px; font-weight: 700; fill: #25313b; text-anchor: middle; }
+  .annotation { font-size: 10px; font-weight: 700; fill: #25313b; }
+  .track { fill: #f0f0f0; }
+  .grid { stroke: #e5e7eb; stroke-width: 1; }
+  .axis-line { stroke: #555; stroke-width: 1.1; }
+</style>
+<rect width="100%" height="100%" fill="white"/>
+<g transform="translate(20,25)">
+<text class="title" x="0" y="18">(a) Insertion-time breakdown</text>
+<text class="subtitle" x="145" y="42" text-anchor="middle">46.62 ms total</text>
+<line class="grid" x1="55" y1="67" x2="250" y2="67"/>
+<line class="grid" x1="55" y1="118.25" x2="250" y2="118.25"/>
+<line class="grid" x1="55" y1="169.5" x2="250" y2="169.5"/>
+<line class="grid" x1="55" y1="220.75" x2="250" y2="220.75"/>
+<line class="grid" x1="55" y1="272" x2="250" y2="272"/>
+<line class="axis-line" x1="55" y1="67" x2="55" y2="272"/>
+<line class="axis-line" x1="55" y1="272" x2="250" y2="272"/>
+<text class="axis" x="49" y="71" text-anchor="end">100</text>
+<text class="axis" x="49" y="122.25" text-anchor="end">75</text>
+<text class="axis" x="49" y="173.5" text-anchor="end">50</text>
+<text class="axis" x="49" y="224.75" text-anchor="end">25</text>
+<text class="axis" x="49" y="276" text-anchor="end">0</text>
+<text class="axis-title" x="9" y="169.5" text-anchor="middle" transform="rotate(-90 9 169.5)">Insertion time (%)</text>
+<rect x="119" y="67" width="62" height="165.90" fill="#9ecae1" stroke="white" stroke-width="1"/>
+<rect x="119" y="232.90" width="62" height="39.10" fill="#d9dde3" stroke="white" stroke-width="1"/>
+<text class="inside" x="150.0" y="153.95">RDMA</text>
+<text class="annotation" x="188" y="153.95">37.72 ms (80.9%)</text>
+<text class="inside" x="150.0" y="256.45">CPU</text>
+<text class="annotation" x="188" y="256.45">8.89 ms (19.1%)</text>
+<text class="axis" x="150.0" y="288" text-anchor="middle">Insertion</text>
+</g><g transform="translate(345,25)">
+<text class="title" x="0" y="18">(b) Update throughput (6.15x)</text>
+<text class="label" x="0" y="65">Coupled</text>
+<rect class="track" x="0" y="77" width="210" height="28"/>
+<rect x="0" y="77" width="30.51" height="28" fill="#7570b3"/>
+<text class="value" x="220" y="98">338.42 ops/s</text>
+<text class="label" x="0" y="150">Two-stage</text>
+<rect class="track" x="0" y="162" width="210" height="28"/>
+<rect x="0" y="162" width="187.50" height="28" fill="#1b9e77"/>
+<text class="value" x="220" y="183">2079.77 ops/s</text>
+</g><g transform="translate(670,25)">
+<text class="title" x="0" y="18">(c) Temporary query quality</text>
+<text class="label" x="0" y="65">Stage1-only</text>
+<rect class="track" x="0" y="77" width="210" height="28"/>
+<rect x="0" y="77" width="161.28" height="28" fill="#e6ab02"/>
+<text class="value" x="220" y="98">76.80%</text>
+<text class="label" x="0" y="150">Stage2 final</text>
+<rect class="track" x="0" y="162" width="210" height="28"/>
+<rect x="0" y="162" width="210.00" height="28" fill="#1b9e77"/>
+<text class="value" x="220" y="183">100.00%</text>
+</g><g transform="translate(995,25)">
+<text class="title" x="0" y="18">(d) Locality (20.3% fewer)</text>
+<text class="label" x="0" y="65">Before move</text>
+<rect class="track" x="0" y="77" width="210" height="28"/>
+<rect x="0" y="77" width="187.50" height="28" fill="#e7298a"/>
+<text class="value" x="220" y="98">17.93%</text>
+<text class="label" x="0" y="150">After move</text>
+<rect class="track" x="0" y="162" width="210" height="28"/>
+<rect x="0" y="162" width="149.50" height="28" fill="#66a61e"/>
+<text class="value" x="220" y="183">14.30%</text>
+</g>
+</svg>

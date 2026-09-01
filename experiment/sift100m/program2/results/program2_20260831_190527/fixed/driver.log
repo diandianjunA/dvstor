@@ -1,0 +1,681 @@
+[breakdown] concurrency clients=272 source=auto auto_required=272 auto_cap=512 gpu_query_slots=256 storage_rpc_inflight=80 (5x16) derivation=gpu_query_slots+dedicated_paced_write_threads
+[breakdown] write-rate-limited split reads=256 writes=16 target_write_qps=500
+[breakdown] performance query: /data/xjs/datasets/sift1b/sift100m_to_110m_query.u8bin [100000000,110000000)
+[breakdown] insert: /data/xjs/datasets/sift1b/sift110m_to_120m_insert.u8bin [110000000,120000000)
+[breakdown] unique performance-query budget rows=10000000 total_timed_seconds=25 max_average_query_qps_without_reuse=400000.0
+[ 12%] Built target rdma_library
+[ 18%] Built target dvstor_gpu_kernels
+[ 81%] Built target dvstor_runtime
+[ 93%] Built target dvstor_breakdown_support
+[100%] Built target dvstor_breakdown_benchmark
+[mn-memory] required=24 GiB source=metadata policy=20% of base nodes limiting_shard=2 dynamic_slots=4120200 record_bytes=1040
+[breakdown] profile=04_gpu_persistent_gpunetio command: /home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark --service-config /home/xjs/experiment/dvstor/experiment/sift100m/program2/results/program2_20260831_190527/fixed/04_gpu_persistent_gpunetio/service_04_gpu_persistent_gpunetio_20260831_190534.ini --profile-name 04_gpu_persistent_gpunetio --system-variant-label full --workload mixed --warmup-ops 100 --measure-ops 1000 --warmup-seconds 5 --measure-seconds 20 --client-threads 272 --read-ratio 0.5 --mixed-mode write_rate_limited --write-threads 16 --target-query-qps 0 --target-write-qps 500 --write-insert-ratio 1 --write-upsert-ratio 0 --write-delete-ratio 0 --report-json /home/xjs/experiment/dvstor/experiment/sift100m/program2/results/program2_20260831_190527/fixed/04_gpu_persistent_gpunetio/sift100m_04_gpu_persistent_gpunetio_20260831_190534.json --report-text /home/xjs/experiment/dvstor/experiment/sift100m/program2/results/program2_20260831_190527/fixed/04_gpu_persistent_gpunetio/sift100m_04_gpu_persistent_gpunetio_20260831_190534.txt --recall-query-file /data/xjs/index/dvstor_sift100m/converted/query.u8bin --groundtruth-file /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin --recall-queries 1000 --recall-k 10 --recall-mode all --recall-base-id-limit 0 --performance-query-file /data/xjs/datasets/sift1b/sift100m_to_110m_query.u8bin --insert-start-id 111000000 --insert-file /data/xjs/datasets/sift1b/sift110m_to_120m_insert.u8bin --storage-maintenance-log /home/xjs/experiment/dvstor/experiment/sift100m/logs/memory_node_1_04_gpu_persistent_gpunetio.log --storage-maintenance-log /home/xjs/experiment/dvstor/experiment/sift100m/logs/memory_node_2_04_gpu_persistent_gpunetio.log --storage-maintenance-log /home/xjs/experiment/dvstor/experiment/sift100m/logs/memory_node_3_04_gpu_persistent_gpunetio.log --storage-maintenance-log /home/xjs/experiment/dvstor/experiment/sift100m/logs/memory_node_4_04_gpu_persistent_gpunetio.log --storage-maintenance-log /home/xjs/experiment/dvstor/experiment/sift100m/logs/memory_node_5_04_gpu_persistent_gpunetio.log
+============================================================
+                        CLIENT
+============================================================
+connect to:                   [192.168.6.202:1234, 192.168.6.202:1235, 192.168.6.202:1236, 192.168.6.202:1237, 192.168.6.202:1238, ]
+is initiator:                 true
+TCP port:                     2234
+QP handshake timeout (ms):    10000
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         64
+max send work requests:       4096
+max receive work requests:    4096
+============================================================
+index prefix:                     "/data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16"
+threads:                          64
+dimension:                        128
+max vectors:                      100000000
+vector ID namespace [0,N):        4294967295
+K / R:                            10 / 96
+vector data type:                 uint8
+--------------------------------------------------------------------
+query engine:                     persistent_gpu_opq_pq
+remote transport:                 GPU-initiated GPUNetIO
+GPU device:                       1
+GPU concurrent query slots:       256
+GPU memory limit/reserve GiB:     40/4
+GPU traversal/rerank width:       128/128
+GPU max expansions:               384
+GPU device stack bytes/thread:    4096
+GPU graph commit/issue width:     16/32
+dynamic graph access mode:        manual
+GPU graph read policy:            fixed
+GPU dynamic graph extent:         true
+GPU-RDMA progression mode:        decoupled
+GPU Beam merge policy:            stable-run
+query RDMA trace mode/rate:       off/1000
+query RDMA trace output:          ""
+GPU RDMA QPs per storage node:    32
+GPU direct CQ timeout ms:         250
+GPU persistent blocks/SM cap:     4
+compute updates enabled:          true
+storage update completion mode:   decoupled
+storage update protocol:          centroid-home two-stage
+storage RPC depth/batch:          16/32
+storage batch max wait us:        10000
+storage Stage2 batch max wait us: 25000
+storage Stage2 initial delay ms:  0
+Stage2 exact score-many:          true
+Stage2 home RPC combining:        true
+Stage2 graph issue width:         16
+storage peer QPs per peer:        8
+storage stage2 maintenance:       8 workers, backlog 65536
+====================================================================
+[breakdown] workload input preflight passed before service startup
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1, active_mtu: 5
+interleaved policy
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+local process CPU partition: rank 0/1 logical_cpus=112
+[STATUS]: loaded schema-16 GPU index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16 (OPQ/PQ32, vector_data_type=uint8)
+client id: 0
+number of clients: 1
+connect to server 192.168.6.202:1234
+pairing: 18764 -- 93985
+connect to server 192.168.6.202:1235
+pairing: 18765 -- 93986
+connect to server 192.168.6.202:1236
+pairing: 18766 -- 93987
+connect to server 192.168.6.202:1237
+pairing: 18767 -- 93988
+connect to server 192.168.6.202:1238
+pairing: 18768 -- 93989
+[STATUS]: receive access tokens of remote memory regions
+[STATUS]: storage-owner authority: deterministic ID shard; physical placement: storage directory + centroid home
+[STATUS]: search: GPU-persistent OPQ/PQ32 beam + final RDMA exact rerank
+[gpu-search] ASFE device stack bytes/thread=4096 requested=4096
+[gpu-search] synthesized navigation manifest in memory from metadata
+[gpu-search] persistent PQ kernel specialization=PQ32 model_subquantizers=32
+[gpu-search] graph-read-policy=fixed graph_record_bytes=832
+[gpu-search] query routing=versioned centroid routes centroid_shards=5 live_entries_per_shard=4 start_shards=1
+[gpu-search] device=NVIDIA A800 80GB PCIe cc=8.0 sm_count=108 global_memory=85119205376 gpudirect_rdma=1
+[gpu-search] navigation budget codes=3200000000 dynamic_code_scratch=20971520 dynamic_code_arena=915541956 dynamic_code_arena_slots=25431721 dynamic_request_scratch=10485760 navigation_candidates=6291456 direct_queue_scratch=1866240 graph_scratch=16777216 graph_request_metadata=0 speculative_graph_request_metadata=237568 graph_extent_classes=0 query_rdma_trace=0 centroid_route=528 shard_centroids=2560 explicit=4527077356 limit=38654705664 bytes
+[STATUS]: exporting GPUNetIO QP resource=0 lane=0 server=0 qpn=18769 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=0 server=1 qpn=18770 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=0 server=2 qpn=18771 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=0 server=3 qpn=18772 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=0 server=4 qpn=18773 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=1 server=0 qpn=18774 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=1 server=1 qpn=18775 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=1 server=2 qpn=18776 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=1 server=3 qpn=18777 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=1 server=4 qpn=18778 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=2 server=0 qpn=18779 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=2 server=1 qpn=18780 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=2 server=2 qpn=18781 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=2 server=3 qpn=18782 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=2 server=4 qpn=18783 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=3 server=0 qpn=18784 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=3 server=1 qpn=18785 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=3 server=2 qpn=18786 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=3 server=3 qpn=18787 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=3 server=4 qpn=18788 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=4 server=0 qpn=18789 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=4 server=1 qpn=18790 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=4 server=2 qpn=18791 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=4 server=3 qpn=18792 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=4 server=4 qpn=18793 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=5 server=0 qpn=18794 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=5 server=1 qpn=18795 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=5 server=2 qpn=18796 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=5 server=3 qpn=18797 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=5 server=4 qpn=18798 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=6 server=0 qpn=18799 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=6 server=1 qpn=18800 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=6 server=2 qpn=18801 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=6 server=3 qpn=18802 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=6 server=4 qpn=18803 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=7 server=0 qpn=18804 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=7 server=1 qpn=18805 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=7 server=2 qpn=18806 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=7 server=3 qpn=18807 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=7 server=4 qpn=18808 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=8 server=0 qpn=18809 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=8 server=1 qpn=18810 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=8 server=2 qpn=18811 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=8 server=3 qpn=18812 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=8 server=4 qpn=18813 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=9 server=0 qpn=18814 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=9 server=1 qpn=18815 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=9 server=2 qpn=18816 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=9 server=3 qpn=18817 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=9 server=4 qpn=18818 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=10 server=0 qpn=18819 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=10 server=1 qpn=18820 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=10 server=2 qpn=18821 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=10 server=3 qpn=18822 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=10 server=4 qpn=18823 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=11 server=0 qpn=18824 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=11 server=1 qpn=18825 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=11 server=2 qpn=18826 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=11 server=3 qpn=18827 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=11 server=4 qpn=18828 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=12 server=0 qpn=18829 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=12 server=1 qpn=18830 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=12 server=2 qpn=18831 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=12 server=3 qpn=18832 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=12 server=4 qpn=18833 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=13 server=0 qpn=18834 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=13 server=1 qpn=18835 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=13 server=2 qpn=18836 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=13 server=3 qpn=18837 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=13 server=4 qpn=18838 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=14 server=0 qpn=18839 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=14 server=1 qpn=18840 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=14 server=2 qpn=18841 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=14 server=3 qpn=18842 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=14 server=4 qpn=18843 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=15 server=0 qpn=18844 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=15 server=1 qpn=18845 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=15 server=2 qpn=18846 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=15 server=3 qpn=18847 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=15 server=4 qpn=18848 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=16 server=0 qpn=18849 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=16 server=1 qpn=18850 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=16 server=2 qpn=18851 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=16 server=3 qpn=18852 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=16 server=4 qpn=18853 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=17 server=0 qpn=18854 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=17 server=1 qpn=18855 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=17 server=2 qpn=18856 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=17 server=3 qpn=18857 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=17 server=4 qpn=18858 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=18 server=0 qpn=18859 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=18 server=1 qpn=18860 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=18 server=2 qpn=18861 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=18 server=3 qpn=18862 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=18 server=4 qpn=18863 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=19 server=0 qpn=18864 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=19 server=1 qpn=18865 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=19 server=2 qpn=18866 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=19 server=3 qpn=18867 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=19 server=4 qpn=18868 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=20 server=0 qpn=18869 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=20 server=1 qpn=18870 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=20 server=2 qpn=18871 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=20 server=3 qpn=18872 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=20 server=4 qpn=18873 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=21 server=0 qpn=18874 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=21 server=1 qpn=18875 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=21 server=2 qpn=18876 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=21 server=3 qpn=18877 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=21 server=4 qpn=18878 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=22 server=0 qpn=18879 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=22 server=1 qpn=18880 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=22 server=2 qpn=18881 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=22 server=3 qpn=18882 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=22 server=4 qpn=18883 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=23 server=0 qpn=18884 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=23 server=1 qpn=18885 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=23 server=2 qpn=18886 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=23 server=3 qpn=18887 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=23 server=4 qpn=18888 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=24 server=0 qpn=18889 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=24 server=1 qpn=18890 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=24 server=2 qpn=18891 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=24 server=3 qpn=18892 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=24 server=4 qpn=18893 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=25 server=0 qpn=18894 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=25 server=1 qpn=18895 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=25 server=2 qpn=18896 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=25 server=3 qpn=18897 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=25 server=4 qpn=18898 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=26 server=0 qpn=18899 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=26 server=1 qpn=18900 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=26 server=2 qpn=18901 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=26 server=3 qpn=18902 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=26 server=4 qpn=18903 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=27 server=0 qpn=18904 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=27 server=1 qpn=18905 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=27 server=2 qpn=18906 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=27 server=3 qpn=18907 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=27 server=4 qpn=18908 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=28 server=0 qpn=18909 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=28 server=1 qpn=18910 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=28 server=2 qpn=18911 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=28 server=3 qpn=18912 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=28 server=4 qpn=18913 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=29 server=0 qpn=18914 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=29 server=1 qpn=18915 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=29 server=2 qpn=18916 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=29 server=3 qpn=18917 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=29 server=4 qpn=18918 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=30 server=0 qpn=18919 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=30 server=1 qpn=18920 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=30 server=2 qpn=18921 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=30 server=3 qpn=18922 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=30 server=4 qpn=18923 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=31 server=0 qpn=18924 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=31 server=1 qpn=18925 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=31 server=2 qpn=18926 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=31 server=3 qpn=18927 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: exporting GPUNetIO QP resource=0 lane=31 server=4 qpn=18928 gpu_pci=0000:5C:00.0 ibdev=mlx5_0 handler=GPU_SM_DB
+[STATUS]: GPUNetIO GPU MR registration=peer_memory bytes=3248422912
+[STATUS]: GPUNetIO startup RDMA read probe passed for 160 QPs
+[STATUS]: GPUNetIO RDMA Read implementation=manual_wqe_locked
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1, active_mtu: 5
+pairing: 18929 -- 94150
+pairing: 18930 -- 94155
+pairing: 18931 -- 94156
+pairing: 18932 -- 94157
+pairing: 18933 -- 94158
+pairing: 18934 -- 94159
+pairing: 18935 -- 94160
+pairing: 18936 -- 94161
+pairing: 18937 -- 94162
+pairing: 18938 -- 94163
+pairing: 18939 -- 94164
+pairing: 18940 -- 94165
+pairing: 18941 -- 94166
+pairing: 18942 -- 94167
+pairing: 18943 -- 94168
+pairing: 18944 -- 94169
+pairing: 18945 -- 94170
+pairing: 18946 -- 94171
+pairing: 18947 -- 94172
+pairing: 18948 -- 94173
+pairing: 18949 -- 94174
+pairing: 18950 -- 94175
+pairing: 18951 -- 94176
+pairing: 18952 -- 94177
+pairing: 18953 -- 94178
+pairing: 18954 -- 94179
+pairing: 18955 -- 94180
+pairing: 18956 -- 94181
+pairing: 18957 -- 94182
+pairing: 18958 -- 94183
+pairing: 18959 -- 94184
+pairing: 18960 -- 94185
+pairing: 18961 -- 94151
+pairing: 18962 -- 94186
+pairing: 18963 -- 94187
+pairing: 18964 -- 94188
+pairing: 18965 -- 94189
+pairing: 18966 -- 94190
+pairing: 18967 -- 94191
+pairing: 18968 -- 94192
+pairing: 18969 -- 94193
+pairing: 18970 -- 94194
+pairing: 18971 -- 94195
+pairing: 18972 -- 94196
+pairing: 18973 -- 94197
+pairing: 18974 -- 94198
+pairing: 18975 -- 94199
+pairing: 18976 -- 94200
+pairing: 18977 -- 94201
+pairing: 18978 -- 94202
+pairing: 18979 -- 94203
+pairing: 18980 -- 94204
+pairing: 18981 -- 94205
+pairing: 18982 -- 94206
+pairing: 18983 -- 94207
+pairing: 18984 -- 94208
+pairing: 18985 -- 94209
+pairing: 18986 -- 94210
+pairing: 18987 -- 94211
+pairing: 18988 -- 94212
+pairing: 18989 -- 94213
+pairing: 18990 -- 94214
+pairing: 18991 -- 94215
+pairing: 18992 -- 94216
+pairing: 18993 -- 94152
+pairing: 18994 -- 94217
+pairing: 18995 -- 94218
+pairing: 18996 -- 94219
+pairing: 18997 -- 94220
+pairing: 18998 -- 94221
+pairing: 18999 -- 94222
+pairing: 19000 -- 94223
+pairing: 19001 -- 94224
+pairing: 19002 -- 94225
+pairing: 19003 -- 94226
+pairing: 19004 -- 94227
+pairing: 19005 -- 94228
+pairing: 19006 -- 94229
+pairing: 19007 -- 94230
+pairing: 19008 -- 94231
+pairing: 19009 -- 94232
+pairing: 19010 -- 94233
+pairing: 19011 -- 94234
+pairing: 19012 -- 94235
+pairing: 19013 -- 94236
+pairing: 19014 -- 94237
+pairing: 19015 -- 94238
+pairing: 19016 -- 94239
+pairing: 19017 -- 94240
+pairing: 19018 -- 94241
+pairing: 19019 -- 94242
+pairing: 19020 -- 94243
+pairing: 19021 -- 94244
+pairing: 19022 -- 94245
+pairing: 19023 -- 94246
+pairing: 19024 -- 94247
+pairing: 19025 -- 94153
+pairing: 19026 -- 94248
+pairing: 19027 -- 94249
+pairing: 19028 -- 94250
+pairing: 19029 -- 94251
+pairing: 19030 -- 94252
+pairing: 19031 -- 94253
+pairing: 19032 -- 94254
+pairing: 19033 -- 94255
+pairing: 19034 -- 94256
+pairing: 19035 -- 94257
+pairing: 19036 -- 94258
+pairing: 19037 -- 94259
+pairing: 19038 -- 94260
+pairing: 19039 -- 94261
+pairing: 19040 -- 94262
+pairing: 19041 -- 94263
+pairing: 19042 -- 94264
+pairing: 19043 -- 94265
+pairing: 19044 -- 94266
+pairing: 19045 -- 94267
+pairing: 19046 -- 94268
+pairing: 19047 -- 94269
+pairing: 19048 -- 94270
+pairing: 19049 -- 94271
+pairing: 19050 -- 94272
+pairing: 19051 -- 94273
+pairing: 19052 -- 94274
+pairing: 19053 -- 94275
+pairing: 19054 -- 94276
+pairing: 19055 -- 94277
+pairing: 19056 -- 94278
+pairing: 19057 -- 94154
+pairing: 19058 -- 94279
+pairing: 19059 -- 94280
+pairing: 19060 -- 94281
+pairing: 19061 -- 94282
+pairing: 19062 -- 94283
+pairing: 19063 -- 94284
+pairing: 19064 -- 94285
+pairing: 19065 -- 94286
+pairing: 19066 -- 94287
+pairing: 19067 -- 94288
+pairing: 19068 -- 94289
+pairing: 19069 -- 94290
+pairing: 19070 -- 94291
+pairing: 19071 -- 94292
+pairing: 19072 -- 94293
+pairing: 19073 -- 94294
+pairing: 19074 -- 94295
+pairing: 19075 -- 94296
+pairing: 19076 -- 94297
+pairing: 19077 -- 94298
+pairing: 19078 -- 94299
+pairing: 19079 -- 94300
+pairing: 19080 -- 94301
+pairing: 19081 -- 94302
+pairing: 19082 -- 94303
+pairing: 19083 -- 94304
+pairing: 19084 -- 94305
+pairing: 19085 -- 94306
+pairing: 19086 -- 94307
+pairing: 19087 -- 94308
+pairing: 19088 -- 94309
+[gpu-search] bootstrap=CPU-posted GPUDirect RDMA; queries=strict GPU-initiated GPUNetIO
+[gpu-search] streamed 3200000000 PQ bytes directly into final GPU storage; ordinal audit passed for 15 entries
+[gpu-search] persistent occupancy candidate threads=128 hardware_blocks_per_sm=3 configured_cap=4 effective_blocks_per_sm=3 grid_capacity=324 owner_blocks=40 query_blocks=256 resident_query_warps=1024 selected=true
+[gpu-search] persistent occupancy candidate threads=256 hardware_blocks_per_sm=1 configured_cap=4 effective_blocks_per_sm=1 grid_capacity=108 owner_blocks=20 query_blocks=86 resident_query_warps=688 selected=false
+[gpu-search] persistent kernel resources registers/thread=166 static_shared_bytes=49144 local_bytes/thread=1064 max_threads/block=128
+[gpu-search] unified persistent CTAs=40-owner+256-query+1-dispatch+1-control QP-owner-warps=160 threads/CTA=128 query_slots=256 resident_capacity=324 launched=298
+[STATUS]: query engine: persistent GPU + GPUNetIO slots=256
+[STATUS]: storage-owner update cores: progress=28 response=0
+[STATUS]: storage-owner acknowledgement=query-visible stage1 graph publication; submission=bounded authority rings; batching=authority-wide; progress=single work-conserving executor
+[breakdown] mixed write-rate-limited thread split: reads=256, writes=16
+[breakdown] preparing workload: workload=mixed
+[breakdown] insert-file vectors: count=10000000 dim=128 dtype=uint8
+[breakdown] recall query data ready: count=10000 dtype=uint8 vector_bytes=128
+[breakdown] performance query data ready: count=10000000 dtype=uint8 vector_bytes=128 policy=single_pass_no_reuse
+[breakdown][recall] done 1000/1000 ops, avg_rate=43351.9 ops/s
+[breakdown][recall] before_performance recall@10=0.9401 queries=1000
+[breakdown] effective insert start id=111000000
+[breakdown] starting warmup mixed
+[storage-owner] sender batch telemetry owner=0 batches=32 items=32 avg_batch=1 full_batches=0 tail_escape_batches=32 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=0 batches=32 items=32 avg_batch=1 avg_rpc_wall_us=334.538 max_rpc_wall_us=9806.77 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=1 batches=32 items=32 avg_batch=1 full_batches=0 tail_escape_batches=32 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=1 batches=32 items=32 avg_batch=1 avg_rpc_wall_us=149.994 max_rpc_wall_us=3913.95 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=2 batches=32 items=32 avg_batch=1 full_batches=0 tail_escape_batches=32 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=2 batches=32 items=32 avg_batch=1 avg_rpc_wall_us=125.293 max_rpc_wall_us=3103.68 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=3 batches=32 items=32 avg_batch=1 full_batches=0 tail_escape_batches=32 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=3 batches=32 items=32 avg_batch=1 avg_rpc_wall_us=58.3801 max_rpc_wall_us=1012.03 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=4 batches=32 items=32 avg_batch=1 full_batches=0 tail_escape_batches=32 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=4 batches=32 items=32 avg_batch=1 avg_rpc_wall_us=29.1758 max_rpc_wall_us=62.103 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=0 batches=64 items=64 avg_batch=1 full_batches=0 tail_escape_batches=64 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=0 batches=64 items=64 avg_batch=1 avg_rpc_wall_us=180.83 max_rpc_wall_us=9806.77 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=1 batches=64 items=64 avg_batch=1 full_batches=0 tail_escape_batches=64 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=1 batches=64 items=64 avg_batch=1 avg_rpc_wall_us=89.7247 max_rpc_wall_us=3913.95 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=2 batches=64 items=64 avg_batch=1 full_batches=0 tail_escape_batches=64 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=2 batches=64 items=64 avg_batch=1 avg_rpc_wall_us=77.4557 max_rpc_wall_us=3103.68 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=3 batches=64 items=64 avg_batch=1 full_batches=0 tail_escape_batches=64 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=3 batches=64 items=64 avg_batch=1 avg_rpc_wall_us=43.9904 max_rpc_wall_us=1012.03 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=4 batches=64 items=64 avg_batch=1 full_batches=0 tail_escape_batches=64 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=4 batches=64 items=64 avg_batch=1 avg_rpc_wall_us=31.0451 max_rpc_wall_us=62.103 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=0 batches=128 items=128 avg_batch=1 full_batches=0 tail_escape_batches=128 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=0 batches=128 items=128 avg_batch=1 avg_rpc_wall_us=103.416 max_rpc_wall_us=9806.77 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=1 batches=128 items=128 avg_batch=1 full_batches=0 tail_escape_batches=128 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=1 batches=128 items=128 avg_batch=1 avg_rpc_wall_us=58.8222 max_rpc_wall_us=3913.95 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=2 batches=128 items=128 avg_batch=1 full_batches=0 tail_escape_batches=128 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=2 batches=128 items=128 avg_batch=1 avg_rpc_wall_us=52.5076 max_rpc_wall_us=3103.68 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=3 batches=128 items=128 avg_batch=1 full_batches=0 tail_escape_batches=128 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=3 batches=128 items=128 avg_batch=1 avg_rpc_wall_us=35.2317 max_rpc_wall_us=1012.03 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=4 batches=128 items=128 avg_batch=1 full_batches=0 tail_escape_batches=128 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=4 batches=128 items=128 avg_batch=1 avg_rpc_wall_us=30.2298 max_rpc_wall_us=62.103 max_active_rpcs=1 max_published=1
+[gpu-search] slow query e2e_us=10020 gpu_us=5333 prepare_us=106 graph_us=523 score_us=561 beam_us=477 exact_us=321 beam_select_us=37 rdma_issue_us=260 rdma_wait_us=2230 graph_validation_us=82 neighbor_decode_us=130 pq_score_us=313 visited_us=117 beam_merge_us=477 graph_reads=209 graph_rereads=0 graph_bytes=173888 graph_extent_reads=0 graph_full_reads=209 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=0 dynamic_graph_bytes=0 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=209 critical_graph_reads=209 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=4368384 rdma_completion_groups=36 issue_width_max=16 commit_width_max=16 critical_misses=5 certificate_rejects=0 graph_batches=28 graph_rounds=16 route_hits=0 exact_reads=128 exact_snapshot_trains=1 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=124 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=608 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=19 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10291 gpu_us=5614 prepare_us=107 graph_us=1196 score_us=560 beam_us=480 exact_us=118 beam_select_us=22 rdma_issue_us=282 rdma_wait_us=2551 graph_validation_us=76 neighbor_decode_us=127 pq_score_us=315 visited_us=117 beam_merge_us=480 graph_reads=204 graph_rereads=0 graph_bytes=169728 graph_extent_reads=0 graph_full_reads=204 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=5 dynamic_graph_bytes=4160 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=202 critical_graph_reads=202 speculative_graph_reads=2 speculative_promoted=0 speculative_stale=2 speculative_wasted_bytes=1664 rdma_completion_latency_ns=7993344 rdma_completion_groups=44 issue_width_max=17 commit_width_max=16 critical_misses=10 certificate_rejects=0 graph_batches=39 graph_rounds=14 route_hits=0 exact_reads=128 exact_snapshot_trains=0 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=128 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=0 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=20 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10196 gpu_us=5445 prepare_us=117 graph_us=336 score_us=721 beam_us=550 exact_us=264 beam_select_us=30 rdma_issue_us=226 rdma_wait_us=2238 graph_validation_us=41 neighbor_decode_us=146 pq_score_us=412 visited_us=162 beam_merge_us=550 graph_reads=205 graph_rereads=0 graph_bytes=170560 graph_extent_reads=0 graph_full_reads=205 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=2 dynamic_graph_bytes=1664 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=205 critical_graph_reads=205 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=4417536 rdma_completion_groups=34 issue_width_max=16 commit_width_max=16 critical_misses=4 certificate_rejects=0 graph_batches=30 graph_rounds=15 route_hits=0 exact_reads=128 exact_snapshot_trains=1 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=126 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=304 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=31 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10441 gpu_us=5642 prepare_us=108 graph_us=358 score_us=348 beam_us=376 exact_us=612 beam_select_us=29 rdma_issue_us=219 rdma_wait_us=2964 graph_validation_us=30 neighbor_decode_us=67 pq_score_us=200 visited_us=79 beam_merge_us=376 graph_reads=214 graph_rereads=0 graph_bytes=178048 graph_extent_reads=0 graph_full_reads=214 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=0 dynamic_graph_bytes=0 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=214 critical_graph_reads=214 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=3693568 rdma_completion_groups=19 issue_width_max=16 commit_width_max=16 critical_misses=4 certificate_rejects=0 graph_batches=15 graph_rounds=15 route_hits=0 exact_reads=128 exact_snapshot_trains=1 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=121 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=1064 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=0 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10411 gpu_us=5468 prepare_us=110 graph_us=453 score_us=530 beam_us=475 exact_us=373 beam_select_us=29 rdma_issue_us=242 rdma_wait_us=2446 graph_validation_us=70 neighbor_decode_us=120 pq_score_us=283 visited_us=126 beam_merge_us=475 graph_reads=209 graph_rereads=0 graph_bytes=173888 graph_extent_reads=0 graph_full_reads=209 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=0 dynamic_graph_bytes=0 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=209 critical_graph_reads=209 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=4258816 rdma_completion_groups=34 issue_width_max=16 commit_width_max=16 critical_misses=12 certificate_rejects=0 graph_batches=26 graph_rounds=15 route_hits=0 exact_reads=128 exact_snapshot_trains=1 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=126 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=304 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=0 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10788 gpu_us=5982 prepare_us=113 graph_us=709 score_us=469 beam_us=517 exact_us=516 beam_select_us=36 rdma_issue_us=231 rdma_wait_us=2673 graph_validation_us=116 neighbor_decode_us=101 pq_score_us=259 visited_us=108 beam_merge_us=517 graph_reads=196 graph_rereads=0 graph_bytes=163072 graph_extent_reads=0 graph_full_reads=196 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=0 dynamic_graph_bytes=0 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=196 critical_graph_reads=196 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=6602752 rdma_completion_groups=48 issue_width_max=16 commit_width_max=16 critical_misses=36 certificate_rejects=0 graph_batches=38 graph_rounds=15 route_hits=0 exact_reads=128 exact_snapshot_trains=3 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=120 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=1216 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=0 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10957 gpu_us=6305 prepare_us=110 graph_us=294 score_us=495 beam_us=489 exact_us=257 beam_select_us=30 rdma_issue_us=214 rdma_wait_us=3620 graph_validation_us=32 neighbor_decode_us=109 pq_score_us=268 visited_us=118 beam_merge_us=489 graph_reads=203 graph_rereads=0 graph_bytes=168896 graph_extent_reads=0 graph_full_reads=203 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=0 dynamic_graph_bytes=0 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=203 critical_graph_reads=203 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=4180992 rdma_completion_groups=19 issue_width_max=16 commit_width_max=16 critical_misses=4 certificate_rejects=0 graph_batches=15 graph_rounds=15 route_hits=0 exact_reads=128 exact_snapshot_trains=1 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=127 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=152 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=0 dynamic_pq_batch_deduplicated=0
+[storage-owner] sender batch telemetry owner=0 batches=256 items=256 avg_batch=1 full_batches=0 tail_escape_batches=256 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=0 batches=256 items=256 avg_batch=1 avg_rpc_wall_us=86.8414 max_rpc_wall_us=9806.77 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=1 batches=256 items=256 avg_batch=1 full_batches=0 tail_escape_batches=256 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=1 batches=256 items=256 avg_batch=1 avg_rpc_wall_us=43.8217 max_rpc_wall_us=3913.95 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=2 batches=256 items=256 avg_batch=1 full_batches=0 tail_escape_batches=256 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=2 batches=256 items=256 avg_batch=1 avg_rpc_wall_us=40.8365 max_rpc_wall_us=3103.68 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=3 batches=256 items=256 avg_batch=1 full_batches=0 tail_escape_batches=256 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=3 batches=256 items=256 avg_batch=1 avg_rpc_wall_us=31.7664 max_rpc_wall_us=1012.03 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=4 batches=256 items=256 avg_batch=1 full_batches=0 tail_escape_batches=256 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=4 batches=256 items=256 avg_batch=1 avg_rpc_wall_us=46.2861 max_rpc_wall_us=3336.48 max_active_rpcs=1 max_published=1
+[gpu-search] slow query e2e_us=10387 gpu_us=5938 prepare_us=101 graph_us=545 score_us=699 beam_us=496 exact_us=283 beam_select_us=30 rdma_issue_us=199 rdma_wait_us=2778 graph_validation_us=54 neighbor_decode_us=136 pq_score_us=400 visited_us=163 beam_merge_us=496 graph_reads=196 graph_rereads=0 graph_bytes=163072 graph_extent_reads=0 graph_full_reads=196 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=1 dynamic_graph_bytes=832 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=196 critical_graph_reads=196 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=6394880 rdma_completion_groups=45 issue_width_max=16 commit_width_max=16 critical_misses=5 certificate_rejects=0 graph_batches=37 graph_rounds=14 route_hits=0 exact_reads=128 exact_snapshot_trains=3 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=122 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=912 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=11 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10570 gpu_us=5974 prepare_us=119 graph_us=336 score_us=583 beam_us=534 exact_us=328 beam_select_us=37 rdma_issue_us=230 rdma_wait_us=2747 graph_validation_us=45 neighbor_decode_us=118 pq_score_us=326 visited_us=138 beam_merge_us=534 graph_reads=195 graph_rereads=0 graph_bytes=162240 graph_extent_reads=0 graph_full_reads=195 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=2 dynamic_graph_bytes=1664 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=195 critical_graph_reads=195 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=5383168 rdma_completion_groups=38 issue_width_max=16 commit_width_max=16 critical_misses=4 certificate_rejects=0 graph_batches=34 graph_rounds=15 route_hits=0 exact_reads=128 exact_snapshot_trains=3 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=121 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=1064 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=47 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10611 gpu_us=5880 prepare_us=104 graph_us=445 score_us=483 beam_us=482 exact_us=316 beam_select_us=45 rdma_issue_us=251 rdma_wait_us=2774 graph_validation_us=23 neighbor_decode_us=112 pq_score_us=263 visited_us=107 beam_merge_us=482 graph_reads=230 graph_rereads=0 graph_bytes=191360 graph_extent_reads=0 graph_full_reads=230 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=4 dynamic_graph_bytes=3328 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=230 critical_graph_reads=230 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=5427200 rdma_completion_groups=37 issue_width_max=16 commit_width_max=16 critical_misses=4 certificate_rejects=0 graph_batches=33 graph_rounds=18 route_hits=0 exact_reads=128 exact_snapshot_trains=2 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=123 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=760 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=26 dynamic_pq_batch_deduplicated=0
+[breakdown][warmup-mixed] progress elapsed=5s/5s, completed=297321 ops, rate=59464.2 ops/s, interval_rate=59464.2 ops/s, interval_read_qps=58964.4, interval_write_qps=499.8
+[breakdown][warmup-mixed] done measurement_elapsed=5s/5s, measurement_completed=297321 ops, measurement_avg_rate=59464.2 ops/s, drain_elapsed=0.00688209s, drain_completed=255 ops
+[breakdown][warmup] maintenance drain elapsed=0.031674s complete=yes
+[breakdown] starting measure phase
+[storage-owner] sender batch telemetry owner=4 batches=512 items=512 avg_batch=1 full_batches=0 tail_escape_batches=512 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=4 batches=512 items=512 avg_batch=1 avg_rpc_wall_us=37.8128 max_rpc_wall_us=3336.48 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=0 batches=512 items=512 avg_batch=1 full_batches=0 tail_escape_batches=512 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=0 batches=512 items=512 avg_batch=1 avg_rpc_wall_us=93.1035 max_rpc_wall_us=11179.5 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=1 batches=512 items=512 avg_batch=1 full_batches=0 tail_escape_batches=512 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=1 batches=512 items=512 avg_batch=1 avg_rpc_wall_us=45.2144 max_rpc_wall_us=4549.26 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=2 batches=512 items=512 avg_batch=1 full_batches=0 tail_escape_batches=512 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=2 batches=512 items=512 avg_batch=1 avg_rpc_wall_us=42.8308 max_rpc_wall_us=4005.43 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=3 batches=512 items=512 avg_batch=1 full_batches=0 tail_escape_batches=512 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=3 batches=512 items=512 avg_batch=1 avg_rpc_wall_us=38.2077 max_rpc_wall_us=4075.25 max_active_rpcs=1 max_published=1
+[breakdown][measure-mixed] progress elapsed=5s/20s, completed=301680 ops, rate=60336 ops/s, interval_rate=60336 ops/s, interval_read_qps=59836.6, interval_write_qps=499.4
+[storage-owner] sender batch telemetry owner=4 batches=1024 items=1024 avg_batch=1 full_batches=0 tail_escape_batches=1024 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=4 batches=1024 items=1024 avg_batch=1 avg_rpc_wall_us=36.6618 max_rpc_wall_us=3336.48 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=0 batches=1024 items=1024 avg_batch=1 full_batches=0 tail_escape_batches=1024 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=0 batches=1024 items=1024 avg_batch=1 avg_rpc_wall_us=75.0281 max_rpc_wall_us=11179.5 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=1 batches=1024 items=1024 avg_batch=1 full_batches=0 tail_escape_batches=1024 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=1 batches=1024 items=1024 avg_batch=1 avg_rpc_wall_us=40.4325 max_rpc_wall_us=4549.26 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=2 batches=1024 items=1024 avg_batch=1 full_batches=0 tail_escape_batches=1024 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=2 batches=1024 items=1024 avg_batch=1 avg_rpc_wall_us=61.5894 max_rpc_wall_us=4805.78 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=3 batches=1024 items=1024 avg_batch=1 full_batches=0 tail_escape_batches=1024 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=3 batches=1024 items=1024 avg_batch=1 avg_rpc_wall_us=55.7429 max_rpc_wall_us=11802.4 max_active_rpcs=1 max_published=1
+[breakdown][measure-mixed] progress elapsed=10s/20s, completed=603915 ops, rate=60391.5 ops/s, interval_rate=60447 ops/s, interval_read_qps=59946.6, interval_write_qps=500.4
+[breakdown][measure-mixed] progress elapsed=15s/20s, completed=906394 ops, rate=60426.3 ops/s, interval_rate=60495.8 ops/s, interval_read_qps=59995.8, interval_write_qps=500
+[gpu-search] slow query e2e_us=10153 gpu_us=5496 prepare_us=104 graph_us=482 score_us=757 beam_us=597 exact_us=274 beam_select_us=51 rdma_issue_us=255 rdma_wait_us=2228 graph_validation_us=74 neighbor_decode_us=120 pq_score_us=462 visited_us=174 beam_merge_us=597 graph_reads=195 graph_rereads=0 graph_bytes=162240 graph_extent_reads=0 graph_full_reads=195 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=0 dynamic_graph_bytes=0 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=195 critical_graph_reads=195 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=4960256 rdma_completion_groups=39 issue_width_max=16 commit_width_max=16 critical_misses=19 certificate_rejects=0 graph_batches=32 graph_rounds=17 route_hits=0 exact_reads=128 exact_snapshot_trains=2 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=121 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=1064 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=63 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10455 gpu_us=5742 prepare_us=133 graph_us=382 score_us=772 beam_us=711 exact_us=306 beam_select_us=69 rdma_issue_us=273 rdma_wait_us=2186 graph_validation_us=36 neighbor_decode_us=140 pq_score_us=433 visited_us=198 beam_merge_us=711 graph_reads=194 graph_rereads=0 graph_bytes=161408 graph_extent_reads=0 graph_full_reads=194 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=0 dynamic_graph_bytes=0 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=194 critical_graph_reads=194 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=3441664 rdma_completion_groups=29 issue_width_max=16 commit_width_max=16 critical_misses=4 certificate_rejects=0 graph_batches=25 graph_rounds=18 route_hits=0 exact_reads=128 exact_snapshot_trains=1 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=114 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=2128 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=65 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10057 gpu_us=4994 prepare_us=107 graph_us=362 score_us=650 beam_us=505 exact_us=233 beam_select_us=30 rdma_issue_us=221 rdma_wait_us=2086 graph_validation_us=25 neighbor_decode_us=136 pq_score_us=360 visited_us=153 beam_merge_us=505 graph_reads=195 graph_rereads=0 graph_bytes=162240 graph_extent_reads=0 graph_full_reads=195 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=6 dynamic_graph_bytes=4992 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=195 critical_graph_reads=195 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=4004864 rdma_completion_groups=25 issue_width_max=16 commit_width_max=16 critical_misses=4 certificate_rejects=0 graph_batches=21 graph_rounds=14 route_hits=0 exact_reads=128 exact_snapshot_trains=1 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=127 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=152 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=93 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10249 gpu_us=5138 prepare_us=99 graph_us=604 score_us=596 beam_us=518 exact_us=308 beam_select_us=35 rdma_issue_us=242 rdma_wait_us=2060 graph_validation_us=134 neighbor_decode_us=128 pq_score_us=325 visited_us=143 beam_merge_us=518 graph_reads=187 graph_rereads=0 graph_bytes=155584 graph_extent_reads=0 graph_full_reads=187 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=2 dynamic_graph_bytes=1664 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=187 critical_graph_reads=187 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=4092928 rdma_completion_groups=37 issue_width_max=16 commit_width_max=16 critical_misses=33 certificate_rejects=0 graph_batches=25 graph_rounds=15 route_hits=0 exact_reads=128 exact_snapshot_trains=1 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=126 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=304 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=63 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10098 gpu_us=4769 prepare_us=109 graph_us=670 score_us=559 beam_us=490 exact_us=257 beam_select_us=37 rdma_issue_us=211 rdma_wait_us=2077 graph_validation_us=30 neighbor_decode_us=111 pq_score_us=310 visited_us=137 beam_merge_us=490 graph_reads=192 graph_rereads=0 graph_bytes=159744 graph_extent_reads=0 graph_full_reads=192 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=0 dynamic_graph_bytes=0 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=192 critical_graph_reads=192 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=4260864 rdma_completion_groups=20 issue_width_max=16 commit_width_max=16 critical_misses=4 certificate_rejects=0 graph_batches=16 graph_rounds=15 route_hits=0 exact_reads=128 exact_snapshot_trains=1 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=125 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=456 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=64 dynamic_pq_batch_deduplicated=0
+[gpu-search] slow query e2e_us=10250 gpu_us=4885 prepare_us=101 graph_us=366 score_us=692 beam_us=591 exact_us=446 beam_select_us=77 rdma_issue_us=293 rdma_wait_us=1487 graph_validation_us=25 neighbor_decode_us=137 pq_score_us=388 visited_us=166 beam_merge_us=591 graph_reads=195 graph_rereads=0 graph_bytes=162240 graph_extent_reads=0 graph_full_reads=195 graph_extent_fallbacks=0 graph_extent_underhints=0 graph_extent_promotions=0 dynamic_graph_short_reads=0 dynamic_graph_full_reads=1 dynamic_graph_bytes=832 dynamic_graph_fallbacks=0 dynamic_graph_promotions=0 dynamic_graph_demotions=0 logical_expansions=195 critical_graph_reads=195 speculative_graph_reads=0 speculative_promoted=0 speculative_stale=0 speculative_wasted_bytes=0 rdma_completion_latency_ns=2308096 rdma_completion_groups=24 issue_width_max=16 commit_width_max=16 critical_misses=4 certificate_rejects=0 graph_batches=20 graph_rounds=19 route_hits=0 exact_reads=128 exact_snapshot_trains=1 exact_snapshot_fallbacks=0 terminal_exact_cache_attempted=1 terminal_exact_cache_issued=128 terminal_exact_cache_promoted=113 terminal_exact_cache_misses=0 terminal_exact_cache_wasted_bytes=2280 terminal_exact_cache_queue_rejects=0 dynamic_pq_reads=0 dynamic_pq_us=0 dynamic_pq_incarnation_rejects=0 dynamic_pq_arena_hits=64 dynamic_pq_batch_deduplicated=0
+[storage-owner] sender batch telemetry owner=4 batches=2048 items=2048 avg_batch=1 full_batches=0 tail_escape_batches=2048 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=4 batches=2048 items=2048 avg_batch=1 avg_rpc_wall_us=36.6608 max_rpc_wall_us=5417.92 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=0 batches=2048 items=2048 avg_batch=1 full_batches=0 tail_escape_batches=2048 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=0 batches=2048 items=2048 avg_batch=1 avg_rpc_wall_us=81.4928 max_rpc_wall_us=11897.6 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=1 batches=2048 items=2048 avg_batch=1 full_batches=0 tail_escape_batches=2048 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=1 batches=2048 items=2048 avg_batch=1 avg_rpc_wall_us=44.1222 max_rpc_wall_us=19623.1 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=2 batches=2048 items=2048 avg_batch=1 full_batches=0 tail_escape_batches=2048 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=2 batches=2048 items=2048 avg_batch=1 avg_rpc_wall_us=52.3111 max_rpc_wall_us=15250.9 max_active_rpcs=1 max_published=1
+[storage-owner] sender batch telemetry owner=3 batches=2048 items=2048 avg_batch=1 full_batches=0 tail_escape_batches=2048 max_wait_flush_batches=0 queue_visibility_stalls=0 partial_visible_batches=0 published=0
+[storage-owner] sender completion telemetry owner=3 batches=2048 items=2048 avg_batch=1 avg_rpc_wall_us=57.9646 max_rpc_wall_us=13336.3 max_active_rpcs=1 max_published=1
+[breakdown][measure-mixed] progress elapsed=20s/20s, completed=1209089 ops, rate=60454.4 ops/s, interval_rate=60539 ops/s, interval_read_qps=60039, interval_write_qps=500
+[breakdown][measure-mixed] done measurement_elapsed=20s/20s, measurement_completed=1209089 ops, measurement_avg_rate=60454.4 ops/s, drain_elapsed=0.00657774s, drain_completed=256 ops
+[breakdown][measure] maintenance drain elapsed=0.0479525s complete=yes
+[breakdown] Stage2 telemetry publication observed=11512 expected=10000
+[breakdown][measure-mixed] reads issued/completed=1199345/1199345, writes issued/completed=10000/10000 (insert=10000, upsert=0, delete=0)
+[breakdown][static_gt_post_recall] done 1000/1000 ops, avg_rate=42939 ops/s
+[breakdown][recall] after_performance recall@10=0.9388 queries=1000
+system_variant
+  profile_name: 04_gpu_persistent_gpunetio
+  label: full
+  update_mutation_api: insert_upsert_erase
+  storage_owner_update_completion_mode: decoupled
+  gpu_dynamic_graph_access_mode: manual
+  gpu_rdma_search_progression_mode: decoupled
+  index_prefix: /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16
+  index_schema_version: 16
+  index_build_fingerprint: 68737734120060254
+query_inputs
+  recall_source: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  recall_rows: 10000
+  performance_source: /data/xjs/datasets/sift1b/sift100m_to_110m_query.u8bin
+  performance_rows: 10000000
+  performance_row_reuse_policy: single_pass_no_reuse
+  performance_warmup/measure/total_rows_consumed: 295076/1199345/1494421
+throughput
+  duration_seconds: 20.0065
+  total_ops_per_sec: 60447.6 (ops=1209345)
+  query_ops_per_sec: 59967.2 (ops=1199345)
+  effective_query_ops_per_sec: 59947.7
+  write_ops_per_sec: 500 (ops=10000)
+  effective_write_ops_per_sec: 499.837
+  insert_ops_per_sec: 500 (ops=10000)
+  client_drain_seconds: 0.00651561
+  scheduled_query/write_ops: 0/10000
+  query/write_rate_attainment_ratio: 1/1
+  nominal/effective_rate_basis: configured_schedule_window/wall_clock_including_client_drain
+  write_mix_completed: insert=10000 upsert=0 delete=0
+  query_head/tail_qps: 59926.3/59993.8
+  query_tail_to_head_ratio: 1.00113
+  query_min_5s_qps: 59836.6
+  write_head/tail_qps: 499.933/500.133
+  write_tail_to_head_ratio: 1.0004
+  write_min_5s_qps: 499.4
+  zero_completion_windows: 0
+  zero_query/write_windows: 0/0
+stage2
+  source: in_band_control_page
+  shards observed/requested: 5/5
+  p99_stage2_delay_upper_ms: 256 (samples=11512)
+  remaining/max_backlog: 0/11
+  completion_outstanding/admission_window: 0/327680 (max_per_shard=0)
+  completion_incomplete/admission_window: 0/327680 (max_per_shard=0, completed_behind_hole=0)
+  completion admission stalls logical/physical: 0/0
+  backlog_slope_per_sec: -1.43972
+  failures (hard): 0
+  peer_reverse_retry_attempts: 1
+  locality telemetry: home_match_rate=0.890028 cross_edge_reduction=0.242495 avg_frontier/expansions/scored=599.558/21.2694/1135.43
+  search budget exhausted (stage1/stage2): 0/0
+  execution batching: contexts=3117 avg_items=3.68495 graph_reads/wave=5.75227 vector_reads/wave=67.9459 pressure_yields=1
+  ordered graph issue: issued/hit/wasted=197418/192921/4497 promotion_ratio=0.977221
+  graph home RPC: batches/items/avg_items=46933/248797/5.30111
+  executor service demand: stage1_total/search/prune_us=4187.44/3797.69/265.368 stage1_candidates/frontier/neighbors=127.994/599.499/42.3673 stage2_search/freeze/reverse_us=1961.38/291.918/1070.83
+recall
+  recall@10: 0.9401
+  queries: 1000
+  mode/base_id_limit/search_width/insufficient_queries: all/0/10/0
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+static_gt_post_recall
+  recall@10: 0.9388
+  queries: 1000
+  mode/base_id_limit/search_width/insufficient_queries: all/0/10/0
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+gpu_persistent
+  GPU memory explicit/base_pq/route GiB: 4.21617/2.98023/2.87592e-06
+  average_batch_size: 1.29975
+  average_submission_wait_us: 5.6814
+  rdma_read_bytes: 214509026096
+  owner WQE submitted/capacity/utilization: 567129319/21879161856/0.025921
+  owner critical/speculative batches: 28556078/139765
+  graph_route_hit_ratio/refreshes: 0/0
+  graph snapshot reread records total/per_query: 0/0
+  graph RDMA bytes total/per_query/per_parent: 191174046336/159399/832
+  graph live/full/fallback/underhint/promotions reads: 0/229776498/0/0/0
+  expanded parents/neighbor sum/average degree: 229636744/10806658350/47.0598
+  expanded degree histogram (ceil(degree/8), overflow=13): [0,176771,5725775,23127257,36791044,38517494,33790365,26175064,19199819,13578419,9668432,7281843,15604459,2]
+  dynamic expanded parents/neighbor sum/average degree/share: 3511038/146072211/41.6037/0.0152895
+  dynamic expanded degree histogram (ceil(degree/8), overflow=13): [0,17729,237488,500387,704964,427828,516408,360447,178101,202681,152950,119375,92680,0]
+  DynaExtent short/full/bytes/fallback/promotions/demotions: 0/3519094/2927886208/0/0/0
+  DynaExtent snapshot-attempts/nonfallback-full-attempts/short-physical-ratio/fallback-ratio/bytes-per-physical-read: 3519094/3519094/0/0/832
+  ASFE logical expansions total/per_query: 229636744/191.468
+  ASFE critical/speculative graph reads: 229636733/139765
+  ASFE critical/speculative graph bytes: 191057761856/116284480
+  ASFE core reads/bytes/arrived/promoted/stale: 222265612/184924989184/222265612/222265612/2573741
+  ASFE core waves/ready waves/ready ratio: 15920547/1000335/0.062833
+  terminal exact cache attempts/rate: 1199345/1
+  terminal exact cache issued/promoted/misses/rejects (total/per_query): 153516160/128, 149114177/124.33, 0/0, 0/0
+  terminal exact cache promotion/waste ratio: 0.971326/0.0286744
+  terminal exact cache wasted bytes total/per_query: 669101416/557.889
+  ASFE completion scoring batches/candidates (total/per_query/candidates_per_batch): 17246959/14.3803, 10806658350/9010.47/626.583
+  ASFE reusable exact certificates total/per_query: 17246959/14.3803
+  ASFE streamed runs/ordered scoring batches/candidates (total/per_query/candidates_per_batch): 33920180/28.2823, 0/0, 0/0/0
+  OOO ROB parents retired beyond an unresolved rank hole (total/per_query): 29355015/24.4759
+  ASFE reusable prefix ranks/full/issued certificates (total/per_query): 224989655/187.594, 0/0, 15920547/13.2744
+  ASFE certificate rejects total/per_query: 0/0
+  ASFE speculative wasted bytes/ratio: 116275328/0.999921
+  ASFE speculative arrived/promoted/stale/queue_rejects: 139765/11/139754/10129
+  ASFE promotion/waste ratio: 7.87035e-05/0.999921
+  ASFE issue/commit epochs: 16047614/17246959
+  ASFE average issue/commit width: 14.0201/13.3146
+  ASFE issue capacity/utilization: 16.0094/0.875744
+  ASFE max issue/commit width: 17/16
+  ASFE critical ROB hits/speculative wait ns/us_per_query: 222265623/1507425527906/1256.87
+  ASFE critical misses/ROB hit ratio: 7371121/0.967901
+  ASFE RDMA completion groups/avg us (critical/speculative): 30642301/113.474 (139765/115.98)
+  GPU occupancy threads/registers/static_shared: 128/166/49144
+  GPU occupancy active/effective blocks per SM: 3/3
+  GPU persistent query/owner/total blocks: 256/40/298
+  centroid route publications/shard_updates/live/snapshot_skips: 1646/3265/20/8
+  centroid route probe_reads/body_reads/unchanged_polls/poll_us: 14440/3288/1234/63817
+  centroid route query snapshot retries/timeouts: 9875/0
+  GPU query/prepare/graph/score/beam/exact us: 4180.27/115.433/397.905/551.565/474.509/307.083
+  exact snapshot train batches/fallbacks/success ratio: 1261963/0/1
+  GPU graph commit/issue width: 16/32
+  GPU graph read/dynamic extent: fixed/0
+  GPU Beam merge policy: stable-run
+  Stage2 score-many/graph-issue/home-combining: 1/16/1
+  GPU Beam merge total/prepare/sort/materialize us: 474.509/15.7985/228.742/229.968
+  dynamic PQ candidates/reads/bytes/incarnation_rejects: 79790565/13086/523440/0
+  dynamic PQ reads/query and wait_us/query: 0.010911/2.04859
+  dynamic PQ arena hits/batch_dedup/authoritative_avoidance: 79777479/0/0.999836
+  dynamic PQ arena publish success/race/capacity: 9993/3093/25431721
+storage_owner_runtime
+  submitted/completed batches: 10000/10000
+  submitted/completed items: 10000/10000
+  average batch / average RPC wall us / max RPC wall us: 1/56.3678/19623.1
+insert breakdown
+  count: 10000
+  latency_ms: mean=4.36115 p50=4.06121 p95=7.52062 p99=9.99837 p999=16.4395
+  fine_grained_breakdown: disabled
+query breakdown
+  count: 1199345
+  latency_ms: mean=4.26773 p50=4.19536 p95=5.43021 p99=6.04788 p999=6.86879
+  fine_grained_breakdown: disabled
+json: /home/xjs/experiment/dvstor/experiment/sift100m/program2/results/program2_20260831_190527/fixed/04_gpu_persistent_gpunetio/sift100m_04_gpu_persistent_gpunetio_20260831_190534.json
+text: /home/xjs/experiment/dvstor/experiment/sift100m/program2/results/program2_20260831_190527/fixed/04_gpu_persistent_gpunetio/sift100m_04_gpu_persistent_gpunetio_20260831_190534.txt

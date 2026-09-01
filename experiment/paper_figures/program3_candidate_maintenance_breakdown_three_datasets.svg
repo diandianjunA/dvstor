@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="650" height="390" viewBox="0 0 650 390">
+<style>
+  text { font-family: Arial, sans-serif; fill: #25313b; }
+  .title { font-size: 15px; font-weight: 700; }
+  .tick { font-size: 10px; fill: #4b5563; }
+  .axis-title { font-size: 12px; fill: #374151; }
+  .dataset { font-size: 12px; font-weight: 700; }
+  .inside { font-size: 10px; font-weight: 700; text-anchor: middle; }
+  .total { font-size: 10px; fill: #4b5563; text-anchor: middle; }
+  .legend { font-size: 10px; fill: #30343b; }
+  .axis { stroke: #555; stroke-width: 1.15; }
+  .grid { stroke: #e1e5ea; stroke-width: 1; }
+</style>
+<rect width="100%" height="100%" fill="white"/>
+<text class="title" x="325.0" y="24" text-anchor="middle">Candidate-maintenance breakdown</text>
+<rect x="55.0" y="41" width="12" height="12" fill="#b8c4d8"/>
+<text class="legend" x="73.0" y="51">Candidate validation</text>
+<rect x="235.0" y="41" width="12" height="12" fill="#f5d8b5"/>
+<text class="legend" x="253.0" y="51">Candidate select</text>
+<rect x="415.0" y="41" width="12" height="12" fill="#efb77e"/>
+<text class="legend" x="433.0" y="51">Merge</text>
+<line class="grid" x1="76" y1="323.00" x2="625" y2="323.00"/>
+<text class="tick" x="68" y="327.00" text-anchor="end">0</text>
+<line class="grid" x1="76" y1="276.60" x2="625" y2="276.60"/>
+<text class="tick" x="68" y="280.60" text-anchor="end">20</text>
+<line class="grid" x1="76" y1="230.20" x2="625" y2="230.20"/>
+<text class="tick" x="68" y="234.20" text-anchor="end">40</text>
+<line class="grid" x1="76" y1="183.80" x2="625" y2="183.80"/>
+<text class="tick" x="68" y="187.80" text-anchor="end">60</text>
+<line class="grid" x1="76" y1="137.40" x2="625" y2="137.40"/>
+<text class="tick" x="68" y="141.40" text-anchor="end">80</text>
+<line class="grid" x1="76" y1="91.00" x2="625" y2="91.00"/>
+<text class="tick" x="68" y="95.00" text-anchor="end">100</text>
+<line class="axis" x1="76" y1="91" x2="76" y2="323"/>
+<line class="axis" x1="76" y1="323" x2="625" y2="323"/>
+<text class="axis-title" x="0" y="0" text-anchor="middle" transform="translate(22 207.0) rotate(-90)">Candidate maintenance time (%)</text>
+<rect x="154.0" y="261.99" width="72" height="61.01" fill="#b8c4d8" stroke="white" stroke-width="1"/>
+<text class="inside" x="190" y="295.99">26.3%</text>
+<rect x="154.0" y="228.87" width="72" height="33.12" fill="#f5d8b5" stroke="white" stroke-width="1"/>
+<text class="inside" x="190" y="248.93">14.3%</text>
+<rect x="154.0" y="91.00" width="72" height="137.87" fill="#efb77e" stroke="white" stroke-width="1"/>
+<text class="inside" x="190" y="163.43">59.4%</text>
+<text class="total" x="190" y="83">1.68 ms</text>
+<text class="dataset" x="190" y="345" text-anchor="middle">SIFT100M</text>
+<rect x="314.0" y="263.81" width="72" height="59.19" fill="#b8c4d8" stroke="white" stroke-width="1"/>
+<text class="inside" x="350" y="296.91">25.5%</text>
+<rect x="314.0" y="223.80" width="72" height="40.01" fill="#f5d8b5" stroke="white" stroke-width="1"/>
+<text class="inside" x="350" y="247.31">17.2%</text>
+<rect x="314.0" y="91.00" width="72" height="132.80" fill="#efb77e" stroke="white" stroke-width="1"/>
+<text class="inside" x="350" y="160.90">57.2%</text>
+<text class="total" x="350" y="83">1.81 ms</text>
+<text class="dataset" x="350" y="345" text-anchor="middle">DEEP100M</text>
+<rect x="474.0" y="259.42" width="72" height="63.58" fill="#b8c4d8" stroke="white" stroke-width="1"/>
+<text class="inside" x="510" y="294.71">27.4%</text>
+<rect x="474.0" y="224.29" width="72" height="35.13" fill="#f5d8b5" stroke="white" stroke-width="1"/>
+<text class="inside" x="510" y="245.36">15.1%</text>
+<rect x="474.0" y="91.00" width="72" height="133.29" fill="#efb77e" stroke="white" stroke-width="1"/>
+<text class="inside" x="510" y="161.14">57.5%</text>
+<text class="total" x="510" y="83">1.92 ms</text>
+<text class="dataset" x="510" y="345" text-anchor="middle">SPACEV100M</text>
+</svg>

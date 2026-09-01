@@ -1,0 +1,5 @@
+sift101m long insert recall
+  inserted: 1000/1000 in 0.360436s (2774.421344 inserts/s)
+  stage1-only self-hit@10: 0.770000
+  finalized self-hit@10: 1.000000
+  Stage1/final result overlap@10: 0.967800

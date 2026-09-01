@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="650" height="390" viewBox="0 0 650 390">
+<style>
+  text { font-family: Arial, sans-serif; fill: #25313b; }
+  .title { font-size: 15px; font-weight: 700; }
+  .tick { font-size: 10px; fill: #4b5563; }
+  .axis-title { font-size: 12px; fill: #374151; }
+  .dataset { font-size: 12px; font-weight: 700; }
+  .inside { font-size: 10px; font-weight: 700; text-anchor: middle; }
+  .total { font-size: 10px; fill: #4b5563; text-anchor: middle; }
+  .legend { font-size: 10px; fill: #30343b; }
+  .axis { stroke: #555; stroke-width: 1.15; }
+  .grid { stroke: #e1e5ea; stroke-width: 1; }
+</style>
+<rect width="100%" height="100%" fill="white"/>
+<text class="title" x="325.0" y="24" text-anchor="middle">GPU query-time breakdown before decoupling</text>
+<rect x="95.0" y="41" width="12" height="12" fill="#efc08d"/>
+<text class="legend" x="113.0" y="51">Candidate maintenance</text>
+<rect x="325.0" y="41" width="12" height="12" fill="#9ecae1"/>
+<text class="legend" x="343.0" y="51">RDMA</text>
+<rect x="95.0" y="61" width="12" height="12" fill="#c9b8d8"/>
+<text class="legend" x="113.0" y="71">Distance computation</text>
+<rect x="325.0" y="61" width="12" height="12" fill="#d9dde3"/>
+<text class="legend" x="343.0" y="71">Others</text>
+<line class="grid" x1="76" y1="323.00" x2="625" y2="323.00"/>
+<text class="tick" x="68" y="327.00" text-anchor="end">0</text>
+<line class="grid" x1="76" y1="276.60" x2="625" y2="276.60"/>
+<text class="tick" x="68" y="280.60" text-anchor="end">20</text>
+<line class="grid" x1="76" y1="230.20" x2="625" y2="230.20"/>
+<text class="tick" x="68" y="234.20" text-anchor="end">40</text>
+<line class="grid" x1="76" y1="183.80" x2="625" y2="183.80"/>
+<text class="tick" x="68" y="187.80" text-anchor="end">60</text>
+<line class="grid" x1="76" y1="137.40" x2="625" y2="137.40"/>
+<text class="tick" x="68" y="141.40" text-anchor="end">80</text>
+<line class="grid" x1="76" y1="91.00" x2="625" y2="91.00"/>
+<text class="tick" x="68" y="95.00" text-anchor="end">100</text>
+<line class="axis" x1="76" y1="91" x2="76" y2="323"/>
+<line class="axis" x1="76" y1="323" x2="625" y2="323"/>
+<text class="axis-title" x="0" y="0" text-anchor="middle" transform="translate(22 207.0) rotate(-90)">GPU query time (%)</text>
+<rect x="154.0" y="227.16" width="72" height="95.84" fill="#efc08d" stroke="white" stroke-width="1"/>
+<text class="inside" x="190" y="278.58">41.3%</text>
+<rect x="154.0" y="165.00" width="72" height="62.16" fill="#9ecae1" stroke="white" stroke-width="1"/>
+<text class="inside" x="190" y="199.58">26.8%</text>
+<rect x="154.0" y="127.27" width="72" height="37.74" fill="#c9b8d8" stroke="white" stroke-width="1"/>
+<text class="inside" x="190" y="149.63">16.3%</text>
+<rect x="154.0" y="91.00" width="72" height="36.27" fill="#d9dde3" stroke="white" stroke-width="1"/>
+<text class="inside" x="190" y="112.63">15.6%</text>
+<text class="total" x="190" y="83">4.07 ms</text>
+<text class="dataset" x="190" y="345" text-anchor="middle">SIFT100M</text>
+<rect x="314.0" y="225.23" width="72" height="97.77" fill="#efc08d" stroke="white" stroke-width="1"/>
+<text class="inside" x="350" y="277.61">42.1%</text>
+<rect x="314.0" y="166.24" width="72" height="58.99" fill="#9ecae1" stroke="white" stroke-width="1"/>
+<text class="inside" x="350" y="199.24">25.4%</text>
+<rect x="314.0" y="126.50" width="72" height="39.74" fill="#c9b8d8" stroke="white" stroke-width="1"/>
+<text class="inside" x="350" y="149.87">17.1%</text>
+<rect x="314.0" y="91.00" width="72" height="35.50" fill="#d9dde3" stroke="white" stroke-width="1"/>
+<text class="inside" x="350" y="112.25">15.3%</text>
+<text class="total" x="350" y="83">4.29 ms</text>
+<text class="dataset" x="350" y="345" text-anchor="middle">DEEP100M</text>
+<rect x="474.0" y="226.62" width="72" height="96.38" fill="#efc08d" stroke="white" stroke-width="1"/>
+<text class="inside" x="510" y="278.31">41.5%</text>
+<rect x="474.0" y="159.08" width="72" height="67.55" fill="#9ecae1" stroke="white" stroke-width="1"/>
+<text class="inside" x="510" y="196.35">29.1%</text>
+<rect x="474.0" y="123.32" width="72" height="35.75" fill="#c9b8d8" stroke="white" stroke-width="1"/>
+<text class="inside" x="510" y="144.70">15.4%</text>
+<rect x="474.0" y="91.00" width="72" height="32.32" fill="#d9dde3" stroke="white" stroke-width="1"/>
+<text class="inside" x="510" y="110.66">13.9%</text>
+<text class="total" x="510" y="83">4.61 ms</text>
+<text class="dataset" x="510" y="345" text-anchor="middle">SPACEV100M</text>
+</svg>
