@@ -165,4 +165,16 @@ inline constexpr bool graph_snapshot_decodable(bool validation_succeeded,
   return validation_succeeded && !stale;
 }
 
+// Back-to-back one-sided rereads can repeatedly overlap the same hot graph
+// publication. Space the exceptional retry path without adding any delay to
+// checksum-valid reads. The capped exponential schedule keeps all seven
+// retries below 200 us in total while giving the remote writer a real
+// quiescent opportunity between observations.
+inline constexpr u32 graph_snapshot_retry_backoff_us(u32 retry_index) {
+  constexpr u32 kInitialBackoffUs = 2;
+  constexpr u32 kMaximumBackoffUs = 64;
+  if (retry_index >= 5) return kMaximumBackoffUs;
+  return kInitialBackoffUs << retry_index;
+}
+
 }  // namespace gpu_search::host_orchestrated_policy

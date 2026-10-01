@@ -1,6 +1,5 @@
 #include "service/compute_service/detail.hh"
 #include "service/compute_service/storage_owner/batch_policy.hh"
-#include "service/compute_service/storage_owner/response_validation.hh"
 
 using namespace compute_service_detail;
 
@@ -12,7 +11,6 @@ void ComputeService::handle_storage_owner_send_completion(
   auto& slot = state.slots[slot_id];
   if (!slot.in_use) return;
   slot.send_done = true;
-  slot.send_completed_at = std::chrono::steady_clock::now();
   queue_storage_owner_completion(slot);
 }
 
@@ -61,10 +59,8 @@ void ComputeService::handle_storage_owner_response(
       service::storage_owner::kMutationProtocolVersion &&
     response.reserved == 0;
   matched->response_ack = response;
-  matched->response_completed_at = std::chrono::steady_clock::now();
-  matched->cq_progress_gap_ns = storage_insert_current_cq_gap_ns_;
   const u64 rpc_wall_ns = duration_ns_clamped(
-    matched->send_posted_at, matched->response_completed_at);
+    matched->send_posted_at, std::chrono::steady_clock::now());
   ++state.completed_rpc_batches;
   state.completed_rpc_items += matched->item_count;
   state.completed_rpc_wall_ns += rpc_wall_ns;
@@ -295,7 +291,6 @@ void ComputeService::commit_storage_owner_slot(
                 << std::endl;
     }
     for (const u32 task_id : slot.tasks) {
-      state.tasks[task_id].sender_dequeued_at = {};
       state.queue->push_wait(task_id);
       state.published_tasks.fetch_add(1, std::memory_order_release);
     }
@@ -305,166 +300,6 @@ void ComputeService::commit_storage_owner_slot(
   // begin a mutation before returning accepted, so failing these callers
   // cannot hide a committed update.
   fail_storage_owner_tasks(owner_storage, slot.tasks);
-  return;
-
-  // Legacy v3 final-batch response parser retained temporarily below for
-  // source-level bisectability; protocol v4 always returns above.
-  const auto response_executor_started = std::chrono::steady_clock::now();
-
-  const byte_t* response_buffer =
-    state.response_slots[slot.response_slot_id].buffer.data();
-  const auto* response = reinterpret_cast<const
-    service::storage_owner::InsertBatchResponseHeader*>(response_buffer);
-  const auto* request = reinterpret_cast<const
-    service::storage_owner::InsertBatchRequestHeader*>(
-      slot.request_buffer.data());
-  bool response_ok = slot.response_valid &&
-    (response->magic == service::storage_owner::kInsertMagic ||
-     response->magic == service::storage_owner::kMutationMagic) &&
-    response->magic == request->magic &&
-    response->owner_storage == slot.owner_storage &&
-    response->batch_id == slot.batch_id &&
-    response->item_count == slot.item_count;
-  u32 invalidation_count = 0;
-  if (response_ok) {
-    invalidation_count =
-      *service::storage_owner::response_invalidation_count(
-        response_buffer, slot.item_count);
-    response_ok = invalidation_count <=
-      service::storage_owner::response_invalidation_capacity(
-        slot.item_count);
-    if (!response_ok) invalidation_count = 0;
-  }
-
-  const u32* statuses =
-    service::storage_owner::response_statuses(response_buffer);
-  const auto* mutation_results =
-    service::storage_owner::response_mutation_results(
-      response_buffer, slot.item_count);
-  bool collect_breakdown = false;
-  for (const u32 task_id : slot.tasks) {
-    collect_breakdown = collect_breakdown ||
-      storage_completion_samples_[state.tasks[task_id].completion_id]
-        .collects_breakdown();
-  }
-  const auto* breakdown = collect_breakdown && response_ok
-    ? service::storage_owner::response_breakdown(
-        response_buffer, slot.item_count)
-    : nullptr;
-  if (!response_ok) {
-    static std::atomic<u32> bad_response_logs{0};
-    const u32 log_index = bad_response_logs.fetch_add(
-      1, std::memory_order_relaxed);
-    if (log_index < 16) {
-      std::cerr << "[storage-owner] invalid insert response"
-                << " owner=" << slot.owner_storage
-                << " slot=" << slot.slot_id
-                << " magic=0x" << std::hex << response->magic << std::dec
-                << " response_owner=" << response->owner_storage
-                << " expected_owner=" << slot.owner_storage
-                << " batch_id=" << response->batch_id
-                << " expected_batch_id=" << slot.batch_id
-                << " item_count=" << response->item_count
-                << " expected_item_count=" << slot.item_count << std::endl;
-    }
-  }
-
-  const u64 memory_breakdown_ns = breakdown == nullptr
-    ? 0 : breakdown->total();
-  const u64 send_ns = collect_breakdown
-    ? duration_ns_clamped(slot.send_posted_at, slot.send_completed_at) : 0;
-  const u64 response_wait_ns = collect_breakdown
-    ? duration_ns_clamped(
-        slot.send_completed_at, slot.response_completed_at) : 0;
-  const u64 response_wait_unaccounted_ns =
-    collect_breakdown && response_wait_ns > memory_breakdown_ns
-      ? response_wait_ns - memory_breakdown_ns : 0;
-
-  for (u32 i = 0; i < slot.item_count; ++i) {
-    const u32 task_id = slot.tasks[i];
-    auto& task = state.tasks[task_id];
-    auto& sample = storage_completion_samples_[task.completion_id];
-    const bool committed = response_ok && statuses[i] == 0;
-    if (committed && !valid_success_maintenance_sequence(
-          config_.synchronous_exact_updates_enabled(),
-          mutation_results[i].maintenance_sequence)) {
-      throw std::runtime_error(
-        "storage-owner response violated the negotiated update maintenance "
-        "contract");
-    }
-    if (committed && mutation_results[i].maintenance_sequence != 0 &&
-        storage_maintenance_targets_ != nullptr) {
-      const RemotePtr new_pointer{mutation_results[i].new_rptr_raw};
-      const RemotePtr old_pointer{mutation_results[i].old_rptr_raw};
-      const RemotePtr maintenance_home =
-        !new_pointer.is_null() ? new_pointer : old_pointer;
-      if (!maintenance_home.is_null() &&
-          maintenance_home.memory_node() < num_servers_) {
-        auto& target =
-          storage_maintenance_targets_[maintenance_home.memory_node()];
-        u64 observed = target.load(std::memory_order_relaxed);
-        while (observed < mutation_results[i].maintenance_sequence &&
-               !target.compare_exchange_weak(
-                 observed, mutation_results[i].maintenance_sequence,
-                 std::memory_order_release, std::memory_order_relaxed)) {
-        }
-      }
-    }
-    if (response_ok && !committed) {
-      static std::atomic<u32> failed_status_logs{0};
-      const u32 log_index = failed_status_logs.fetch_add(
-        1, std::memory_order_relaxed);
-      if (log_index < 16) {
-        std::cerr << "[storage-owner] mutation failed"
-                  << " owner=" << slot.owner_storage
-                  << " slot=" << slot.slot_id
-                  << " batch_id=" << slot.batch_id
-                  << " item=" << i
-                  << " status=" << statuses[i] << std::endl;
-      }
-    }
-    if (sample.collects_breakdown()) {
-      add_storage_owner_sender_breakdown(
-        &sample,
-        duration_ns_clamped(task.enqueued_at, task.sender_dequeued_at),
-        slot.request_prepare_ns,
-        send_ns,
-        response_wait_unaccounted_ns,
-        slot.item_count);
-      sample.add_subcategory(
-        service::breakdown::Subcategory::cpu_storage_owner_dequeue_to_post,
-        duration_ns_clamped(task.sender_dequeued_at, slot.send_posted_at));
-      sample.add_subcategory(
-        service::breakdown::Subcategory::cpu_storage_owner_cq_progress_gap,
-        per_item_ns(slot.cq_progress_gap_ns, slot.item_count));
-      sample.add_subcategory(
-        service::breakdown::Subcategory::cpu_storage_owner_response_executor_queue,
-        duration_ns_clamped(
-          slot.response_completed_at, response_executor_started));
-      if (breakdown != nullptr) {
-        add_storage_owner_breakdown(&sample, *breakdown, slot.item_count);
-      }
-    }
-
-  }
-
-  const auto response_processed_at = std::chrono::steady_clock::now();
-  const u64 response_process_ns = duration_ns(
-    response_executor_started, response_processed_at);
-  for (u32 i = 0; i < slot.item_count; ++i) {
-    const u32 task_id = slot.tasks[i];
-    auto& task = state.tasks[task_id];
-    auto& sample = storage_completion_samples_[task.completion_id];
-    if (sample.collects_breakdown()) {
-      sample.add_subcategory(
-        service::breakdown::Subcategory::cpu_storage_owner_response_process,
-        per_item_ns(response_process_ns, slot.item_count));
-    }
-    sample.mark_finished(response_processed_at);
-    complete_storage_owner_task(
-      owner_storage, task_id, response_ok && statuses[i] == 0);
-  }
-
 }
 
 void ComputeService::release_storage_owner_slot(
@@ -490,8 +325,6 @@ void ComputeService::complete_storage_owner_task(
   const u32 completion_id = task.completion_id;
   task.encoded_vector.clear();
   task.operation_id = 0;
-  task.enqueued_at = {};
-  task.sender_dequeued_at = {};
   task.completion_id = std::numeric_limits<u32>::max();
   const bool freed = state.free_tasks->try_push(task_id);
   lib_assert(freed, "storage-owner task pool overflow");

@@ -32,6 +32,42 @@ inline bool storage_owner_retry_deadline_elapsed(
   return retry_not_before_ns == 0 || now_ns >= retry_not_before_ns;
 }
 
+// Lower bound on one shard's submitted-but-not-durable Stage2 maintenance
+// sequences, from the storage-published watermarks and this client's highest
+// observed completion target. next_sequence is the next sequence the shard
+// will assign, so an idle shard (next = durable + 1) reports zero backlog.
+inline u64 storage_owner_flow_control_backlog(
+    u64 next_sequence,
+    u64 target_sequence,
+    u64 durable_sequence) {
+  const u64 acknowledged = std::max(target_sequence, durable_sequence);
+  if (next_sequence <= acknowledged) return 0;
+  const u64 span = next_sequence - acknowledged;
+  return span > 1 ? span - 1 : 0;
+}
+
+// Per-batch sender pacing delay for the observed shard backlog. Zero delay
+// means no throttling: the feature is disabled, the backlog is at or below
+// the low watermark, or no maximum delay is configured. Between the
+// watermarks the delay grows linearly; at or above the high watermark the
+// configured maximum applies.
+inline u64 storage_owner_flow_control_delay_ns(
+    u64 backlog,
+    u32 backlog_low,
+    u32 backlog_high,
+    u64 max_delay_ns) {
+  if (backlog_low == 0 || backlog_high <= backlog_low || max_delay_ns == 0) {
+    return 0;
+  }
+  if (backlog <= backlog_low) return 0;
+  if (backlog >= backlog_high) return max_delay_ns;
+  const u64 range = static_cast<u64>(backlog_high) - backlog_low;
+  const u64 risen = backlog - backlog_low;
+  // Split the product so risen * (max % range) stays below range^2 <= 2^64.
+  return max_delay_ns / range * risen +
+    (max_delay_ns % range) * risen / range;
+}
+
 inline bool storage_owner_batch_wait_elapsed(
     u64 oldest_ready_since_ns,
     u64 now_ns,

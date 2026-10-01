@@ -298,6 +298,9 @@ class MemoryNode {
     vec<RemotePtr> cleanup_neighbors;
     std::chrono::steady_clock::time_point queued_at{};
     std::chrono::steady_clock::time_point retry_not_before{};
+    // Zero until the first permanent-failure deferral of this descriptor; the
+    // Stage2 retry window is measured from that point.
+    std::chrono::steady_clock::time_point stage2_first_permanent_defer_at{};
   };
 
   struct StorageOwnerMaintenanceIntent {
@@ -836,6 +839,9 @@ private:
   void complete_storage_owner_maintenance_sequence(u64 sequence,
                                                    u32 work_items);
   bool storage_owner_cleanup_ready(u64 sequence) const;
+  // Lock-free accepted-but-unfinished Stage2 sequence count. Zero when the
+  // completion ring does not exist (coupled mode or runtime-less callers).
+  u64 storage_owner_maintenance_incomplete() const;
   void publish_storage_owner_maintenance_watermarks();
   void log_storage_owner_maintenance_observation(size_t stage2_remaining,
                                                  size_t cleanup_remaining,
@@ -1442,6 +1448,10 @@ private:
   std::atomic<u64> storage_owner_reverse_aggregate_ops_{0};
   std::atomic<u64> storage_owner_maintenance_stale_{0};
   std::atomic<u64> storage_owner_maintenance_cleanup_processed_{0};
+  // Stage2 contexts terminated after exhausting the permanent-failure retry
+  // window, and the highest maintenance sequence released that way.
+  std::atomic<u64> storage_owner_maintenance_stage2_terminated_{0};
+  std::atomic<u64> storage_owner_maintenance_stage2_last_terminated_sequence_{0};
   std::atomic<u64> storage_owner_maintenance_max_backlog_{0};
   std::atomic<u64> storage_owner_maintenance_pressure_yields_{0};
   std::atomic<u64> storage_owner_stage2_batches_{0};

@@ -1094,6 +1094,12 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   telemetry_snapshot.stage2_finalize_latency_ns =
     storage_owner_maintenance_finalize_latency_ns_.load(
       std::memory_order_relaxed);
+  telemetry_snapshot.stage2_terminated_total =
+    storage_owner_maintenance_stage2_terminated_.load(
+      std::memory_order_relaxed);
+  telemetry_snapshot.stage2_last_terminated_sequence =
+    storage_owner_maintenance_stage2_last_terminated_sequence_.load(
+      std::memory_order_relaxed);
   telemetry_snapshot.packing_target_batch = stage2_packing.target_batch;
   telemetry_snapshot.packing_arrival_interval_us =
     stage2_packing.estimated_arrival_interval_us;
@@ -1159,6 +1165,14 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(storage_owner_maintenance_cleanup_processed_.load(std::memory_order_relaxed)) +
                " stale=" +
                std::to_string(stale) +
+               " stage2_terminated_total=" +
+               std::to_string(
+                 storage_owner_maintenance_stage2_terminated_.load(
+                   std::memory_order_relaxed)) +
+               " stage2_last_terminated_sequence=" +
+               std::to_string(
+                 storage_owner_maintenance_stage2_last_terminated_sequence_
+                   .load(std::memory_order_relaxed)) +
                " stage2_completion_ratio=" +
                std::to_string(ratio_or_zero(finalized_live, finalize_enqueued)) +
                " live_stage2_completion_ratio=" +

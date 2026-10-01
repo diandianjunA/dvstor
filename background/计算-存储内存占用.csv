@@ -1,0 +1,8 @@
+SIFT1B,compute_node_memory（GB）,storage_node_memory（GB）
+Milvus-HNSW,645.359,2.868
+Milvus-DiskANN,0.579,47.169
+,,
+,,
+SPACEV1B,compute_node_memory（GB）,storage_node_memory（GB）
+Milvus-HNSW,592.5,1.912
+Milvus-DiskANN,5.281,46.129

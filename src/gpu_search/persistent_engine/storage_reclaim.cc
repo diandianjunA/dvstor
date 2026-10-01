@@ -128,6 +128,20 @@ std::vector<format::StorageControlBlock> PersistentSearchEngine::Impl::read_stor
   return controls;
 }
 
+std::vector<MaintenanceWatermark>
+PersistentSearchEngine::Impl::read_maintenance_watermarks() {
+  const std::vector<format::StorageControlBlock> controls =
+    read_storage_controls();
+  std::vector<MaintenanceWatermark> watermarks(controls.size());
+  for (size_t shard = 0; shard < controls.size(); ++shard) {
+    watermarks[shard] = {
+      .next_sequence = controls[shard].next_maintenance_sequence,
+      .durable_sequence = controls[shard].durable_maintenance_sequence,
+    };
+  }
+  return watermarks;
+}
+
 std::vector<std::optional<maintenance_telemetry::Snapshot>>
 PersistentSearchEngine::Impl::read_maintenance_telemetry() {
   std::lock_guard<std::mutex> read_lock(storage_control_read_mutex);

@@ -417,6 +417,21 @@ HostOrchestratedSearchEngine::Impl::read_maintenance_telemetry() {
   return read_maintenance_telemetry(lane.get());
 }
 
+std::vector<MaintenanceWatermark>
+HostOrchestratedSearchEngine::Impl::read_maintenance_watermarks() {
+  LaneGuard lane = acquire_lane();
+  const std::vector<format::StorageControlBlock> controls =
+    read_storage_controls(lane.get());
+  std::vector<MaintenanceWatermark> watermarks(controls.size());
+  for (size_t shard = 0; shard < controls.size(); ++shard) {
+    watermarks[shard] = {
+      .next_sequence = controls[shard].next_maintenance_sequence,
+      .durable_sequence = controls[shard].durable_maintenance_sequence,
+    };
+  }
+  return watermarks;
+}
+
 bool HostOrchestratedSearchEngine::Impl::wait_for_maintenance(
     std::span<const u64> target_sequences,
     std::chrono::milliseconds timeout,

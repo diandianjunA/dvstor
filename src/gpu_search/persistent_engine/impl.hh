@@ -132,6 +132,7 @@ struct PersistentSearchEngine::Impl {
   std::vector<format::StorageControlBlock> read_storage_controls();
   std::vector<std::optional<maintenance_telemetry::Snapshot>>
   read_maintenance_telemetry();
+  std::vector<MaintenanceWatermark> read_maintenance_watermarks();
   CentroidRouteReadResult read_storage_centroid_route_publications();
   StorageRouteSyncResult synchronize_storage_routes();
   bool wait_for_maintenance(std::span<const u64> target_sequences,

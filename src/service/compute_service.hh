@@ -73,7 +73,6 @@ public:
   vec<node_t> search_raw(VectorDType query_dtype, const byte_t* query_data, u32 dim, u32 k);
   Status status() const;
   void reset_breakdown_state();
-  void clear_thread_statistics();
   service::breakdown::Report collect_breakdown_report() const;
   gpu_search::TelemetrySnapshot gpu_search_telemetry() const {
     return search_engine_ == nullptr
@@ -122,8 +121,6 @@ private:
     // changing this value, so authority replay never depends on batch ordinal.
     u64 operation_id{};
     u32 operation_generation{};
-    std::chrono::steady_clock::time_point enqueued_at{};
-    std::chrono::steady_clock::time_point sender_dequeued_at{};
   };
 
   struct StorageOwnerRpcSlot {
@@ -136,18 +133,9 @@ private:
     bool completion_claimed{false};
     bool response_valid{false};
     service::storage_owner::MutationBatchAckV2 response_ack{};
-    // Kept only for the unreachable protocol-v3 parser below the v4 return;
-    // no v4 receive slot is retained by an RPC batch.
-    u32 response_slot_id{std::numeric_limits<u32>::max()};
     u32 item_count{};
     u64 batch_id{};
-    u64 request_prepare_ns{};
-    u64 cq_progress_gap_ns{};
-    size_t request_size{};
-    size_t response_size{};
     std::chrono::steady_clock::time_point send_posted_at{};
-    std::chrono::steady_clock::time_point send_completed_at{};
-    std::chrono::steady_clock::time_point response_completed_at{};
     vec<byte_t> request_buffer;
     std::unique_ptr<LocalMemoryRegion> request_region;
     vec<u32> tasks;
@@ -221,6 +209,12 @@ private:
     u64 busy_batches{};
     u64 busy_items{};
     u32 max_consecutive_busy_batches{};
+    // Early flow-control pacing applied by the progress thread. Delays are
+    // armed through retry_not_before_ns after a batch is posted; they never
+    // block CQ progress and never drop or reorder queued work.
+    u64 flow_control_throttled_batches{};
+    u64 flow_control_delay_ns_total{};
+    u64 flow_control_max_backlog{};
   };
 
   struct StorageOwnerReadySlot {
@@ -247,6 +241,7 @@ private:
   void release_storage_insert_runtime();
   void run_storage_insert_progress_loop();
   void run_storage_insert_completion_loop();
+  void run_storage_flow_control_poll_loop();
   bool drain_storage_owner_submissions(u32& first_owner);
   void reclaim_storage_owner_slots();
   void post_storage_owner_batch(u32 owner_storage,
@@ -298,13 +293,20 @@ private:
   std::atomic<u64> storage_owner_completed_items_{0};
   std::atomic<u64> storage_owner_completed_rpc_wall_ns_{0};
   std::atomic<u64> storage_owner_max_rpc_wall_ns_{0};
-  u64 storage_insert_current_cq_gap_ns_{};
   std::unique_ptr<bounded::Queue<StorageOwnerReadySlot>> storage_ready_slots_;
   std::unique_ptr<bounded::Queue<StorageOwnerReleasedSlot>> storage_released_slots_;
   std::unique_ptr<bounded::CompletionPool> storage_completion_pool_;
   std::unique_ptr<service::breakdown::Sample[]> storage_completion_samples_;
   std::unique_ptr<std::atomic<u64>[]> storage_maintenance_targets_;
   vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
+  // Per-shard Stage2 watermarks refreshed by the flow-control poll thread
+  // through the query engine's control-block read path. The sender reads only
+  // these atomics; the RDMA read never runs on the progress thread.
+  std::thread storage_flow_control_poll_thread_;
+  std::unique_ptr<std::atomic<u64>[]> storage_flow_control_next_sequences_;
+  std::unique_ptr<std::atomic<u64>[]> storage_flow_control_durable_sequences_;
+  std::atomic<u64> storage_flow_control_refreshes_{0};
+  std::atomic<u64> storage_flow_control_refresh_failures_{0};
   // Authority replay identity includes a per-process incarnation, not the
   // reusable connection-manager client ordinal. This prevents a restarted
   // compute process from replaying an old operation token accidentally.

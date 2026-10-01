@@ -172,6 +172,7 @@ bool MemoryNode::execute_storage_owner_batch_items_exact(
       vector_bytes, VamanaNode::vector_dtype(), VamanaNode::DIM,
       decoded.data());
     discover_live_parents = [&]() {
+      u32 attempts = 0;
       for (;;) {
         const vec<RemotePtr> entries = local_centroid_route_entries();
         lib_assert(!entries.empty(),
@@ -210,6 +211,10 @@ bool MemoryNode::execute_storage_owner_batch_items_exact(
         if (std::find(states.begin(), states.end(),
                       SnapshotState::retryable) != states.end()) {
           if (cancellable_shutdown()) return vec<RemotePtr>{};
+          if (config.storage_owner_exact_max_attempts != 0 &&
+              ++attempts >= config.storage_owner_exact_max_attempts) {
+            return vec<RemotePtr>{};
+          }
           retry_pause();
           continue;
         }
@@ -232,6 +237,10 @@ bool MemoryNode::execute_storage_owner_batch_items_exact(
           elapsed_ns_since(prune_started);
         if (!selected.empty()) return selected;
         if (cancellable_shutdown()) return vec<RemotePtr>{};
+        if (config.storage_owner_exact_max_attempts != 0 &&
+            ++attempts >= config.storage_owner_exact_max_attempts) {
+          return vec<RemotePtr>{};
+        }
         retry_pause();
       }
     };
@@ -247,6 +256,10 @@ bool MemoryNode::execute_storage_owner_batch_items_exact(
     new_pointer = allocate_local_node();
     breakdown.storage_owner_allocate_node_ns +=
       elapsed_ns_since(allocation_started);
+    if (new_pointer.is_null()) {
+      (void)abort_authority_mutation(ids[index], operation);
+      return false;
+    }
     const auto write_started = std::chrono::steady_clock::now();
     write_new_node(
       new_pointer, ids[index], span<const element_t>{decoded},
@@ -271,6 +284,7 @@ bool MemoryNode::execute_storage_owner_batch_items_exact(
           parent_round.push_back(parent);
         }
       }
+      u32 attempts = 0;
       for (;;) {
         for (const RemotePtr parent : parent_round) {
           const ReconcileReverseOp mandatory{
@@ -293,6 +307,10 @@ bool MemoryNode::execute_storage_owner_batch_items_exact(
             return true;
           }
           if (cancellable_shutdown()) return false;
+          if (config.storage_owner_exact_max_attempts != 0 &&
+              ++attempts >= config.storage_owner_exact_max_attempts) {
+            return false;
+          }
           retry_pause();
         }
         parent_round = discover_live_parents();

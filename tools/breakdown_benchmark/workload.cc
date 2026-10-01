@@ -774,7 +774,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     std::cerr << "[breakdown][recall] " << phase << " recall@" << recall_k << "=" << recall
               << " queries=" << recall_queries << std::endl;
     if (reset_after) {
-      service.clear_thread_statistics();
       service.reset_breakdown_state();
     }
   };
@@ -1288,7 +1287,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     maintenance_log_cursors = snapshot_maintenance_logs(
       args.storage_maintenance_logs);
   }
-  service.clear_thread_statistics();
   service.reset_breakdown_state();
   std::cerr << "[breakdown] starting measure phase" << std::endl;
   size_t measured_query_operations = 0;

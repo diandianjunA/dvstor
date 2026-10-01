@@ -49,6 +49,67 @@ inline PartitionSearchBudget stage2_partition_search_budget(
   return PartitionSearchBudget::unbounded();
 }
 
+// Backlog-aware tightening of the Stage2 continuation budget. All fields zero
+// keeps the historical unbounded production behavior; the feature activates
+// only when both watermarks are configured.
+struct Stage2BudgetBacklogPolicy {
+  u32 backlog_low{0};
+  u32 backlog_high{0};
+  // Tightest per-dimension budget applied at the high watermark. Zero keeps
+  // that dimension unbounded at every backlog.
+  u64 max_expansions{0};
+  u64 max_candidate_visits{0};
+};
+
+inline bool stage2_budget_backlog_policy_enabled(
+    const Stage2BudgetBacklogPolicy& policy) {
+  return policy.backlog_low != 0 && policy.backlog_low < policy.backlog_high;
+}
+
+// Linear interpolation for one budget dimension. At or below the low
+// watermark the continuation keeps its unbounded budget; at or above the high
+// watermark it runs with the configured tight value. Between the watermarks
+// the budget shrinks linearly from a nominal full-convergence scale down to
+// the tight value. A zero tight value exempts the dimension entirely.
+inline u64 stage2_budget_backlog_interpolate(
+    u64 tight,
+    u64 nominal,
+    u64 backlog,
+    u32 backlog_low,
+    u32 backlog_high) {
+  if (tight == 0 || backlog <= backlog_low) {
+    return std::numeric_limits<u64>::max();
+  }
+  if (backlog >= backlog_high) return tight;
+  nominal = std::max(nominal, tight);
+  const u64 range = static_cast<u64>(backlog_high) - backlog_low;
+  const u64 risen = backlog - backlog_low;
+  return nominal - (nominal - tight) * risen / range;
+}
+
+// Backlog-aware Stage2 continuation budget. The nominal anchor at the low
+// watermark is the search's natural single-pass scale: beam_width expansions,
+// each admitting up to graph_entry_capacity fresh candidates. Only the
+// incremental remote continuation is bounded; the Stage1 handoff frontier
+// (max_remote_frontier) always retains the complete phase boundary.
+inline PartitionSearchBudget stage2_partition_search_budget(
+    u32 beam_width,
+    u32 graph_entry_capacity,
+    u64 backlog,
+    const Stage2BudgetBacklogPolicy& policy) {
+  PartitionSearchBudget budget = PartitionSearchBudget::unbounded();
+  if (!stage2_budget_backlog_policy_enabled(policy)) return budget;
+  budget.max_expansions = stage2_budget_backlog_interpolate(
+    policy.max_expansions, beam_width, backlog,
+    policy.backlog_low, policy.backlog_high);
+  budget.max_candidate_visits = static_cast<size_t>(
+    stage2_budget_backlog_interpolate(
+      policy.max_candidate_visits,
+      static_cast<u64>(beam_width) * graph_entry_capacity, backlog,
+      policy.backlog_low, policy.backlog_high));
+  return budget;
+}
+
 // Algorithm-only state for construction search inside one storage partition.
 // The beam is always sorted and never grows beyond L. Production callers run
 // expansion/visitation to convergence and retain the complete phase-boundary

@@ -7,7 +7,6 @@ void ComputeService::run_storage_insert_progress_loop() {
   vec<ibv_wc> send_wcs(std::max<i32>(1, config_.max_send_queue_wr));
   vec<ibv_wc> recv_wcs(std::max<i32>(1, config_.max_recv_queue_wr));
   u32 first_owner = 0;
-  auto previous_poll = std::chrono::steady_clock::now();
 
   for (;;) {
     // Shutdown must remain bounded even when a remote process has disappeared.
@@ -22,11 +21,6 @@ void ComputeService::run_storage_insert_progress_loop() {
     }
     bool progressed = false;
     reclaim_storage_owner_slots();
-
-    const auto poll_started = std::chrono::steady_clock::now();
-    storage_insert_current_cq_gap_ns_ =
-      duration_ns(previous_poll, poll_started);
-    previous_poll = poll_started;
 
     const i32 send_count = Context::poll_send_cq(
       send_wcs.data(), static_cast<i32>(send_wcs.size()),
@@ -98,6 +92,12 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
   if (owner_count == 0) return false;
   const u64 max_wait_ns =
     static_cast<u64>(config_.storage_owner_batch_max_wait_us) * 1000ull;
+  const bool flow_control =
+    config_.storage_owner_flow_control_backlog_low != 0 &&
+    storage_flow_control_next_sequences_ != nullptr;
+  const u64 flow_control_max_delay_ns =
+    static_cast<u64>(config_.storage_owner_flow_control_max_delay_us) *
+      1000ull;
   const auto now_ns = []() {
     return static_cast<u64>(std::chrono::duration_cast<
       std::chrono::nanoseconds>(
@@ -193,17 +193,63 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
                   << " partial_visible_batches="
                   << state.partial_visible_batches
                   << " published="
-                  << state.published_tasks.load(std::memory_order_relaxed)
-                  << std::endl;
-      }
-      for (const u32 id : slot.tasks) {
-        state.tasks[id].sender_dequeued_at = dequeued_at;
+                  << state.published_tasks.load(std::memory_order_relaxed);
+        if (state.flow_control_throttled_batches != 0) {
+          std::cerr << " flow_control_throttled_batches="
+                    << state.flow_control_throttled_batches
+                    << " flow_control_avg_delay_us="
+                    << (static_cast<double>(state.flow_control_delay_ns_total) /
+                        static_cast<double>(
+                          state.flow_control_throttled_batches) / 1000.0)
+                    << " flow_control_max_backlog="
+                    << state.flow_control_max_backlog;
+        }
+        std::cerr << std::endl;
       }
       post_storage_owner_batch(owner, slot_id);
       state.max_active_rpcs = std::max(
         state.max_active_rpcs,
         static_cast<u32>(state.slots.size() - state.free_slots.size()));
       progressed = true;
+      if (flow_control) {
+        // Read durable before next so a concurrent refresh can only
+        // overestimate the backlog (see the poller's store order).
+        const u64 durable =
+          storage_flow_control_durable_sequences_[owner].load(
+            std::memory_order_acquire);
+        const u64 next =
+          storage_flow_control_next_sequences_[owner].load(
+            std::memory_order_acquire);
+        const u64 target =
+          storage_maintenance_targets_[owner].load(
+            std::memory_order_acquire);
+        const u64 backlog =
+          storage_owner_flow_control_backlog(next, target, durable);
+        const u64 delay_ns = storage_owner_flow_control_delay_ns(
+          backlog,
+          config_.storage_owner_flow_control_backlog_low,
+          config_.storage_owner_flow_control_backlog_high,
+          flow_control_max_delay_ns);
+        if (delay_ns != 0) {
+          // Pace instead of blocking: one batch per delay interval per owner.
+          // Raise-only so a concurrent busy-ACK backoff with a later deadline
+          // is never weakened. A token completion may still clear the gate
+          // early; the next posted batch simply re-arms it.
+          const u64 not_before = now_ns() + delay_ns;
+          u64 observed_deadline =
+            state.retry_not_before_ns.load(std::memory_order_acquire);
+          while (observed_deadline < not_before &&
+                 !state.retry_not_before_ns.compare_exchange_weak(
+                   observed_deadline, not_before,
+                   std::memory_order_release, std::memory_order_acquire)) {
+          }
+          ++state.flow_control_throttled_batches;
+          state.flow_control_delay_ns_total += delay_ns;
+          state.flow_control_max_backlog =
+            std::max(state.flow_control_max_backlog, backlog);
+          break;
+        }
+      }
     }
   }
   first_owner = (first_owner + 1) % owner_count;
@@ -228,16 +274,9 @@ void ComputeService::reclaim_storage_owner_slots() {
     slot.completion_claimed = false;
     slot.response_valid = false;
     slot.response_ack = {};
-    slot.response_slot_id = std::numeric_limits<u32>::max();
     slot.item_count = 0;
     slot.batch_id = 0;
-    slot.request_prepare_ns = 0;
-    slot.cq_progress_gap_ns = 0;
-    slot.request_size = 0;
-    slot.response_size = 0;
     slot.send_posted_at = {};
-    slot.send_completed_at = {};
-    slot.response_completed_at = {};
     slot.tasks.clear();
     state.free_slots.push_back(released.slot_id);
     storage_insert_inflight_.fetch_sub(1, std::memory_order_acq_rel);
@@ -253,18 +292,12 @@ void ComputeService::post_storage_owner_batch(
 
   const u32 item_count = static_cast<u32>(slot.tasks.size());
   const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
-  bool collect_breakdown = false;
   bool mutation_request = false;
   for (const u32 task_id : slot.tasks) {
     const auto& task = state.tasks[task_id];
-    const auto& sample = storage_completion_samples_[task.completion_id];
-    collect_breakdown = collect_breakdown || sample.collects_breakdown();
     mutation_request = mutation_request ||
       task.kind != service::storage_owner::MutationKind::insert;
   }
-  const auto prepare_start = collect_breakdown
-    ? std::chrono::steady_clock::now()
-    : std::chrono::steady_clock::time_point{};
   const size_t request_size = mutation_request
     ? service::storage_owner::mutation_batch_request_bytes(item_count)
     : service::storage_owner::insert_batch_request_bytes(item_count);
@@ -336,14 +369,8 @@ void ComputeService::post_storage_owner_batch(
   slot.completion_claimed = false;
   slot.response_valid = false;
   slot.response_ack = {};
-  slot.response_slot_id = std::numeric_limits<u32>::max();
   slot.item_count = item_count;
   slot.batch_id = batch_id;
-  slot.request_prepare_ns = collect_breakdown
-    ? duration_ns(prepare_start, std::chrono::steady_clock::now()) : 0;
-  slot.request_size = request_size;
-  slot.response_size = response_size;
-  slot.cq_progress_gap_ns = 0;
   slot.send_posted_at = std::chrono::steady_clock::now();
   storage_insert_inflight_.fetch_add(1, std::memory_order_acq_rel);
 

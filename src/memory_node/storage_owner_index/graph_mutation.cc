@@ -571,8 +571,10 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
       std::equal(observed_neighbors.begin(), observed_neighbors.end(),
                  current_neighbors.begin());
     if (!unchanged) {
-      ++conflicts;
       unlock_node(target_ptr);
+      if (++conflicts > config.storage_owner_reverse_conflict_limit) {
+        return false;
+      }
       continue;
     }
     select_fresh_reverse_candidates_locked(
@@ -588,8 +590,10 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
                  revalidated_candidates.end(),
                  fresh_candidates.begin());
     if (!candidates_unchanged) {
-      ++conflicts;
       unlock_node(target_ptr);
+      if (++conflicts > config.storage_owner_reverse_conflict_limit) {
+        return false;
+      }
       continue;
     }
     write_neighbor_list(target_ptr, selected_neighbors);

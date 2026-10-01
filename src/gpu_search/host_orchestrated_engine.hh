@@ -38,6 +38,7 @@ public:
     std::vector<u64>* effective_target_sequences = nullptr) override;
   std::vector<std::optional<maintenance_telemetry::Snapshot>>
     read_maintenance_telemetry() override;
+  std::vector<MaintenanceWatermark> read_maintenance_watermarks() override;
 
   TelemetrySnapshot telemetry() const override;
   void reset_telemetry() override;

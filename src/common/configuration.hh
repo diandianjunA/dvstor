@@ -127,13 +127,45 @@ public:
   u32 storage_owner_peer_rdma_tokens{16};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30'000};
+  // Zero keeps the legacy unbounded synchronous-exact retry loops.
+  u32 storage_owner_exact_max_attempts{0};
   u32 storage_owner_search_snapshot_batch{256};
   // Stage2 is part of the only supported update protocol, so at least one
   // maintenance executor must exist even when the caller does not tune it.
   u32 storage_owner_maintenance_workers{1};
   u32 storage_owner_maintenance_queue_depth{65'536};
+  // Permanent Stage2 failures are retried with the nominal 1 ms deferral for
+  // at most this long before the stuck context is terminated and its
+  // maintenance sequence completed. Zero preserves unbounded retries.
+  u32 storage_owner_stage2_max_retry_ms{300'000};
+  // Backlog-aware Stage2 continuation search budget. Both watermarks zero
+  // disables the controller and preserves the unbounded production budget.
+  // Below the low watermark the budget stays unbounded; at the high watermark
+  // the configured tight values apply; between them the budget shrinks
+  // linearly from the search's natural single-pass scale.
+  u32 storage_owner_stage2_budget_backlog_low{0};
+  u32 storage_owner_stage2_budget_backlog_high{0};
+  // Tightest per-dimension Stage2 continuation budget at the high watermark;
+  // zero keeps the corresponding dimension unbounded at every backlog.
+  u64 storage_owner_stage2_budget_max_expansions{0};
+  u64 storage_owner_stage2_budget_max_candidate_visits{0};
+  // Compute-side early flow control on submitted-but-not-durable Stage2
+  // maintenance. Both watermarks zero disables throttling and preserves the
+  // hard queue-depth backpressure as the only admission control. Between the
+  // watermarks the sender paces each authority with a per-batch delay that
+  // grows linearly up to the configured maximum.
+  u32 storage_owner_flow_control_backlog_low{0};
+  u32 storage_owner_flow_control_backlog_high{0};
+  u32 storage_owner_flow_control_poll_ms{5};
+  u32 storage_owner_flow_control_max_delay_us{20'000};
   u32 storage_owner_reverse_queue_depth{65'536};
   u32 storage_owner_reverse_coalesce_max{256};
+  // Optimistic reverse-update revalidation gives up after this many observed
+  // adjacency conflicts on one target; the sender retries with backoff.
+  u32 storage_owner_reverse_conflict_limit{32};
+  // Reverse aggregate resends start at the 1 ms base backoff and double per
+  // failed attempt up to this cap.
+  u32 storage_owner_reverse_retry_backoff_max_us{100'000};
 
   u32 mn_memory_gb{10};
 
@@ -498,6 +530,11 @@ private:
       ("storage-owner-rpc-timeout-ms",
        po::value<u32>(&storage_owner_rpc_timeout_ms)->default_value(storage_owner_rpc_timeout_ms),
        "Mutation RPC timeout.")
+      ("storage-owner-exact-max-attempts",
+       po::value<u32>(&storage_owner_exact_max_attempts)
+         ->default_value(storage_owner_exact_max_attempts),
+       "Maximum parent-discovery and bridge retries for one synchronous exact "
+       "mutation; zero retries without a bound.")
       ("storage-owner-search-snapshot-batch",
        po::value<u32>(&storage_owner_search_snapshot_batch)
          ->default_value(storage_owner_search_snapshot_batch),
@@ -510,6 +547,49 @@ private:
        po::value<u32>(&storage_owner_maintenance_queue_depth)
          ->default_value(storage_owner_maintenance_queue_depth),
        "Bounded graph-maintenance backlog; writers backpressure at the limit.")
+      ("storage-owner-stage2-max-retry-ms",
+       po::value<u32>(&storage_owner_stage2_max_retry_ms)
+         ->default_value(storage_owner_stage2_max_retry_ms),
+       "Maximum permanent-failure retry window for one Stage2 context before "
+       "it is terminated and its sequence completed; zero retries forever.")
+      ("storage-owner-stage2-budget-backlog-low",
+       po::value<u32>(&storage_owner_stage2_budget_backlog_low)
+         ->default_value(storage_owner_stage2_budget_backlog_low),
+       "Stage2 backlog below which the continuation search budget stays "
+       "unbounded; zero disables backlog-aware budgeting.")
+      ("storage-owner-stage2-budget-backlog-high",
+       po::value<u32>(&storage_owner_stage2_budget_backlog_high)
+         ->default_value(storage_owner_stage2_budget_backlog_high),
+       "Stage2 backlog at which the continuation search budget reaches its "
+       "configured tightest values.")
+      ("storage-owner-stage2-budget-max-expansions",
+       po::value<u64>(&storage_owner_stage2_budget_max_expansions)
+         ->default_value(storage_owner_stage2_budget_max_expansions),
+       "Stage2 continuation expansion budget at the high backlog watermark; "
+       "zero keeps expansions unbounded.")
+      ("storage-owner-stage2-budget-max-candidate-visits",
+       po::value<u64>(&storage_owner_stage2_budget_max_candidate_visits)
+         ->default_value(storage_owner_stage2_budget_max_candidate_visits),
+       "Stage2 continuation candidate-visit budget at the high backlog "
+       "watermark; zero keeps visits unbounded.")
+      ("storage-owner-flow-control-backlog-low",
+       po::value<u32>(&storage_owner_flow_control_backlog_low)
+         ->default_value(storage_owner_flow_control_backlog_low),
+       "Submitted-but-not-durable Stage2 backlog per shard below which the "
+       "compute sender is not throttled; zero disables early flow control.")
+      ("storage-owner-flow-control-backlog-high",
+       po::value<u32>(&storage_owner_flow_control_backlog_high)
+         ->default_value(storage_owner_flow_control_backlog_high),
+       "Submitted-but-not-durable Stage2 backlog per shard at which the "
+       "compute sender applies the maximum per-batch pacing delay.")
+      ("storage-owner-flow-control-poll-ms",
+       po::value<u32>(&storage_owner_flow_control_poll_ms)
+         ->default_value(storage_owner_flow_control_poll_ms),
+       "Compute-side storage maintenance watermark refresh period.")
+      ("storage-owner-flow-control-max-delay-us",
+       po::value<u32>(&storage_owner_flow_control_max_delay_us)
+         ->default_value(storage_owner_flow_control_max_delay_us),
+       "Maximum per-batch sender pacing delay at the high backlog watermark.")
       ("storage-owner-reverse-queue-depth",
        po::value<u32>(&storage_owner_reverse_queue_depth)
          ->default_value(storage_owner_reverse_queue_depth),
@@ -518,6 +598,15 @@ private:
        po::value<u32>(&storage_owner_reverse_coalesce_max)
          ->default_value(storage_owner_reverse_coalesce_max),
        "Maximum reverse updates per coalesced batch.")
+      ("storage-owner-reverse-conflict-limit",
+       po::value<u32>(&storage_owner_reverse_conflict_limit)
+         ->default_value(storage_owner_reverse_conflict_limit),
+       "Optimistic reverse-update conflicts tolerated on one target before "
+       "the receiver reports failure and the sender retries with backoff.")
+      ("storage-owner-reverse-retry-backoff-max-us",
+       po::value<u32>(&storage_owner_reverse_retry_backoff_max_us)
+         ->default_value(storage_owner_reverse_retry_backoff_max_us),
+       "Cap for the exponential reverse-aggregate resend backoff.")
       ("mn-memory", po::value<u32>(&mn_memory_gb)->default_value(mn_memory_gb),
        "Storage-node registered-memory capacity in GiB.");
   }
@@ -663,6 +752,29 @@ private:
         static_cast<u64>(storage_owner_batch_max) * 2) {
       fail("stage2 maintenance queue depth must cover two intents per RPC batch");
     }
+    if ((storage_owner_stage2_budget_backlog_low == 0) !=
+        (storage_owner_stage2_budget_backlog_high == 0)) {
+      fail("--storage-owner-stage2-budget-backlog-low and "
+           "--storage-owner-stage2-budget-backlog-high must be set together");
+    }
+    if (storage_owner_stage2_budget_backlog_low != 0 &&
+        storage_owner_stage2_budget_backlog_low >=
+          storage_owner_stage2_budget_backlog_high) {
+      fail("--storage-owner-stage2-budget-backlog-low must be smaller than "
+           "--storage-owner-stage2-budget-backlog-high");
+    }
+    if ((storage_owner_flow_control_backlog_low == 0) !=
+        (storage_owner_flow_control_backlog_high == 0)) {
+      fail("--storage-owner-flow-control-backlog-low and "
+           "--storage-owner-flow-control-backlog-high must be set together");
+    }
+    if (storage_owner_flow_control_backlog_low != 0 &&
+        (storage_owner_flow_control_backlog_low >=
+           storage_owner_flow_control_backlog_high ||
+         storage_owner_flow_control_poll_ms == 0)) {
+      fail("enabled storage-owner flow control requires low < high backlog "
+           "watermarks and a positive --storage-owner-flow-control-poll-ms");
+    }
     if (is_server && server_index_file.empty()) {
       fail("storage node requires --server-index-file");
     }
@@ -751,6 +863,8 @@ public:
              << config.storage_owner_batch_max << '\n';
       output << std::setw(width) << "storage batch max wait us: "
              << config.storage_owner_batch_max_wait_us << '\n';
+      output << std::setw(width) << "storage exact max attempts: "
+             << config.storage_owner_exact_max_attempts << '\n';
       output << std::setw(width) << "storage Stage2 batch max wait us: "
              << config.storage_owner_stage2_batch_max_wait_us << '\n';
       output << std::setw(width) << "storage Stage2 initial delay ms: "
@@ -766,6 +880,26 @@ public:
       output << std::setw(width) << "storage stage2 maintenance: "
              << config.storage_owner_maintenance_workers << " workers, backlog "
              << config.storage_owner_maintenance_queue_depth << '\n';
+      output << std::setw(width) << "storage Stage2 max retry ms: "
+             << config.storage_owner_stage2_max_retry_ms << '\n';
+      output << std::setw(width) << "Stage2 budget backlog low/high: "
+             << config.storage_owner_stage2_budget_backlog_low << "/"
+             << config.storage_owner_stage2_budget_backlog_high << '\n';
+      output << std::setw(width) << "Stage2 budget tight exp/visits: "
+             << config.storage_owner_stage2_budget_max_expansions << "/"
+             << config.storage_owner_stage2_budget_max_candidate_visits
+             << '\n';
+      output << std::setw(width) << "flow control backlog low/high: "
+             << config.storage_owner_flow_control_backlog_low << "/"
+             << config.storage_owner_flow_control_backlog_high << '\n';
+      output << std::setw(width) << "flow control poll/max delay: "
+             << config.storage_owner_flow_control_poll_ms << " ms/"
+             << config.storage_owner_flow_control_max_delay_us << " us"
+             << '\n';
+      output << std::setw(width) << "storage reverse conflict limit: "
+             << config.storage_owner_reverse_conflict_limit << '\n';
+      output << std::setw(width) << "storage reverse retry backoff max us: "
+             << config.storage_owner_reverse_retry_backoff_max_us << '\n';
       output << std::setfill('=') << std::setw(line_width) << "" << '\n';
     } else if (config.is_server) {
       output << std::setw(width) << "index prefix: " << config.index_prefix << '\n';

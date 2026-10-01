@@ -1,61 +1,47 @@
-# Source Layout
+# 源码结构
 
-## 模块边界
+## 运行时
 
-运行时按职责划分，而不是按历史功能堆叠：
+| 路径 | 职责 |
+|---|---|
+| `src/common/` | 配置、公共类型与格式辅助函数 |
+| `src/service/compute_service/` | 服务生命周期、索引校验、查询和更新入口 |
+| `src/gpu_search/search_engine.hh` | 两种查询后端共用的接口 |
+| `src/gpu_search/host_orchestrated_engine/` | CPU 图导航、RDMA 波次和 CUDA 距离计算的编排 |
+| `src/gpu_search/persistent_engine/` | Persistent 引擎资源、提交/完成环、路由同步和健康检查 |
+| `src/gpu_search/persistent_kernel/` | GPU 候选评分、图遍历、前沿管理、RDMA 读取和精排 |
+| `src/gpu/` | DOCA GPUNetIO 传输、QP owner 和硬件探针 |
+| `src/memory_node/storage_owner_index/` | 存储分配、图访问、候选搜索和图修改 |
+| `src/memory_node/storage_owner_runtime/` | 更新协议、事务执行和 worker 生命周期 |
+| `src/memory_node/storage_owner_maintenance/` | Stage2、反向边、迁移和回收任务 |
+| `src/memory_node/peer_rpc/` | 存储节点之间的 RPC 请求、响应和 worker |
+| `src/vamana/` | 图、质心发布、centroid checkpoint 和 idmap 格式 |
 
-- `src/gpu_search/persistent_engine.cc`：GPU 查询引擎 PImpl 的装配入口；
-- `src/gpu_search/persistent_engine/`：构造、生命周期、查询、路由、质心发布、
-  存储回收、完成处理和状态；
-- `src/gpu_search/persistent_kernel.cu`：单一持久化 CUDA translation unit；
-- `src/gpu_search/persistent_kernel/`：PQ 评分、GPUNetIO/RDMA 读取、版本化 centroid
-  route 快照、图遍历和 kernel runtime；
-- `src/memory_node/storage_owner_index/`：存储分配、图访问、候选搜索和图修改；
-- `src/memory_node/peer_rpc/`：peer RPC 生命周期、请求处理、worker 和客户端请求；
-- `src/memory_node/storage_owner_maintenance/`：维护队列、worker 和图任务；
-- `src/memory_node/storage_owner_runtime/`：更新 runtime 生命周期、批执行和 wire protocol；
-- `src/service/compute_service/storage_owner/`：计算侧更新入口、发送和完成处理；
-- `src/vamana/centroid_router.*`：物理分片补偿式 FP64 sum/count、1--4 个 live entries 与
-  immutable publication；
-- `src/vamana/centroid_state.hh`：离线 `.centroid` checkpoint 的版本化格式；
-- `tools/breakdown_benchmark/`：数据集、进度、报表和工作负载编排。
+引擎选择位于 `src/service/compute_service/lifecycle.cc`，配置模式解析位于
+`src/common/configuration.hh`。修改 baseline/full 时先核对模式解析后的实际参数，
+再核对后端实现；实验脚本可以通过 `manual` 模式覆盖下层参数。
 
-## 实现单元
+CPU 模块使用独立编译的 `.cc` 和声明头 `.hh`。模块内部共享声明放在 `detail.hh`，
+查询引擎内部状态放在 `impl.hh`，公开门面负责构造和转发。
+CUDA 设备代码由 `persistent_kernel.cu` 编译为单个翻译单元，其 `.cuh` 按职责拆分，
+保留设备端内联与常量传播。
 
-CPU 运行时使用普通 `.hh`/`.cc`：每个 `.cc` 是可独立编译、可被 clangd 直接解析的
-职责单元。模块共享的非公开声明放在本目录的 `detail.hh`；GPU 查询引擎通过
-`impl.hh` 定义 PImpl 状态，公开门面只保留装配和转发。项目不使用 `.ipp` 文本片段，
-也不依赖 `__INCLUDE_LEVEL__` 改变源码语义。
+## 工具与实验
 
-CUDA 设备代码仍由 `persistent_kernel.cu` 形成一个 translation unit，以保留设备端
-内联与常量传播；目录内 `.cuh` 是带 `#pragma once`、显式依赖和命名空间的正常 CUDA
-头文件，而不是可独立切换行为的 include 片段。
+- `tools/vamana_offline/`：数据读取、Vamana 构图、分片、PQ 编码和格式转换。
+- `tools/breakdown_benchmark/`：负载编排、数据集读取、进度和报表。
+- `test/`：CPU 单元测试和 CUDA/RDMA 测试；硬件测试需对应运行环境。
+- `cmake/`：依赖发现与目标配置。
+- `experiment/common/`：数据集共用的绘图、汇总和存储启动实现；从各数据集入口调用。
+- `experiment/{sift100m,deep100m,spacev100m}/`：数据/profile 配置、索引准备和实验入口。
+- `experiment/mixed_test/`：跨数据集混合负载。
 
-## 动态更新语义
+## 修改边界
 
-存储节点维护唯一的权威动态图。Stage1 完成本地插入和本地反向边后，新节点即可
-通过正常图遍历被查询；Stage2 延续同一搜索上下文完成远端候选、最终剪枝、物理
-home 选择和最终反向边。计算节点不维护独立的更新 overlay，也不复制一份动态
-索引状态。动态查询采用 incarnation-tagged read-committed 语义：旧存储记录在
-durable watermark 后回收，复用时递增 incarnation 并最后发布新 header；系统不提供
-跨计算节点 snapshot-RCU。静态 generation 的重建与切换属于独立的离线/控制面过程。
+Persistent 查询热路径使用预分配资源，避免引入动态分配、stream/QP 创建或 CPU 同步导航。
+HostOrchestrated 独立维护 CPU 导航流程；两者均不做隐式后端回退。
+图、向量、ID authority 和 mutation 状态归存储节点，计算侧只持有查询状态与可验证缓存。
 
-路由状态与 ID authority 分离。每个物理分片从 `.centroid` checkpoint 恢复精确
-sum/count 和真实图入口，mutation 完成物理 membership 变更后由 `CentroidRouter`
-批量产生新的 immutable snapshot。存储节点再通过带 descriptor、magic/version、
-checksum 和 sequence bracket 的 variable-length publication 暴露该版本。计算节点
-从同一组 storage-canonical publication 构造 CPU physical-home selector，并通过
-control CTA 更新 GPU centroid route；查询只消费完整的 per-shard transaction。
-
-在线布局合成不读取 metadata 中的 medoid 或离线采样 entry-point，也不生成独立
-静态路由表。首份完整 centroid route 安装失败时查询引擎 fail-stop，
-不会退回另一套离线路由或 CPU 导航。
-
-## 变更约束
-
-- 不在查询热路径分配内存、创建 stream、创建 QP 或同步等待 CPU fallback；
-- 不新增 CPU 图导航或隐式传输回退；
-- 索引格式、centroid publication 和 RPC wire protocol 必须由显式 schema/version
-  保护；
-- 结构重构保持公开 ABI，并通过构建与性能测试确认跨实现单元边界；
-- 修改职责边界时同步更新单元测试与本文档。
+索引、centroid publication 和 RPC wire protocol 的布局由显式 schema/version 保护。
+结构调整应保留公开接口、序列化布局、排序和浮点语义；涉及查询热路径时核对 GPU 资源占用、
+召回率和端到端性能。执行协议见 [查询与动态更新](gpu_persistent_engine.md)。

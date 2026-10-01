@@ -625,7 +625,6 @@ InsertStats run_insert_phase(ComputeService& service,
           if (args.reset_breakdown_every > 0 &&
               before / args.reset_breakdown_every != after / args.reset_breakdown_every) {
             std::lock_guard<std::mutex> lock(reset_mutex);
-            service.clear_thread_statistics();
             service.reset_breakdown_state();
           }
         }
@@ -771,7 +770,6 @@ int run_with_service(ComputeService& service, const Args& args) {
                                  args.recall_queries, args.recall_k);
     root["baseline_recall"] = recall_json(*baseline_recall, args.query_file,
                                           args.baseline_groundtruth_file);
-    service.clear_thread_statistics();
     service.reset_breakdown_state();
   }
 
@@ -779,7 +777,6 @@ int run_with_service(ComputeService& service, const Args& args) {
             << ", " << (args.insert_start_id + effective_insert_count) << ")" << std::endl;
   const InsertStats insert_stats = run_insert_phase(service, insert_rows, args, effective_insert_count);
   root["insert"] = insert_stats_json(insert_stats);
-  service.clear_thread_statistics();
   service.reset_breakdown_state();
 
   if (insert_stats.failed != 0 || insert_stats.inserted != effective_insert_count) {

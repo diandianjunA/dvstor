@@ -223,5 +223,81 @@ int main() {
 
   // Stage2 is mandatory for the sole supported update pipeline.
   assert(default_config.storage_owner_maintenance_workers > 0);
+
+  // Both Phase-2 throughput controllers default to fully disabled.
+  assert(default_config.storage_owner_stage2_budget_backlog_low == 0);
+  assert(default_config.storage_owner_stage2_budget_backlog_high == 0);
+  assert(default_config.storage_owner_stage2_budget_max_expansions == 0);
+  assert(default_config.storage_owner_stage2_budget_max_candidate_visits == 0);
+  assert(default_config.storage_owner_flow_control_backlog_low == 0);
+  assert(default_config.storage_owner_flow_control_backlog_high == 0);
+  assert(default_config.storage_owner_flow_control_poll_ms == 5);
+  assert(default_config.storage_owner_flow_control_max_delay_us == 20'000);
+
+  const auto budgeted = make_config_with_extra({
+    "--storage-owner-stage2-budget-backlog-low", "1000",
+    "--storage-owner-stage2-budget-backlog-high", "8000",
+    "--storage-owner-stage2-budget-max-expansions", "8",
+    "--storage-owner-stage2-budget-max-candidate-visits", "512"});
+  assert(budgeted.storage_owner_stage2_budget_backlog_low == 1000);
+  assert(budgeted.storage_owner_stage2_budget_backlog_high == 8000);
+  assert(budgeted.storage_owner_stage2_budget_max_expansions == 8);
+  assert(budgeted.storage_owner_stage2_budget_max_candidate_visits == 512);
+
+  const auto flow_controlled = make_config_with_extra({
+    "--storage-owner-flow-control-backlog-low", "2000",
+    "--storage-owner-flow-control-backlog-high", "16000"});
+  assert(flow_controlled.storage_owner_flow_control_backlog_low == 2000);
+  assert(flow_controlled.storage_owner_flow_control_backlog_high == 16000);
+
+  expect_configuration_rejected([] {
+    (void)make_config_with_extra({
+      "--storage-owner-stage2-budget-backlog-low", "1000"});
+  });
+  expect_configuration_rejected([] {
+    (void)make_config_with_extra({
+      "--storage-owner-stage2-budget-backlog-low", "8000",
+      "--storage-owner-stage2-budget-backlog-high", "1000"});
+  });
+  expect_configuration_rejected([] {
+    (void)make_config_with_extra({
+      "--storage-owner-flow-control-backlog-high", "8000"});
+  });
+  expect_configuration_rejected([] {
+    (void)make_config_with_extra({
+      "--storage-owner-flow-control-backlog-low", "8000",
+      "--storage-owner-flow-control-backlog-high", "1000"});
+  });
+  expect_configuration_rejected([] {
+    (void)make_config_with_extra({
+      "--storage-owner-flow-control-backlog-low", "1000",
+      "--storage-owner-flow-control-backlog-high", "8000",
+      "--storage-owner-flow-control-poll-ms", "0"});
+  });
+
+  // Stability bounds for the OOM/retry hardening changes.
+  assert(default_config.storage_owner_stage2_max_retry_ms == 300'000);
+  assert(default_config.storage_owner_reverse_conflict_limit == 32);
+  assert(default_config.storage_owner_reverse_retry_backoff_max_us ==
+         100'000);
+  assert(default_config.storage_owner_exact_max_attempts == 0);
+
+  const auto stability_bounds = make_config_with_extra({
+    "--storage-owner-stage2-max-retry-ms", "60000",
+    "--storage-owner-reverse-conflict-limit", "4",
+    "--storage-owner-reverse-retry-backoff-max-us", "5000",
+    "--storage-owner-exact-max-attempts", "7"});
+  assert(stability_bounds.storage_owner_stage2_max_retry_ms == 60'000);
+  assert(stability_bounds.storage_owner_reverse_conflict_limit == 4);
+  assert(stability_bounds.storage_owner_reverse_retry_backoff_max_us == 5'000);
+  assert(stability_bounds.storage_owner_exact_max_attempts == 7);
+
+  // Zero is a legal explicit value: unbounded Stage2 retry window and
+  // unbounded synchronous-exact attempts.
+  const auto unbounded_retry = make_config_with_extra({
+    "--storage-owner-stage2-max-retry-ms", "0",
+    "--storage-owner-exact-max-attempts", "0"});
+  assert(unbounded_retry.storage_owner_stage2_max_retry_ms == 0);
+  assert(unbounded_retry.storage_owner_exact_max_attempts == 0);
   return 0;
 }

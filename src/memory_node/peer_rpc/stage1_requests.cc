@@ -585,6 +585,12 @@ MemoryNode::prepare_local_stage1_item(
     breakdown->storage_owner_allocate_node_ns +=
       elapsed_ns_since(allocate_started);
   }
+  if (target.is_null()) {
+    release_retryable_reservation();
+    record_physical_stage1(
+      candidates.size(), remote_frontier.size(), neighbors.size());
+    return result;
+  }
   const auto write_started = std::chrono::steady_clock::now();
   write_new_node_on_shard(
     target, item.id, span<const element_t>{components}, neighbors,

@@ -66,6 +66,11 @@ PersistentSearchEngine::read_maintenance_telemetry() {
   return impl_->read_maintenance_telemetry();
 }
 
+std::vector<MaintenanceWatermark>
+PersistentSearchEngine::read_maintenance_watermarks() {
+  return impl_->read_maintenance_watermarks();
+}
+
 TelemetrySnapshot PersistentSearchEngine::telemetry() const {
   TelemetrySnapshot result = telemetry_.snapshot();
   if (impl_ == nullptr || impl_->d_direct_owner_progress == nullptr ||

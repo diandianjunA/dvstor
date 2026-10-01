@@ -1,154 +1,61 @@
-# SPACEV100M Motivation 实验
+# SPACEV100M
 
-本目录接入 `/data/xjs/datasets/spacev1b/spacev100m`，提供当前系统三项
-Motivation 实验所需的数据准备、schema-16 索引构建、运行 profile 和节点启动脚本。
+使用 100,000,000 × 100 int8 向量，L2、PQ20（每个子空间 5 维）。公共实验流程见
+[实验说明](../README.md)，构图默认 R96、beam 128、METIS、5 shards。
+配置入口为 `spacev100m_common.sh`。
 
-已按数据文件头部固定以下契约：
+## 数据
 
-| 项目 | 配置 |
+默认数据目录为 `/data/xjs/datasets/spacev1b/spacev100m`，工作目录为
+`/data/xjs/index/dvstor_spacev100m`。
+
+| 文件 | 内容 |
 |---|---|
-| Base | `spacev100m_base.i8bin`，100,000,000 × 100 |
-| dtype / metric | `int8` / L2 |
-| Query | `query.i8bin`，29,316 × 100 |
-| Ground truth | `msspacev-gt-100M`，29,316 × top-100 |
-| 图 / 分片 | R=96，build beam=128，METIS，5 shards |
-| OPQ/PQ | PQ20（100 维可整除，每子空间 5 维） |
+| `spacev100m_base.i8bin` | 100M × 100 基础向量 |
+| `query.i8bin` | 29,316 × 100 官方查询 |
+| `msspacev-gt-100M` | 29,316 × top-100 ground truth |
+| `spacev100m_to_110m_query.i8bin` | 性能查询，原始 base 的 `[100M,110M)` |
+| `spacev110m_to_120m_insert.i8bin` | 插入，原始 base 的 `[110M,120M)` |
 
-## 1. 修改机器配置
-
-集中修改 `spacev100m_common.sh` 中的 `HOSTS`、`BASE_PORT`、`GPU_DEVICE`、
-`IB_DEVICE`，或用同名环境变量覆盖。默认使用 5 个逻辑分片和当前系统硬件资源
-参数。索引默认写到：
-
-```text
-/data/xjs/index/dvstor_spacev100m/index/
-```
-
-可用 `WORK_DIR` 或 `PQ_INDEX_PREFIX` 改到其他磁盘。计算节点与存储节点必须使用相同
-的 profile、索引前缀和分片数。
-
-## 2. 准备 benchmark 输入
-
-原始 query 的 `[0,10000)` 默认用于 recall query，并同步切出对应 top-100 GT。性能查询和插入默认使用从官方 SPACEV1B base 提取、且未进入 100M 索引的两段：
-
-- `[100000000,110000000)`：`spacev100m_to_110m_query.i8bin`；
-- `[110000000,120000000)`：`spacev110m_to_120m_insert.i8bin`。
+后两个文件需事先准备，也可通过 `PERFORMANCE_QUERY_FILE` 和 `INSERT_FILE` 指定。
+准备脚本校验原始 base/query/GT 的 header 与大小，将官方 query 的 `[0,10000)` 和对应
+GT 写入 `$WORK_DIR/prepared/`：
 
 ```bash
 ./experiment/spacev100m/prepare_spacev100m_data.sh
 ```
 
-输出默认位于 `/data/xjs/index/dvstor_spacev100m/prepared/`。脚本严格校验三个源文件
-的 header 与精确大小，重复运行会原子替换小型派生文件。
+脚本还生成其余官方 query 的小型 `performance_query.i8bin` 与 `insert.i8bin` 切片；主实验
+默认仍读取上表的两段 10M 文件，不会自动使用这些小切片。base 不复制。
 
-## 3. 构建
-
-所有构建并发默认使用 16、最多为 32：`BUILD_JOBS=16` 控制 CMake，`BUILD_THREADS=16`
-控制离线构图，`PQ_THREADS=16` 控制 OPQ/PQ 训练与编码。可以调低；设置为大于 32
-会直接报错。运行期的 `SERVICE_THREADS` 不属于构建线程。
-
-`build.sh` 支持 `BUILD_ROLE=auto|storage|offline|compute|all`。`auto` 会读取现有 CMake cache；
-若 `DVSTOR_STORAGE_NODE_ONLY=ON`，只构建存储服务和离线索引工具，不会请求 compute target。
-
-存储/离线索引节点（当前 `build` 会自动识别为此角色）：
+## 构建与运行
 
 ```bash
-./experiment/spacev100m/build.sh
-```
-
-计算节点必须使用单独的非 storage-only 构建目录：
-
-```bash
-cmake -S . -B build-compute -DCMAKE_BUILD_TYPE=Release \
-  -DDVSTOR_STORAGE_NODE_ONLY=OFF
+BUILD_DIR="$PWD/build-storage" BUILD_ROLE=storage ./experiment/spacev100m/build.sh
 BUILD_DIR="$PWD/build-compute" BUILD_ROLE=compute BUILD_INDEX=0 \
   ./experiment/spacev100m/build.sh
 ```
 
-如果存储工程已经编译，只构建索引：
+`build.sh` 会编译、准备派生输入，并按角色决定是否构建索引。已有二进制时可单独运行
+`build_spacev100m_index.sh`，支持 `VALIDATE_ONLY=1` 和断点续建。最终前缀默认为
+`$WORK_DIR/index/spacev100m_R96_bw128_metis_pmd32_pq20_schema16`，可用 `PQ_INDEX_PREFIX` 覆盖。
 
 ```bash
-./experiment/spacev100m/build_spacev100m_index.sh 04_gpu_persistent_gpunetio
+BUILD_DIR="$PWD/build-compute" ./experiment/spacev100m/run_motivation.sh all
 ```
 
-脚本会自动识别并续跑三个提交阶段：schema-15 graph、schema-16 PQ 和 extent。PQ 或 extent 失败后直接重跑同一命令，不会删除或重建已完成的 graph；完整索引会直接校验后退出。
+也可将 `all` 换成 `program1`、`program2`、`program3`，或直接调用各 program 的
+`run_programN.sh`。参数、存储启动与结果复用见 [共享流程](../README.md#运行与恢复)。
 
-`OVERWRITE_INDEX=1` 不再删除 graph。只有明确需要从零重建时才使用 `REBUILD_GRAPH=1`；仅重做 PQ 或 extent 可分别使用 `REBUILD_PQ=1`、`REBUILD_EXTENT=1`。每次正式构建前还会运行 LocalIdSet/beam-search 回归、数据头、分片参数、磁盘和内存预检。仅编译程序和准备输入、不构建昂贵索引时使用
-`BUILD_INDEX=0 ./experiment/spacev100m/build.sh`。
+## 已有 balanced 索引转 METIS
 
-## 4. 将已有 balanced 索引转换为 METIS
-
-本目录的配置和脚本只依赖 SPACEV100M 自己的文件：
-`repartition_to_metis.env` 与 `repartition_to_metis.sh`。转换器保留原 Vamana
-逻辑邻接关系，只重新计算物理 placement；因此会重新生成 shard、idmap、每个物理分片的
-centroid、PQ codes 和 graph extent。OPQ/PQ 模型与向量 ID 不依赖物理分片，可以复用，
-转换器会校验 checksum 后复制模型。
-
-不要并行转换 SPACEV100M 和 Deep100M；两个 100M METIS 任务都需要较大的峰值内存。
-推荐在 `tmux` 中运行。若要在完整校验通过后删除 balanced 版本：
+先检查 `repartition_to_metis.env` 的源/目标前缀，再执行：
 
 ```bash
-DELETE_BALANCED_AFTER_SUCCESS=1 \
-  ./experiment/spacev100m/repartition_to_metis.sh
+./experiment/spacev100m/repartition_to_metis.sh
 ```
 
-也可先保留源索引（默认），确认实验启动正常后用相同命令设置
-`DELETE_BALANCED_AFTER_SUCCESS=1` 重跑；已完成的 METIS 目标会被完整校验而不会重算。
-脚本仅精确删除 `SOURCE_INDEX_PREFIX` 的已知索引产物，不删除 base 数据集。转换中断时直接
-重跑同一命令：schema-15 后从 PQ 继续，schema-16 后只补 extent，未提交的目标文件会安全清理。
-目标默认是：
-
-```text
-/data/xjs/index/dvstor_spacev100m/index/spacev100m_R96_bw128_metis_pmd32_pq20_schema16
-```
-
-## 5. 运行 Motivation
-
-三项入口均为本目录内的独立实现：
-
-```bash
-./experiment/spacev100m/program1/run_program1.sh
-./experiment/spacev100m/program2/run_program2.sh
-./experiment/spacev100m/program3/run_program3.sh
-```
-
-也可以使用统一入口：
-
-```bash
-./experiment/spacev100m/run_motivation.sh program1
-./experiment/spacev100m/run_motivation.sh program2
-./experiment/spacev100m/run_motivation.sh program3
-# 顺序运行三项（每个 case 仍会等待存储节点就绪）
-./experiment/spacev100m/run_motivation.sh all
-```
-
-计算侧脚本会在每个 case 前打印对应的存储侧命令。例如方案三某个宽度应在存储节点运行：
-
-```bash
-GPU_COMMIT_WIDTH=16 ./experiment/spacev100m/program3/start_storage_case.sh early
-```
-
-可用各 program 的 `start_storage_case.sh status` / `stop` 查看或停止存储进程。结果分别
-写入 `program1/results`、`program2/results`、`program3/results`。
-
-底层单次 benchmark 入口也可直接使用：
-
-```bash
-WORKLOAD=query ./experiment/spacev100m/run_breakdown.sh 04_gpu_persistent_gpunetio
-```
-
-## 6. 常用覆盖项
-
-```bash
-# 更换构建目录或索引位置
-BUILD_DIR=/path/to/build PQ_INDEX_PREFIX=/path/to/index_prefix \
-  ./experiment/spacev100m/build_spacev100m_index.sh
-
-# 调整节点地址和 RDMA 设备（计算/存储两侧保持一致）
-HOSTS="host1 host2 host3 host4 host5" IB_DEVICE=mlx5_0 \
-  ./experiment/spacev100m/program2/start_storage_case.sh live
-```
-
-正式对比应保持 baseline/full 的下层 GPU、RDMA 和 storage capacity 参数一致；两个
-profile 只切换贡献级 mode。运行前脚本会校验 metadata 的 schema、dtype、维度、分片、
-PQ 模型、extent sidecar 和各 storage artifact。
+转换保留逻辑图和向量 ID，重建物理 shard、idmap、centroid、PQ codes 与 extent，校验后
+复用 OPQ/PQ 模型。中断后重跑会复用已提交阶段，默认保留源索引。只有明确需要在成功后
+删除旧版本时才设置 `DELETE_BALANCED_AFTER_SUCCESS=1`；删除范围限于旧前缀索引产物。
+两个 100M METIS 转换应串行运行，避免 SPACEV 与 Deep 同时占用峰值内存。

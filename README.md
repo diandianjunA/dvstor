@@ -1,230 +1,102 @@
 # DVSTOR
 
-DVSTOR 是面向动态向量检索的存算分离系统。`main` 内的 baseline 与 full 使用同一份
-schema-16 索引和相同的图、PQ、路由、动态 header 与精确向量表示，但由贡献级 mode
-选择不同的查询执行 owner。baseline 的 HostOrchestrated 后端由 CPU 维护 Beam/visited、
-post/poll one-sided RDMA，并按严格波次调用有限生命周期 CUDA PQ/精确距离 kernel；它
-不启动 persistent query kernel，也不使用 GPUNetIO query transport。full 的 Persistent
-后端由 GPU 常驻 OPQ/PQ32 导航码和查询状态，通过 DOCA GPUNetIO 直接读取存储节点数据，
-并执行 ahead-of-commit 流水推进。两者切换的是搜索执行机制，不是索引结构。
+DVSTOR 是面向动态向量检索的存算分离系统。存储节点维护 Vamana 图、精确向量和更新状态，
+计算节点通过 RDMA 访问索引，使用 OPQ/PQ 导航和原始向量 L2 精排。
 
-## Full 查询路径
+项目包含两种查询引擎，共用 schema-16 索引：
 
-1. CPU 将请求写入有界提交队列，并按微批分配 GPU 查询槽。
-2. 持久化 GPU block 完成 OPQ 变换并构建 PQ 查找表。
-3. GPU 读取由最新完整 centroid publication 安装的版本化分片路由，按分片中心
-   排序，并只从最近的一个物理分片选择实时存活入口初始化 beam；后续跨分片工作
-   只能由真实图边触发。
-4. GPU 通过 GPUNetIO 并发直接拉取远端 2048 字节以内的紧凑图记录；路由入口
-   只保存指针和代际，静态节点使用常驻 base PQ code，动态节点的权威 PQ code
-   随记录按需读取，不常驻计算侧动态索引副本。
-5. GPU 使用对应 PQ code 对邻居做近似距离计算并更新 beam。
-6. GPU 仅为最终候选拉取精确向量，计算 L2 距离并返回 top-k。
+| 查询推进模式 | 引擎 | 执行方式 |
+|---|---|---|
+| `coupled` | HostOrchestrated | CPU 维护 beam/visited、提交和轮询 RDMA，有限生命周期 CUDA kernel 计算距离 |
+| `decoupled` | Persistent | GPU 常驻查询状态，通过 DOCA GPUNetIO 读取远端记录，并提前发起下一轮图读取 |
+| `manual` | Persistent | 用于单独控制提前读取、批量宽度等实验参数 |
 
-## 动态更新
+正式 baseline/full profile 分别使用前两种模式；动机和消融脚本会覆盖部分模式，具体见
+[实验说明](experiment/README.md)。HostOrchestrated 是显式选择的后端，运行失败不会触发引擎切换。
 
-存储节点继续拥有 insert、upsert 和 delete 的图维护协议；其中完整系统的
-`decoupled` 模式支持三者，严格单-owner baseline 的 `coupled` 模式只接受
-append-only fresh insert，并在任何 authority/物理副作用前明确拒绝 upsert/delete：
+## 构建
 
-- storage owner 负责 idmap、代际、紧凑图记录和反向边维护；
-- Stage1 在物理 home 写入节点、出边和本地反向边，使新节点立即进入权威图；
-- 查询直接遍历该权威动态图，动态 PQ code、精确向量、tombstone 和 generation
-  都从存储记录读取，不经过计算节点广播或二次发布；
-- Stage2 延续 Stage1 搜索上下文，仅补充远端候选，完成统一剪枝、最终物理
-  placement 和最终反向边；
-- 质心路由由存储节点低频发布完整事务，GPU control CTA 只安装路由状态，不编码
-  或缓存 mutation 数据；
-- 动态查询采用 incarnation-tagged read-committed 语义：durable watermark
-  允许旧地址复用，递增 incarnation 和 header-last 发布使旧指针无法命中新对象；
-  系统不提供跨计算节点 snapshot-RCU，也不维护固定客户端 ACK 数组。
+需要 CMake 3.18+、支持 C++20 的编译器（GCC 11+）、AVX2 CPU、RDMA verbs、Boost 和 TBB。
+计算节点还需要 CUDA 11.8+ 和 DOCA GPUNetIO，DOCA 默认安装路径为 `/opt/mellanox/doca`。
+离线工具需要 CPU Faiss、BLAS、LAPACK 和 OpenMP，METIS 为可选分片依赖。
 
-ID 的逻辑 authority 与向量的物理 home 是两件事。基础和动态 ID 的 authority 都由
-确定性的 `ID % N` 选择，负责串行化代际和目录更新；该存储节点自己的 idmap 保存
-真实物理 placement。计算节点从 storage-canonical centroid 快照中选择 Stage1 的
-物理 home，再由 authority 在本地执行或转发。这样任意数量的计算节点都无需复制
-全量 ID 目录，也不会产生分裂的 ID 所有权，物理放置仍可随数据分布动态变化。
-逻辑 ID 必须位于配置的 `[0, max-vectors)` 命名空间；计算和存储两侧都在创建事务
-状态前校验该边界，使 generation/tombstone 目录的最坏空间由声明容量而非请求历史决定。
-
-每个物理存储分片维护一个 `CentroidRouter`：成员变化以补偿式 FP64 sum/count 更新
-中心，并保留 1--4 个由调用方确认仍然存活的真实图入口。离线 `.centroid` sidecar
-提供启动时的精确状态；维护线程把一批 mutation 作为新的不可变版本发布，再通过
-RDMA 可读的 variable-length centroid publication 公布
-`{version, count, centroid, live entries}`。计算节点用 sequence/checksum 校验完整
-publication，并把同一份版本化 FP32 centroid 同时安装到 CPU home selector 和 GPU
-路由表；两者采用相同的 FP32 FMA 累加和分片 tie-break，而 FP64 sum/count 仅留在
-存储侧用于稳定维护。
-查询没有离线静态入口兜底：首份完整 centroid 快照安装成功后才开放准入。
-
-唯一支持的两阶段插入语义为：
-
-1. 计算节点先把向量编码为索引的 canonical dtype，并从已完整安装的
-   storage-canonical centroid 快照选择物理 home；authority 验证 ID/代际、该 home
-   和当前 placement；所选物理 home 从自身当前 centroid
-   live entries 执行完整的宽度 `L` 本地搜索，写入 provisional 出边，并在单独的
-   provisional 邻接区安装最多两个、按 tagged 动态槽位轮转的本地可达桥（至少一个
-   ACK 才提交 Stage1）；普通查询同时遍历 stable/provisional 邻接，因而 Stage1
-   ACK 后即可发现新节点，而热点容量不会随出度 `R` 倍增消耗。
-2. Stage2 仍在该物理 home 上从 Stage1 保存的 beam、visited 和 remote frontier
-   继续搜索，不重启逐分片搜索；只有沿图边跨分片时才通过 one-sided RDMA 拉取远端
-   记录，并继续使用原始 dtype 的精确距离。收敛后统一执行一次 alpha RobustPrune，
-   选择使最终跨分片边最少的物理 placement（只有严格改善才迁移），再以 ID/generation
-   幂等协调最终反向边：先把一个临时可达桥原子提升为 `R` 有界的 stable 边，再发布
-   其余普通反向边，最后清除全部 Stage1 protected 临时边；随后更新新旧 centroid
-   membership 并推进 durable watermark。
-
-maintenance 日志直接记录这条机制的工作量与收益：Stage2 continuation 的 remote
-frontier、实际远端展开和评分记录数，初选 home 命中率、迁移数，以及迁移前后的
-跨分片边数；Stage1/Stage2 搜索预算耗尽次数也单独报告，任何有界工作量造成的
-质量风险都不会被吞掉。benchmark 按测量窗口对累积计数器做差，因此可在不同数据集、dtype、
-并发度和更新率下同时检验实时开销与长期局部性，而不是依赖短时采样。
-
-## 索引文件
-
-运行索引固定为 schema 16、L2、`plain` vector record、tagged compact graph、持久化
-storage control block 和 OPQ/PQ 导航。默认 profile 使用 32 个 8-bit 子空间。
-`fixed` 图读取路径运行时不消费 extent class；`live-extent` 路径读取一个
-1 byte/base-node 的只读长度 sidecar，不保存邻接表。正式 baseline/full
-为确保物理索引完全相同，两者启动时都校验该 sidecar。
-
-| 文件                              | 计算节点             | 存储节点 X | 作用                     |
-| ------------------------------- | ---------------- | ------ | ---------------------- |
-| `<prefix>.meta.json`            | 必需               | 必需     | 分片、远端 offset 和格式契约     |
-| `<prefix>.pq32`                 | 必需               | 不需要    | OPQ 矩阵与 PQ codebook    |
-| `<prefix>.gextent8`             | 正式 baseline/full 必需 | 不需要    | 每个 base node 的 8-edge 读取长度档 |
-| `<prefix>_nodeX_ofN.dat`        | 不需要              | 必需     | 精确向量、固定记录和紧凑图          |
-| `<prefix>_nodeX_ofN.idmap`      | 不需要              | 必需     | 与构建/owner 强绑定的 ID/代际/物理目录 |
-| `<prefix>_nodeX_ofN.centroid`   | 不需要              | 必需     | 物理分片 FP64 sum/count 与启动入口  |
-| `<prefix>_nodeX_ofN.pq32.codes` | 不需要              | 必需     | 启动时注册到远端内存的 PQ32 码流    |
-
-计算节点本地保存 metadata、PQ 模型和正式 profile 共用的
-`.gextent8`。该 sidecar 对 SIFT100M 为约 100 MB，只含全局物理 ordinal 对应的
-长度档和与索引绑定的校验头，不包含 handle、边或向量。metadata 只合成并校验不可变分片布局，
-不读取 medoid 或离线采样 entry-point。METIS 只决定物理 placement；逻辑 authority
-始终可由 ID 推导，因此查询和更新模式的计算节点都不加载 `.idmap`。计算节点不会
-保存 `.gpu.idx`、图分片、精确向量、ID 目录或全量导航码。
-
-每个 PQ code sidecar 的 header 同时绑定向量 dtype、整次索引构建指纹和物理分片
-指纹；存储节点会与 metadata 以及分片文件中的指纹交叉校验，拒绝同尺寸的跨数据集
-或跨分片码流。PQ32 每个向量占 32 字节：SIFT100M 为 3.2 GB，SIFT1B 为 32 GB
-（约 29.8 GiB）。计算 GPU 只为每个分片常驻中心和最多 4 个实时入口，不保存
-计算侧 mutable overlay、基础图记录或精确向量；稳态查询通过
-GPUNetIO/RDMA 按需直接读取它们。
-
-Live-Extent 的格式、fallback、telemetry 和 A/B 方法见
-[`docs/live_extent_rdma.md`](docs/live_extent_rdma.md)。
-
-每个 owner idmap 使用 `owner_sharded_v2_bound`：header 同时绑定整次构建指纹、
-owner 对应的分片指纹、owner/shard 数量、tagged `RemotePtr` 布局以及 payload/header
-checksum。存储节点逐块流式校验精确文件长度、`ID % N`、静态记录范围和重复 ID；
-旧的 owner-sharded v1 不会被兼容加载。基础目录在内存中使用紧凑的
-`ID -> RemotePtr` 表；generation=0 等不可变状态在查找时物化，只有参与动态更新的
-ID 才进入完整事务状态 overlay，因此基础规模不会乘上 mutation receipt 的体积。
-
-## 依赖与构建
-
-计算节点需要 C++20、CUDA、RDMA verbs、DOCA GPUNetIO、Boost、TBB、OpenMP
-和 Faiss；离线 METIS 分片可选。默认 DOCA 路径为 `/opt/mellanox/doca`。
+计算节点构建：
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake -S . -B build-compute -DCMAKE_BUILD_TYPE=Release
+cmake --build build-compute -j16
 ```
 
-主要目标：
-
-- `dvstor_compute_node`：GPU 查询与更新客户端；
-- `dvstor_memory_node`：存储节点；
-- `dvstor_breakdown_benchmark`：吞吐、延迟、召回率和分解统计；
-- `vamana_offline_builder`：在 CPU 上构建 compact Vamana 图，并执行
-  `balanced`、`bfs` 或可选的 `metis` 分片；
-- `vamana_pq_indexer`：训练 OPQ/PQ 并生成分片码流。
-- `vamana_graph_extent_indexer`：校验完整 schema-16 图分片，并生成
-  one-shot Live-Extent RDMA 所需的只读长度档 sidecar。
-
-无 GPU 的存储节点可同时构建存储服务和 CPU 离线索引工具：
+无 GPU 的存储/索引构建节点：
 
 ```bash
-cmake -S . -B build-storage \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DDVSTOR_STORAGE_NODE_ONLY=ON \
-  -DCMAKE_CXX_COMPILER=/usr/bin/g++-11
-cmake --build build-storage -j --target \
-  dvstor_memory_node vamana_offline_builder vamana_pq_indexer \
-  vamana_graph_extent_indexer vamana_legacy_index_converter
+cmake -S . -B build-storage -DCMAKE_BUILD_TYPE=Release \
+  -DDVSTOR_STORAGE_NODE_ONLY=ON
+cmake --build build-storage -j16
 ```
 
-存储服务本身只依赖 CPU、RDMA、Boost 和 TBB。离线工具使用 CPU Faiss、BLAS、
-LAPACK、OpenMP 和可选 METIS，但不依赖 CUDA 或 DOCA。CMake 直接链接
-`libfaiss` CPU 库，不加载可能包含 `faiss_gpu_objs` 的 Faiss CMake 导出。
-动态更新运行时使用标准 C++20 coroutine 和 `atomic_ref`，因此要求 GCC 11+
-或等价的现代 Clang。若节点只运行存储服务，可增加
-`-DDVSTOR_BUILD_OFFLINE_TOOLS=OFF`。
+仅运行存储服务时，可再设置 `-DDVSTOR_BUILD_OFFLINE_TOOLS=OFF`，无需安装 Faiss、CUDA 或 DOCA。
+计算和存储构建使用各自的目录；实验脚本通过 `BUILD_DIR`、`STORAGE_BUILD_DIR` 选择对应产物。
 
-`DVSTOR_METIS_PARTITION=AUTO` 会先验证 METIS/GKlib 能否
-在本机真实链接；若仓库内预编译库与本机 glibc 不兼容，会先回退到系统 CPU
-METIS，没有兼容版本时才保留 `balanced/bfs` 并禁用 `metis`。需要强制 METIS
-时，安装本机 CPU 版本并设置
-`-DDVSTOR_METIS_ROOT=/path/to/metis -DDVSTOR_METIS_PARTITION=ON`。
+`DVSTOR_METIS_PARTITION=AUTO` 会检查 METIS/GKlib 的实际链接兼容性，并尝试回退到系统库。
+需要 METIS 时设置 `-DDVSTOR_METIS_PARTITION=ON`；自定义安装路径使用
+`-DDVSTOR_METIS_ROOT=/path/to/metis`。没有兼容 METIS 时仍可使用 `balanced` 或 `bfs` 分片。
 
-新建索引的分片由 `vamana_offline_builder --partition-strategy ...` 完成，不需要
-GPU，也不需要额外重分片可执行文件。
+| 可执行文件 | 用途 |
+|---|---|
+| `dvstor_compute_node` | 计算服务与更新客户端 |
+| `dvstor_memory_node` | 存储服务 |
+| `dvstor_breakdown_benchmark` | 查询/更新负载、吞吐、延迟、召回率与分解统计 |
+| `vamana_offline_builder` | CPU 构图和物理分片 |
+| `vamana_pq_indexer` | OPQ/PQ 训练、编码和 schema-16 产物生成 |
+| `vamana_graph_extent_indexer` | 校验图分片并生成读取长度 sidecar |
+| `vamana_metis_repartitioner` | 保留逻辑图，将现有索引重新做 METIS 物理分片 |
+| `vamana_legacy_index_converter` | 将支持的 schema-15 旧索引转换为 schema 16 |
 
-## 生成索引
+## 索引与部署
 
-完整构建：
+运行索引使用 schema 16、L2、`plain` 精确向量记录和 incarnation-tagged 紧凑图。
+`M` 表示 PQ 子空间数：SIFT100M、Deep100M 使用 32，SPACEV100M 使用 20。
+
+| 文件 | 计算节点 | 存储节点 X | 内容 |
+|---|---|---|---|
+| `<prefix>.meta.json` | 必需 | 必需 | 格式、分片、远端 offset 和构建指纹 |
+| `<prefix>.pqM` | 必需 | 无需 | OPQ 矩阵和 PQ codebook |
+| `<prefix>.gextent8` | 正式 profile 必需 | 无需 | 每个基础节点一个字节的图读取长度档 |
+| `<prefix>_nodeX_ofN.dat` | 无需 | 必需 | 精确向量和图记录 |
+| `<prefix>_nodeX_ofN.idmap` | 无需 | 必需 | 该 authority 的 ID、代际和物理目录 |
+| `<prefix>_nodeX_ofN.centroid` | 无需 | 必需 | 物理分片中心状态与启动入口 |
+| `<prefix>_nodeX_ofN.pqM.codes` | 无需 | 必需 | 注册到远端内存的基础 PQ 码流 |
+
+`pqM` 是文件名示意，例如 `.pq32` 或 `.pq20`。metadata、分片和 sidecar 必须来自同一次构建，
+启动时会校验格式、尺寸、指纹和 checksum。计算 GPU 从存储节点导入基础 PQ 码流；图、
+精确向量和 ID 目录保留在存储侧。Persistent 按物理槽位和 incarnation 在 GPU 中缓存动态
+PQ 数据；HostOrchestrated 每次读取动态 PQ 到主机 scratch，再复制到对应 CUDA lane。
+权威状态均由存储节点持有。
+
+首次运行先按数据集说明准备数据和索引，再启动实验入口。以 SIFT100M 为例：
 
 ```bash
-./experiment/sift100m/build_sift100m_index.sh 04_gpu_persistent_gpunetio
+BUILD_DIR="$PWD/build-storage" ./experiment/sift100m/build_sift100m_index.sh
+BUILD_DIR="$PWD/build-compute" ./experiment/sift100m/program1/run_program1.sh
 ```
 
-该命令先产出 schema-15 tagged graph 中间态及每个物理分片的精确 `.centroid`
-sidecar，再由 PQ indexer 原子升级并产出最终 schema-16 分片契约、owner idmap、
-OPQ/PQ32 模型和每分片 PQ32 码流，最后全量校验图记录并生成 `.gextent8`，
-不需要再运行重编码脚本。默认目标已存在时脚本会在昂贵构建前
-拒绝覆盖；建议通过 `PQ_INDEX_PREFIX=/new/prefix` 构建新版本，确认需要原地重建时
-才设置 `OVERWRITE_INDEX=1`。
+实验脚本在每个 case 前打印存储节点命令并等待就绪。数据路径、节点地址和运行参数需按机器
+配置，详见 [SIFT100M](experiment/sift100m/README.md)、[Deep100M](experiment/deep100m/README.md)
+和 [SPACEV100M](experiment/spacev100m/README.md)。三者均提供 Program 1–3；SIFT 另有累积消融，
+跨数据集混合负载见 [mixed_test](experiment/mixed_test/README.md)。
 
-若已有完整、静态的 schema-15 `vamana_compact_v1` 分片，可用
-`vamana_legacy_index_converter` 保留原图与 METIS placement 并流式升级，无需重新
-构图或训练 PQ；具体参数可通过 `./build/vamana_legacy_index_converter --help` 查看。
-
-## 运行论文实验
-
-SIFT100M 实验代码位于 `experiment/sift100m/`，不再维护平行的 `motivation/`
-目录。该数据集只保留三个动机实验和一套累积消融实验：
+## 验证与开发
 
 ```bash
-./experiment/sift100m/program1/run_program1.sh
-./experiment/sift100m/program2/run_program2.sh
-./experiment/sift100m/program3/run_program3.sh
-./experiment/sift100m/ablation/run_ablation.sh
+ctest --test-dir build-storage --output-on-failure
+ctest --test-dir build-compute --output-on-failure
 ```
 
-四套入口共享同一份 SIFT100M schema-16 索引、profile、benchmark driver 和存储
-节点启动脚本。每个入口都会打印与当前 case 精确匹配的存储节点命令，并将结果写入
-自身的 `results/`。完整目录说明见
-[`experiment/sift100m/README.md`](experiment/sift100m/README.md)。
+本地测试覆盖格式、PQ、路由、更新协议、内存预算与查询策略。吞吐、召回率和 GPU/RDMA
+运行情况需要在实际存储节点和计算节点上验证，测试通过不能代替硬件实验。
 
-## 验证
-
-```bash
-ctest --test-dir build --output-on-failure
-bash -n experiment/sift100m/*.sh experiment/sift100m/*/*.sh \
-  experiment/sift100m/profiles/*.env
-```
-
-`gpu_memory_budget_test` 覆盖 SIFT100M/SIFT1B 预算；格式、PQ、centroid 路由和
-提交环均有独立测试。硬件吞吐和召回率仍需在真实存储节点启动后通过 profile
-进行验证。
-
-## 代码结构
-
-- `src/gpu_search/`：PQ 模型、索引布局、持久化引擎与 CUDA kernel；
-- `src/gpu/`：DOCA GPUNetIO 传输和探针；
-- `src/memory_node/`：分片加载、更新、维护与 storage peer RPC；
-- `src/service/`：计算服务、索引契约和统计；
-- `src/vamana/`：compact graph、CentroidRouter、centroid state 和 idmap 格式；
-- `tools/vamana_offline/`：离线构图与 PQ sidecar 生成；
-- `experiment/{sift100m,deep100m,spacev100m}/`：按数据集组织论文实验；当前完整实现位于 `sift100m/`。
+- [源码结构](docs/source_layout.md)：模块职责和修改边界。
+- [查询与动态更新](docs/gpu_persistent_engine.md)：执行流程、路由、一致性和故障处理。
+- [Live-Extent RDMA](docs/live_extent_rdma.md)：读取长度、回退和统计口径。
+- [实验说明](experiment/README.md)：数据准备、Program 1–3 和结果复用。

@@ -203,8 +203,6 @@ size_t ComputeService::submit_storage_owner_mutations(
       (static_cast<u64>(task.operation_generation) << 32) | task_id;
     lib_assert(task.operation_id != 0,
                "storage-owner operation id wrapped to zero");
-    task.enqueued_at = std::chrono::steady_clock::now();
-    task.sender_dequeued_at = {};
     state.queue->push_wait(task_id);
     state.published_tasks.fetch_add(1, std::memory_order_release);
     // Queue publication precedes the release-store. A sender that observes no

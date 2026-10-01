@@ -13,6 +13,14 @@
 
 namespace gpu_search {
 
+// One storage shard's Stage2 maintenance watermarks as published in its
+// registered StorageControlBlock. next_sequence is the next sequence the
+// shard will assign; durable_sequence is its contiguous finalized watermark.
+struct MaintenanceWatermark {
+  u64 next_sequence{1};
+  u64 durable_sequence{0};
+};
+
 // Query execution and storage-control observation share one service-facing
 // contract.  The persistent GPU implementation and the CPU-orchestrated
 // baseline deliberately differ below this boundary while consuming the same
@@ -41,6 +49,10 @@ public:
     std::vector<u64>* effective_target_sequences = nullptr) = 0;
   virtual std::vector<std::optional<maintenance_telemetry::Snapshot>>
     read_maintenance_telemetry() = 0;
+  // Point-in-time per-shard Stage2 watermarks for the compute-side sender
+  // flow controller. Unlike the telemetry snapshot this is read straight from
+  // each storage control block, so it is fresh enough for millisecond pacing.
+  virtual std::vector<MaintenanceWatermark> read_maintenance_watermarks() = 0;
 
   virtual TelemetrySnapshot telemetry() const = 0;
   virtual void reset_telemetry() = 0;

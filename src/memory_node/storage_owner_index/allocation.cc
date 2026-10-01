@@ -1,4 +1,5 @@
 #include "memory_node/storage_owner_index/detail.hh"
+#include "memory_node/storage_owner_index/dynamic_allocation_policy.hh"
 
 #include <cstring>
 #include <filesystem>
@@ -107,11 +108,11 @@ RemotePtr MemoryNode::allocate_local_node() {
   auto* free_ptr = reinterpret_cast<u64*>(index_buffer_.get_full_buffer());
   std::atomic_ref<u64> alloc_ref(*free_ptr);
   const u64 offset = alloc_ref.fetch_add(node_size, std::memory_order_acq_rel);
-  const u64 allocation_limit = dynamic_allocation_limit_ == 0
-    ? mn_memory_bytes_ : dynamic_allocation_limit_;
-  lib_assert(offset <= allocation_limit &&
-               node_size <= allocation_limit - offset,
-             "storage node dynamic region is out of memory");
+  const u64 allocation_limit = resolve_dynamic_allocation_limit(
+    dynamic_allocation_limit_, mn_memory_bytes_);
+  if (!dynamic_slot_allocation_fits(offset, node_size, allocation_limit)) {
+    return RemotePtr{};
+  }
   std::atomic_ref<u64> high_watermark(control->dynamic_high_watermark);
   u64 observed = high_watermark.load(std::memory_order_relaxed);
   while (observed < offset + node_size &&
@@ -130,10 +131,10 @@ void MemoryNode::retire_local_dynamic_node(RemotePtr pointer,
   const u64 node_size = dynamic_node_allocation_stride();
   lib_assert((pointer.byte_offset() - gpu_dynamic_node_base_) % node_size == 0,
              "cannot retire a misaligned storage-owner dynamic node");
-  const u64 allocation_limit = dynamic_allocation_limit_ == 0
-    ? mn_memory_bytes_ : dynamic_allocation_limit_;
-  lib_assert(pointer.byte_offset() <= allocation_limit &&
-               node_size <= allocation_limit - pointer.byte_offset(),
+  const u64 allocation_limit = resolve_dynamic_allocation_limit(
+    dynamic_allocation_limit_, mn_memory_bytes_);
+  lib_assert(dynamic_slot_allocation_fits(
+               pointer.byte_offset(), node_size, allocation_limit),
              "cannot retire a dynamic node outside the allocation region");
   const byte_t* node = index_buffer_.get_full_buffer() + pointer.byte_offset();
   const u64 header = std::atomic_ref<const u64>(
@@ -174,10 +175,10 @@ void MemoryNode::retire_local_dynamic_node_ready(RemotePtr pointer) {
   const u64 node_size = dynamic_node_allocation_stride();
   lib_assert((pointer.byte_offset() - gpu_dynamic_node_base_) % node_size == 0,
              "cannot retire a misaligned exact-update dynamic node");
-  const u64 allocation_limit = dynamic_allocation_limit_ == 0
-    ? mn_memory_bytes_ : dynamic_allocation_limit_;
-  lib_assert(pointer.byte_offset() <= allocation_limit &&
-               node_size <= allocation_limit - pointer.byte_offset(),
+  const u64 allocation_limit = resolve_dynamic_allocation_limit(
+    dynamic_allocation_limit_, mn_memory_bytes_);
+  lib_assert(dynamic_slot_allocation_fits(
+               pointer.byte_offset(), node_size, allocation_limit),
              "cannot retire an exact-update node outside the allocation region");
   const byte_t* node = index_buffer_.get_full_buffer() + pointer.byte_offset();
   const u64 header = std::atomic_ref<const u64>(

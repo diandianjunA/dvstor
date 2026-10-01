@@ -123,6 +123,7 @@ struct HostOrchestratedSearchEngine::Impl {
                             std::vector<u64>* effective_target_sequences);
   std::vector<std::optional<maintenance_telemetry::Snapshot>>
   read_maintenance_telemetry();
+  std::vector<MaintenanceWatermark> read_maintenance_watermarks();
 
   LaneGuard acquire_lane(bool account_query_wait = false);
   void release_lane(u32 lane);

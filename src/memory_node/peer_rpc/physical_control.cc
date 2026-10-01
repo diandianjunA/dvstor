@@ -640,19 +640,17 @@ bool MemoryNode::apply_local_dynamic_node_control_items(
             break;
           }
 
-          try {
-            output.node_raw = allocate_local_node().raw_address;
-            output.status = static_cast<u32>(
-              protocol::DynamicNodeControlStatus::ok);
-          } catch (...) {
-            // allocate_local_node() currently either returns a fully reserved
-            // slot or terminates on capacity exhaustion. Keep the receipt
-            // exception-safe if that implementation later gains a throwing
-            // pre-reservation path.
+          const RemotePtr allocated_slot = allocate_local_node();
+          if (allocated_slot.is_null()) {
             lib_assert(dynamic_allocation_receipts_.cancel_claim(item),
-                       "dynamic allocation exception lost its claim");
-            throw;
+                       "dynamic allocation exhaustion lost its claim");
+            output.status = static_cast<u32>(
+              protocol::DynamicNodeControlStatus::failed);
+            break;
           }
+          output.node_raw = allocated_slot.raw_address;
+          output.status = static_cast<u32>(
+            protocol::DynamicNodeControlStatus::ok);
           // Once a slot exists, losing its receipt would make safe replay and
           // reclamation impossible. publish() cannot legitimately fail: a
           // settlement observes an unready claim as pending and never erases

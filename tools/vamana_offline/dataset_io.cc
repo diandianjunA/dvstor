@@ -25,11 +25,6 @@ u32 read_u32(std::ifstream& input) {
   return value;
 }
 
-float l2_float_query_to_raw(const float* query, const byte_t* rhs, VectorDType dtype, u32 dim) {
-  return typed_l2_distance_float_query(
-    span<const f32>{query, dim}, rhs, dtype, dim);
-}
-
 }  // namespace
 
 filepath_t resolve_dataset_file(const filepath_t& input_path) {
@@ -147,19 +142,17 @@ Dataset read_dataset(const VamanaBuildConfig& config) {
   return dataset;
 }
 
-float dataset_l2_distance(const Dataset& dataset, size_t lhs, size_t rhs) {
+float dataset_distance(const Dataset& dataset, size_t lhs, size_t rhs) {
   const byte_t* a = dataset.raw_vector(lhs);
   const byte_t* b = dataset.raw_vector(rhs);
   return typed_l2_distance(
     a, dataset.dtype, b, dataset.dtype, dataset.dim);
 }
 
-float dataset_distance(const Dataset& dataset, size_t lhs, size_t rhs) {
-  return dataset_l2_distance(dataset, lhs, rhs);
-}
-
 float dataset_distance_float_query(const Dataset& dataset, const float* query, size_t rhs) {
-  return l2_float_query_to_raw(query, dataset.raw_vector(rhs), dataset.dtype, dataset.dim);
+  return typed_l2_distance_float_query(
+    span<const f32>{query, dataset.dim}, dataset.raw_vector(rhs),
+    dataset.dtype, dataset.dim);
 }
 
 void dataset_decode_vector(const Dataset& dataset, size_t row, float* dst) {

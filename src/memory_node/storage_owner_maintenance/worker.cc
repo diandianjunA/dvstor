@@ -224,6 +224,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     static_cast<u64>(config.storage_owner_rpc_timeout_ms) * 1000ull * 1000ull;
   const u64 retry_backoff_ns = std::min<u64>(
     rpc_timeout_ns, 1000ull * 1000ull);
+  const u64 reverse_retry_backoff_max_ns = static_cast<u64>(
+    config.storage_owner_reverse_retry_backoff_max_us) * 1000ull;
+  const auto reverse_retry_backoff = [&](u32 attempts) {
+    return reverse_retry_backoff_ns(
+      attempts, retry_backoff_ns, reverse_retry_backoff_max_ns);
+  };
   lib_assert(storage_owner_reverse_outbox_ != nullptr &&
                worker_id < storage_owner_reverse_completions_.size() &&
                storage_owner_reverse_completions_[worker_id] != nullptr,
@@ -1150,7 +1156,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         }
         lib_assert(storage_owner_reverse_outbox_->release_poll(
                      worker_id, aggregate->wire_request_id, true,
-                     now + retry_backoff_ns),
+                     now + reverse_retry_backoff(aggregate->retry_attempts)),
                    "stage2 reverse aggregate failure retry release failed");
         storage_owner_maintenance_pressure_yields_.fetch_add(
           1, std::memory_order_relaxed);
@@ -1164,7 +1170,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           1, std::memory_order_relaxed);
       }
       lib_assert(storage_owner_reverse_outbox_->release_poll(
-                   worker_id, aggregate->wire_request_id, timed_out, now),
+                   worker_id, aggregate->wire_request_id, timed_out,
+                   timed_out
+                     ? now + reverse_retry_backoff(aggregate->retry_attempts)
+                     : now),
                  "stage2 reverse aggregate poll release failed");
       progressed = timed_out || progressed;
     }
@@ -1221,7 +1230,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       const u64 posted_at = steady_now_ns();
       lib_assert(storage_owner_reverse_outbox_->finish_post(
                    worker_id, aggregate->wire_request_id, sent,
-                   posted_at + (sent ? rpc_timeout_ns : retry_backoff_ns)),
+                   posted_at + (sent ? rpc_timeout_ns
+                                     : reverse_retry_backoff(
+                                         aggregate->retry_attempts))),
                  "stage2 reverse aggregate post release failed");
       if (sent) {
         progressed = true;
@@ -1389,9 +1400,78 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     return Stage2SearchAdvanceResult::complete;
   };
 
-  const auto defer_stage2_retry = [](Stage2Context& context) {
-    const auto retry_at = std::chrono::steady_clock::now() +
-      std::chrono::milliseconds(1);
+  // Termination must release the durable-watermark sequence even when the
+  // best-effort cleanup cannot reach a peer: residual backlinks are fenced
+  // lazily by identity/generation checks, while a stuck context would
+  // otherwise pin the completion ring forever.
+  const auto terminate_stuck_stage2 = [&](Stage2Context& context) {
+    if (!release_rebindable_context_lane(context)) {
+      const auto retry_at = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(1);
+      for (StorageOwnerMaintenanceTask& task : context.tasks) {
+        task.retry_not_before = retry_at;
+      }
+      return;
+    }
+    for (StorageOwnerMaintenanceTask& task : context.tasks) {
+      if (task.maintenance_sequence == 0) continue;
+      if (!complete_stale_stage2(task)) {
+        static std::atomic<u32> terminate_cleanup_logs{0};
+        const u32 log_index =
+          terminate_cleanup_logs.fetch_add(1, std::memory_order_relaxed);
+        if (log_index < 16) {
+          std::cerr << "[storage-owner] stage2 termination cleanup incomplete"
+                    << " self_shard=" << storage_id_
+                    << " sequence=" << task.maintenance_sequence
+                    << " id=" << task.id
+                    << " generation=" << task.generation
+                    << std::endl;
+        }
+        storage_owner_maintenance_stale_.fetch_add(
+          1, std::memory_order_relaxed);
+        storage_owner_maintenance_processed_.fetch_add(
+          1, std::memory_order_relaxed);
+        complete_storage_owner_maintenance_sequence(
+          task.maintenance_sequence);
+      }
+      storage_owner_maintenance_stage2_terminated_.fetch_add(
+        1, std::memory_order_relaxed);
+      atomic_utils::update_max_relaxed(
+        storage_owner_maintenance_stage2_last_terminated_sequence_,
+        task.maintenance_sequence);
+    }
+    const Stage2ContextHandle handle = context.handle;
+    reset_context(context);
+    lib_assert(states.release_retryable(handle),
+               "terminated stage2 context retained an asynchronous request");
+    storage_owner_maintenance_active_workers_.fetch_sub(
+      1, std::memory_order_acq_rel);
+    notify_storage_owner_maintenance_capacity();
+  };
+
+  const auto defer_stage2_retry = [&](Stage2Context& context,
+                                      bool permanent = false) {
+    const auto now = std::chrono::steady_clock::now();
+    if (permanent) {
+      auto first_permanent_defer =
+        std::chrono::steady_clock::time_point::max();
+      for (StorageOwnerMaintenanceTask& task : context.tasks) {
+        if (task.stage2_first_permanent_defer_at ==
+            std::chrono::steady_clock::time_point{}) {
+          task.stage2_first_permanent_defer_at = now;
+        }
+        first_permanent_defer = std::min(
+          first_permanent_defer, task.stage2_first_permanent_defer_at);
+      }
+      if (config.storage_owner_stage2_max_retry_ms != 0 &&
+          now - first_permanent_defer >
+            std::chrono::milliseconds(
+              config.storage_owner_stage2_max_retry_ms)) {
+        terminate_stuck_stage2(context);
+        return;
+      }
+    }
+    const auto retry_at = now + std::chrono::milliseconds(1);
     for (StorageOwnerMaintenanceTask& task : context.tasks) {
       task.retry_not_before = retry_at;
     }
@@ -1702,7 +1782,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           placement_results, config)) {
       storage_owner_maintenance_pressure_yields_.fetch_add(
         1, std::memory_order_relaxed);
-      defer_stage2_retry(context);
+      defer_stage2_retry(context, /*permanent=*/true);
       return false;
     }
     lib_assert(placement_results.size() == placement_task_indices.size(),
@@ -1764,7 +1844,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           span<const CentroidMembershipOp>{centroid_adds}, config)) {
       storage_owner_maintenance_pressure_yields_.fetch_add(
         1, std::memory_order_relaxed);
-      defer_stage2_retry(context);
+      defer_stage2_retry(context, /*permanent=*/true);
       return false;
     }
     for (StorageOwnerMaintenanceTask& task : context.tasks) {
@@ -1786,7 +1866,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       if (!settle_dynamic_allocation(task)) {
         storage_owner_maintenance_pressure_yields_.fetch_add(
           1, std::memory_order_relaxed);
-        defer_stage2_retry(context);
+        defer_stage2_retry(context, /*permanent=*/true);
         return false;
       }
       task.allocation_settled = true;
@@ -1810,7 +1890,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       1, std::memory_order_relaxed);
     storage_owner_maintenance_pressure_yields_.fetch_add(
       1, std::memory_order_relaxed);
-    defer_stage2_retry(context);
+    defer_stage2_retry(context, /*permanent=*/true);
   };
 
   const auto start_reconcile_barrier = [&] (
@@ -1932,7 +2012,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         1, std::memory_order_relaxed);
       storage_owner_maintenance_pressure_yields_.fetch_add(
         1, std::memory_order_relaxed);
-      defer_stage2_retry(context);
+      defer_stage2_retry(context, /*permanent=*/true);
       return false;
     }
     lib_assert(gate_results.size() == gate_task_indices.size(),
@@ -2240,7 +2320,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
               1, std::memory_order_relaxed);
             storage_owner_maintenance_pressure_yields_.fetch_add(
               1, std::memory_order_relaxed);
-            defer_stage2_retry(context);
+            defer_stage2_retry(context, /*permanent=*/true);
             return false;
           }
           if (static_cast<protocol::DynamicNodeControlStatus>(
@@ -2250,7 +2330,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
               1, std::memory_order_relaxed);
             storage_owner_maintenance_pressure_yields_.fetch_add(
               1, std::memory_order_relaxed);
-            defer_stage2_retry(context);
+            defer_stage2_retry(context, /*permanent=*/true);
             return false;
           }
           const RemotePtr allocated{allocation_result.node_raw};
@@ -2580,7 +2660,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
             !publish_recovery_outgoing(
               task, recovery_parent,
               live_stage2_neighbors_by_task[item])) {
-          defer_stage2_retry(context);
+          defer_stage2_retry(context, /*permanent=*/true);
           return false;
         }
         expected_plan = plan_stage2_backlink_reconciliation(
@@ -3611,6 +3691,19 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       auto wake_at = std::min(
         next_fallback_context_scan,
         idle_started + kFallbackContextAuditInterval);
+      // Deferred contexts are worker-private here: clamp the sleep to the
+      // earliest task retry deadline instead of waiting for the 10 ms
+      // fallback audit to rediscover them.
+      for (const Stage2Context& context : contexts) {
+        if (!context.active) continue;
+        for (const StorageOwnerMaintenanceTask& task : context.tasks) {
+          if (task.retry_not_before !=
+                std::chrono::steady_clock::time_point{} &&
+              task.retry_not_before < wake_at) {
+            wake_at = task.retry_not_before;
+          }
+        }
+      }
       {
         std::lock_guard<std::mutex> queue_lock(
           storage_owner_maintenance_mutex_);
@@ -3667,6 +3760,25 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       fallback_context_scan_requested =
         wake_channel.epoch.load(std::memory_order_acquire) !=
           observed_wake_epoch;
+      if (!fallback_context_scan_requested) {
+        // A deadline-timed wake carries no event epoch. Request the bounded
+        // scan that drives the now-due deferred context; without it the next
+        // iteration would recompute a past wake_at and spin until the 10 ms
+        // fallback audit.
+        const auto woken_at = std::chrono::steady_clock::now();
+        for (const Stage2Context& context : contexts) {
+          if (!context.active) continue;
+          for (const StorageOwnerMaintenanceTask& task : context.tasks) {
+            if (task.retry_not_before !=
+                  std::chrono::steady_clock::time_point{} &&
+                task.retry_not_before <= woken_at) {
+              fallback_context_scan_requested = true;
+              break;
+            }
+          }
+          if (fallback_context_scan_requested) break;
+        }
+      }
       unregister_waiter();
       wake_lock.unlock();
       unpublished_idle_wait_ns += steady_now_ns() - idle_started_ns;

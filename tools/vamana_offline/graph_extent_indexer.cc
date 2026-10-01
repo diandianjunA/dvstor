@@ -40,16 +40,6 @@ struct GraphLayout {
   throw std::runtime_error(message);
 }
 
-u32 shard_bits_for(u32 shard_count) {
-  u32 bits = 0;
-  u32 capacity = 1;
-  while (capacity < shard_count) {
-    capacity <<= 1;
-    ++bits;
-  }
-  return bits;
-}
-
 u32 graph_capacity_for_degree(u32 degree) {
   const u32 provisional =
     std::min<u32>(15, std::max<u32>(2, (degree + 15) / 16));
@@ -110,7 +100,7 @@ GraphLayout read_layout(const filepath_t& prefix) {
   if (layout.degree == 0 || layout.degree > kMaxSupportedGraphDegree ||
       layout.shards == 0 ||
       layout.shards > RemotePtr::MEMORY_NODE_MASK + 1 ||
-      layout.shard_bits != shard_bits_for(layout.shards) ||
+      layout.shard_bits != vamana::hot_graph::shard_bits_for(layout.shards) ||
       layout.node_bytes == 0 ||
       layout.node_bytes % RemotePtr::OFFSET_ALIGNMENT != 0 ||
       layout.nodes == 0 || layout.nodes > kMaxGpuNavigationNodes ||
@@ -183,12 +173,6 @@ void read_exact(
   }
 }
 
-u32 load_u32(const byte_t* data) {
-  u32 value = 0;
-  std::memcpy(&value, data, sizeof(value));
-  return value;
-}
-
 u64 load_u64(const byte_t* data) {
   u64 value = 0;
   std::memcpy(&value, data, sizeof(value));
@@ -236,9 +220,9 @@ u8 validate_record_and_class(
       stable_count > layout.degree ||
       provisional_count > provisional_capacity ||
       stable_count + provisional_count > layout.capacity ||
-      load_u32(record + 4) != 0 ||
-      load_u32(record + 8) != 0 ||
-      load_u32(record + 12) != 0 ||
+      vamana::hot_graph::load_u32_le(record + 4) != 0 ||
+      vamana::hot_graph::load_u32_le(record + 8) != 0 ||
+      vamana::hot_graph::load_u32_le(record + 12) != 0 ||
       stored_checksum !=
         vamana::hot_graph::checksum16(record, layout.entry_bytes)) {
     fail(

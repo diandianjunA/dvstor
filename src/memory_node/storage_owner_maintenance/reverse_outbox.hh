@@ -57,6 +57,10 @@ struct Stage2ReverseAggregate {
     service::storage_owner::PeerRpcType::reverse_update_request};
   std::uint32_t item_count{};
   std::uint32_t logical_count{};
+  // Failed post/response attempts of this wire request. The owning executor
+  // turns it into an exponential resend backoff; a successful ACK retires the
+  // aggregate and therefore resets the count.
+  std::uint32_t retry_attempts{};
   std::uint64_t ready_at_ns{};
   std::uint64_t deadline_ns{};
 };
@@ -68,6 +72,17 @@ enum class Stage2ReverseEnqueueResult : std::uint8_t {
   full,
   invalid,
 };
+
+// Exponential resend backoff for one reverse aggregate: base_ns doubled per
+// failed attempt, with the shift saturating so long-running conflicts cannot
+// overflow the delay arithmetic, and the result capped at max_ns.
+[[nodiscard]] inline std::uint64_t reverse_retry_backoff_ns(
+    std::uint32_t attempts,
+    std::uint64_t base_ns,
+    std::uint64_t max_ns) noexcept {
+  const std::uint32_t shift = std::min(attempts, 20u);
+  return std::min(base_ns << shift, max_ns);
+}
 
 // Fixed-capacity MPMC logical outbox plus fixed-capacity aggregate storage.
 // All vectors reserve their maximum in the constructor and never grow beyond
@@ -286,6 +301,7 @@ class Stage2ReverseOutbox {
       aggregate->state = AggregateState::awaiting_response;
       aggregate->snapshot.deadline_ns = ready_or_deadline_ns;
     } else {
+      ++aggregate->snapshot.retry_attempts;
       aggregate->snapshot.ready_at_ns = ready_or_deadline_ns;
     }
     return true;
@@ -303,6 +319,7 @@ class Stage2ReverseOutbox {
     }
     aggregate->leased = false;
     if (retry) {
+      ++aggregate->snapshot.retry_attempts;
       aggregate->state = AggregateState::ready_to_post;
       aggregate->snapshot.ready_at_ns = ready_at_ns;
     }

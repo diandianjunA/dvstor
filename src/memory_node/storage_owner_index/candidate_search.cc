@@ -29,6 +29,24 @@ StableNodeSnapshotState classify_stage1_traversal_snapshot(
     : StableNodeSnapshotState::stable;
 }
 
+// The backlog-aware budget reads the accepted-but-unfinished Stage2 sequence
+// count (a lock-free approximation) once per continuation batch. Below the
+// low watermark the policy returns the historical unbounded budget.
+PartitionSearchBudget stage2_search_budget_for_backlog(
+    const configuration::IndexConfiguration& config,
+    u64 backlog,
+    u32 construction_width) {
+  return stage2_partition_search_budget(
+    construction_width, VamanaNode::graph_entry_capacity(), backlog,
+    Stage2BudgetBacklogPolicy{
+      .backlog_low = config.storage_owner_stage2_budget_backlog_low,
+      .backlog_high = config.storage_owner_stage2_budget_backlog_high,
+      .max_expansions = config.storage_owner_stage2_budget_max_expansions,
+      .max_candidate_visits =
+        config.storage_owner_stage2_budget_max_candidate_visits,
+    });
+}
+
 }  // namespace
 
 vec<RemotePtr> MemoryNode::partition_local_search_candidates(
@@ -411,8 +429,8 @@ const vec<RemotePtr>& MemoryNode::continue_stage2_search_candidates(
       span<const PartitionLocalSearchEntry>{local_beam},
       span<const RemotePtr>{task.stage1_remote_frontier}, storage_id_,
       construction_width,
-      stage2_partition_search_budget(
-        construction_width, VamanaNode::graph_entry_capacity()),
+      stage2_search_budget_for_backlog(
+        config, storage_owner_maintenance_incomplete(), construction_width),
       score_batch, expand, &budget_exhausted, &remote_expansions);
   if (record_stage2_telemetry) {
     storage_owner_stage2_remote_expansions_.fetch_add(
@@ -445,8 +463,8 @@ void MemoryNode::continue_stage2_search_candidates_batched(
   if (tasks.empty()) return;
 
   const u32 construction_width = storage_owner_construction_width(config);
-  const PartitionSearchBudget budget = stage2_partition_search_budget(
-    construction_width, VamanaNode::graph_entry_capacity());
+  const PartitionSearchBudget budget = stage2_search_budget_for_backlog(
+    config, storage_owner_maintenance_incomplete(), construction_width);
 
   // Keep independent beams/visited sets but retain their capacity across
   // high-frequency batches on this maintenance OS worker.
@@ -813,8 +831,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
   }
 
   const u32 construction_width = storage_owner_construction_width(config);
-  const PartitionSearchBudget budget = stage2_partition_search_budget(
-    construction_width, VamanaNode::graph_entry_capacity());
+  const PartitionSearchBudget budget = stage2_search_budget_for_backlog(
+    config, storage_owner_maintenance_incomplete(), construction_width);
   const auto& credit_plan = peer_rdma_read_credit_plan();
   const auto ordinary_dispatch_limits =
     memory_node_detail::peer_rdma_read_dispatch_limits(credit_plan);

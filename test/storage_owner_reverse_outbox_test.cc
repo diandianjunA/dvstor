@@ -1,6 +1,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 #include "memory_node/storage_owner_maintenance/reverse_outbox.hh"
@@ -209,6 +210,72 @@ void test_duplicate_capacity_and_shutdown_cleanup() {
   assert(outbox.size() == 0);
 }
 
+void test_retry_attempts_count_failed_attempts_and_reset_on_success() {
+  detail::Stage2ReverseOutbox outbox(4, 4, 3, 4);
+  const std::array<Op, 1> ops{{{71, 171}}};
+  assert(outbox.try_enqueue(dispatch(
+           61, 0, 2, 0, ops.data(), ops.size())) ==
+         detail::Stage2ReverseEnqueueResult::enqueued);
+  const auto formed = outbox.form_aggregate(2, 0, 6001, 0);
+  assert(formed.has_value());
+  assert(formed->retry_attempts == 0);
+
+  size_t cursor = 0;
+  // A failed post attempt counts once and defers the aggregate.
+  assert(outbox.claim_ready_to_post(0, 0, cursor).has_value());
+  assert(outbox.finish_post(0, 6001, false, 100));
+  cursor = 0;
+  const auto first_retry = outbox.claim_ready_to_post(0, 100, cursor);
+  assert(first_retry.has_value());
+  assert(first_retry->retry_attempts == 1);
+
+  // A response-side retry (failure or timeout) counts again.
+  assert(outbox.finish_post(0, 6001, true, 500));
+  cursor = 0;
+  assert(outbox.claim_awaiting_response(0, cursor).has_value());
+  assert(outbox.release_poll(0, 6001, true, 700));
+  cursor = 0;
+  const auto second_retry = outbox.claim_ready_to_post(0, 700, cursor);
+  assert(second_retry.has_value());
+  assert(second_retry->retry_attempts == 2);
+
+  // A successful ACK retires the aggregate; its replacement starts at zero.
+  assert(outbox.finish_post(0, 6001, true, 900));
+  cursor = 0;
+  assert(outbox.claim_awaiting_response(0, cursor).has_value());
+  assert(outbox.finish_success(0, 6001));
+  assert(outbox.try_enqueue(dispatch(
+           62, 0, 2, 0, ops.data(), ops.size())) ==
+         detail::Stage2ReverseEnqueueResult::enqueued);
+  const auto replacement = outbox.form_aggregate(2, 0, 6002, 0);
+  assert(replacement.has_value());
+  assert(replacement->retry_attempts == 0);
+}
+
+void test_reverse_retry_backoff_grows_exponentially_and_caps() {
+  constexpr std::uint64_t kBaseNs = 1'000'000;      // 1 ms
+  constexpr std::uint64_t kMaxNs = 100'000'000;     // 100 ms
+  assert(detail::reverse_retry_backoff_ns(0, kBaseNs, kMaxNs) == kBaseNs);
+  assert(detail::reverse_retry_backoff_ns(1, kBaseNs, kMaxNs) == 2 * kBaseNs);
+  assert(detail::reverse_retry_backoff_ns(2, kBaseNs, kMaxNs) == 4 * kBaseNs);
+  assert(detail::reverse_retry_backoff_ns(6, kBaseNs, kMaxNs) == 64 * kBaseNs);
+  // 128 ms would exceed the 100 ms cap; every later attempt stays capped.
+  assert(detail::reverse_retry_backoff_ns(7, kBaseNs, kMaxNs) == kMaxNs);
+  assert(detail::reverse_retry_backoff_ns(20, kBaseNs, kMaxNs) == kMaxNs);
+  assert(detail::reverse_retry_backoff_ns(1000, kBaseNs, kMaxNs) == kMaxNs);
+
+  // With an unreachable cap the shift saturates at 20 so the u64 delay
+  // arithmetic cannot overflow.
+  constexpr std::uint64_t kNoCap = std::numeric_limits<std::uint64_t>::max();
+  const std::uint64_t shift_saturated =
+    detail::reverse_retry_backoff_ns(20, kBaseNs, kNoCap);
+  assert(shift_saturated == (kBaseNs << 20));
+  assert(detail::reverse_retry_backoff_ns(21, kBaseNs, kNoCap) ==
+         shift_saturated);
+  assert(detail::reverse_retry_backoff_ns(1000, kBaseNs, kNoCap) ==
+         shift_saturated);
+}
+
 }  // namespace
 
 int main() {
@@ -217,5 +284,7 @@ int main() {
   test_retry_reuses_wire_id_and_payload();
   test_release_precedes_fanout_at_exact_capacity();
   test_duplicate_capacity_and_shutdown_cleanup();
+  test_retry_attempts_count_failed_attempts_and_reset_on_success();
+  test_reverse_retry_backoff_grows_exponentially_and_caps();
   return 0;
 }

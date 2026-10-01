@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <map>
 #include <set>
@@ -23,6 +24,7 @@
 #include "tools/vamana_offline/graph.hh"
 #include "tools/vamana_offline/graph_extent_indexer.hh"
 #include "tools/vamana_offline/metis_repartitioner.hh"
+#include "tools/vamana_offline/partitioning.hh"
 #include "tools/vamana_offline/pq_indexer.hh"
 #include "tools/vamana_offline/shard_writer.hh"
 #include "vamana/centroid_state.hh"
@@ -244,6 +246,10 @@ void expect_failure(const MetisRepartitionOptions &options) {
 } // namespace
 
 int main() {
+  if (!metis_partitioning_available() || metis_index_bits() < 64) {
+    std::cout << "SKIP: schema-16 repartitioning requires 64-bit METIS\n";
+    return 77;
+  }
   TemporaryDirectory temporary;
   const fs::path data_path = temporary.path / "base.fbin";
   const fs::path source_prefix = temporary.path / "balanced";

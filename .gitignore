@@ -1,4 +1,4 @@
-build/
+/build*/
 .cache/
 __pycache__/
 *.pyc
@@ -12,4 +12,11 @@ compile_commands.json
 *~
 .DS_Store
 CMakeUserPresets.json
-tutorial/
+
+# Local experiment output. Existing checked-in reference results stay tracked.
+/experiment/**/results/
+/experiment/**/reports/
+/experiment/**/logs/
+/experiment/**/storage_logs/
+/experiment/**/pids/
+/experiment/**/build.log

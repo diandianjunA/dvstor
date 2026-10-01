@@ -1,62 +1,41 @@
-# 三项方案累积消融
+# 累积消融
 
-四个配置只改变三个正式的贡献级模式，其他配置完全继承 `experiment` 下的正式
-SIFT100M profile：
+四个 case 依次启用两阶段更新、GPU/RDMA 推进解耦和动态长度读取，共用 SIFT100M 索引
+与质量、容量参数。运行准备见 [实验说明](../../README.md)。
 
-| case | 编码 | 方案一 | 方案二 | 方案三 |
-|---|---:|---|---|---|
-| `baseline` | 000 | 关 | 关 | 关 |
-| `program1` | 100 | 开 | 关 | 关 |
-| `program3` | 101 | 开 | 关 | 开 |
-| `full` | 111 | 开 | 开 | 开 |
+| case | 编码 | 更新完成模式 | 图访问模式 | 查询推进模式 |
+|---|---|---|---|---|
+| `baseline` | 000 | coupled | fixed | manual |
+| `program1` | 100 | decoupled | fixed | manual |
+| `program3` | 101 | decoupled | fixed | decoupled |
+| `full` | 111 | decoupled | adaptive | decoupled |
 
-Baseline 也是 Persistent GPU + GPUNetIO，只关闭方案三的 early/ahead-of-commit
-progression；HostOrchestrated CPU-posted 模式不参与贡献消融。累积顺序为
-`Baseline → +P1 → +P3 → +P2 (Full)`，让方案二在高性能 GPU 查询路径上体现收益。
+此处 baseline 显式使用 Persistent + GPUNetIO、Stable-Run，关闭提前推进；直接运行
+正式 baseline profile 则会选择 HostOrchestrated，两者不能混用。manual case 的
+commit/issue width 均为 16；decoupled case 的 issue 上限由运行时自动解析。
 
-`full` 直接使用 `04_gpu_persistent_gpunetio` 正式 profile；默认 warmup 15 秒、测量
-120 秒、50% 查询线程和 50% 插入线程、自动 512 并发，与指定的主实验报告一致。
-
-## 运行
-
-计算节点：
+默认预热 15 秒、测量 120 秒、查询/插入各占 50% 线程，客户端并发自动选择，上限 1024。
+可以覆盖 `WARMUP_SECONDS`、`MEASURE_SECONDS`、`READ_RATIO`、`CLIENT_THREADS` 和
+`CLIENT_THREAD_CAP`，同一次比较的四组保持一致。
 
 ```bash
-cd /home/xjs/experiment/dvstor
-./experiment/sift100m/ablation/run_ablation.sh
+BUILD_DIR="$PWD/build-compute" ./experiment/sift100m/ablation/run_ablation.sh
 ```
 
-脚本每到一个 case 会暂停。此时在存储节点按提示运行，例如：
+每个 case 前脚本暂停；在存储节点运行提示中的命令，例如：
 
 ```bash
-cd /home/xjs/experiment/dvstor
-./experiment/sift100m/ablation/start_storage_case.sh baseline
+STORAGE_BUILD_DIR="$PWD/build-storage" \
+  ./experiment/sift100m/ablation/start_storage_case.sh baseline
 ```
 
-看到 `storage ready` 后回到计算节点按 Enter。随后依次按提示启动 `program1`、
-`program3` 和 `full`。存储脚本会停止上一组存储进程，再从同一静态索引重新启动，
-避免前一组动态更新污染下一组。
+看到 `storage ready` 后继续，随后依次启动 `program1`、`program3`、`full`。
+存储脚本会停止上一组进程，再从同一静态索引重新加载。
 
-结果写入 `experiment/sift100m/ablation/results/ablation_时间戳/`，包括原始 JSON/TXT、
-`summary.csv`、`ablation_performance.svg` 和 `消融实验分析报告.md`。
-
-若某一组中断，可复用原结果目录补跑：
+输出位于 `results/ablation_时间戳/`，包含原始 JSON/TXT、manifest、`summary.csv`、
+`ablation_performance.svg` 和分析报告。中断后补跑或重新汇总：
 
 ```bash
-RUN_ROOT=/home/xjs/experiment/dvstor/experiment/sift100m/ablation/results/ablation_YYYYmmdd_HHMMSS \
-  ./experiment/sift100m/ablation/run_ablation.sh program3
-```
-
-四组完成后重新汇总：
-
-```bash
-RUN_ROOT=/home/xjs/experiment/dvstor/experiment/sift100m/ablation/results/ablation_YYYYmmdd_HHMMSS \
-  ./experiment/sift100m/ablation/run_ablation.sh summarize
-```
-
-存储节点若使用独立构建目录，可在启动时指定，例如：
-
-```bash
-STORAGE_BUILD_DIR=/home/xjs/experiment/dvstor/build-storage \
-  ./experiment/sift100m/ablation/start_storage_case.sh full
+RUN_ROOT=/path/to/ablation_TIMESTAMP ./experiment/sift100m/ablation/run_ablation.sh program3
+RUN_ROOT=/path/to/ablation_TIMESTAMP ./experiment/sift100m/ablation/run_ablation.sh summarize
 ```

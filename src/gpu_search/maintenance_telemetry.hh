@@ -29,8 +29,9 @@ inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
 // exact Stage2 completion-latency sum. Version 15 separates the local Stage1
 // search from the global continuation and final candidate materialization.
 // Version 16 adds non-overlapping exact-insert RDMA wait intervals measured
-// at actual submission/completion boundaries.
-inline constexpr u32 kVersion = 16;
+// at actual submission/completion boundaries. Version 17 reports Stage2
+// contexts terminated after exhausting the permanent-failure retry window.
+inline constexpr u32 kVersion = 17;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -153,6 +154,11 @@ struct alignas(64) Snapshot {
   // Sum of queued-at to finalized-live latency for the same samples counted
   // by stage2_finalized_live and stage2_delay_histogram.
   u64 stage2_finalize_latency_ns{};
+
+  // Stage2 contexts terminated after exceeding storage_owner_stage2_max_retry_ms
+  // of permanent-failure retries, and the highest sequence released that way.
+  u64 stage2_terminated_total{};
+  u64 stage2_last_terminated_sequence{};
 };
 
 static_assert(kSnapshotOffset == 192);

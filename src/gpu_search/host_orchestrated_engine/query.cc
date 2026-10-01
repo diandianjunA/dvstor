@@ -302,13 +302,14 @@ void HostOrchestratedSearchEngine::Impl::fetch_graph_wave(
   // A checksum failure is normally a read racing a whole-record graph
   // publication, not persistent corruption.  Under the coupled baseline,
   // hundreds of host query lanes can repeatedly hit the same centroid-near
-  // parents while backlink writers update them.  Three back-to-back reads
-  // were too small a contention budget and made one ordinary race terminate
-  // an otherwise healthy long benchmark.  Match the persistent reader's
-  // accounting rule (an optimistic short extent is outside the authoritative
-  // full-record budget) and give the CPU-posted path enough bounded full
-  // rereads to outlive a hot publication window.  The final invalid full
-  // snapshot still fails loudly, so durable corruption is never accepted.
+  // parents while backlink writers update them. A finite number of immediate
+  // rereads is still one correlated observation window, so the exceptional
+  // retry path uses a capped exponential backoff below. Match the persistent
+  // reader's accounting rule (an optimistic short extent is outside the
+  // authoritative full-record budget) and give the CPU-posted path enough
+  // bounded full rereads to outlive a hot publication window. The final
+  // invalid full snapshot still fails loudly, so durable corruption is never
+  // accepted.
   constexpr u32 kFullGraphSnapshotAttempts = 8;
   const u32 maximum_batch_attempts =
     adaptive ? kFullGraphSnapshotAttempts + 1u : kFullGraphSnapshotAttempts;
@@ -373,9 +374,25 @@ void HostOrchestratedSearchEngine::Impl::fetch_graph_wave(
           attempt, state.started_partial ? 1u : 0u, state.partial,
           maximum_batch_attempts, kFullGraphSnapshotAttempts);
       if (!attempts_remain) {
+        const byte_t* failed_record =
+          lane.scratch + graph_scratch_offset + item * graph_entry_bytes;
+        const u16 stored_checksum =
+          static_cast<u16>(failed_record[2]) |
+          static_cast<u16>(static_cast<u16>(failed_record[3]) << 8);
+        const u16 observed_checksum =
+          graph_record_validation::checksum16(failed_record,
+                                              graph_entry_bytes);
         throw std::runtime_error(
           "host query graph snapshot validation failed after bounded "
-          "full-record rereads");
+          "full-record rereads: pointer_raw=" +
+          std::to_string(wave[item]->pointer.raw_address) +
+          " shard=" + std::to_string(state.record.shard) +
+          " graph_offset=" + std::to_string(state.record.graph_offset) +
+          " immutable=" + std::to_string(state.record.immutable_base) +
+          " stable_count=" + std::to_string(failed_record[0]) +
+          " flags=" + std::to_string(failed_record[1]) +
+          " stored_checksum=" + std::to_string(stored_checksum) +
+          " observed_checksum=" + std::to_string(observed_checksum));
       }
       if (state.partial) {
         engine.telemetry_.graph_extent_fallback_reads.fetch_add(
@@ -417,6 +434,8 @@ void HostOrchestratedSearchEngine::Impl::fetch_graph_wave(
                        Clock::now() - validation_started)
                        .count();
     if (retry.empty()) break;
+    std::this_thread::sleep_for(std::chrono::microseconds(
+      host_orchestrated_policy::graph_snapshot_retry_backoff_us(attempt)));
     read_batch(lane, retry, true);
     engine.telemetry_.graph_shard_batches.fetch_add(
       populated_shards<ReadRequest>(retry, index.shards.size()),

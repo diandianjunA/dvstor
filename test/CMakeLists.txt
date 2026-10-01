@@ -1,7 +1,8 @@
-add_executable(breakdown_aggregate_test breakdown_aggregate_test.cc)
+include(DvstorTestHelpers)
+include(cpu_tests.cmake)
+
+dvstor_add_test(breakdown_aggregate_test)
 target_link_libraries(breakdown_aggregate_test PRIVATE dvstor_runtime)
-target_compile_options(breakdown_aggregate_test PRIVATE -UNDEBUG)
-add_test(NAME breakdown_aggregate_test COMMAND breakdown_aggregate_test)
 
 add_test(NAME mn_memory_estimator_test
          COMMAND bash ${CMAKE_SOURCE_DIR}/test/mn_memory_estimator_test.sh
@@ -19,136 +20,56 @@ add_test(NAME deep_data_preparation_test
          COMMAND python3
                  ${CMAKE_SOURCE_DIR}/test/deep_data_preparation_test.py)
 
-add_executable(breakdown_benchmark_support_test breakdown_benchmark_support_test.cc)
+dvstor_add_test(breakdown_benchmark_support_test)
 dvstor_target_tool_includes(breakdown_benchmark_support_test)
 target_link_libraries(breakdown_benchmark_support_test PRIVATE dvstor_breakdown_support)
-target_compile_options(breakdown_benchmark_support_test PRIVATE -UNDEBUG)
-add_test(NAME breakdown_benchmark_support_test COMMAND breakdown_benchmark_support_test)
 
-add_executable(breakdown_benchmark_control_test
+dvstor_add_test(breakdown_benchmark_control_test
     breakdown_benchmark_control_test.cc
     ${CMAKE_SOURCE_DIR}/tools/breakdown_benchmark/args.cc
     ${CMAKE_SOURCE_DIR}/tools/breakdown_benchmark/progress.cc)
 dvstor_target_tool_includes(breakdown_benchmark_control_test)
 target_link_libraries(breakdown_benchmark_control_test PRIVATE dvstor_breakdown_support)
-target_compile_options(breakdown_benchmark_control_test PRIVATE -UNDEBUG)
-add_test(NAME breakdown_benchmark_control_test COMMAND breakdown_benchmark_control_test)
 
-add_executable(common_atomic_utils_test common_atomic_utils_test.cc)
+dvstor_add_test(common_atomic_utils_test)
 target_link_libraries(common_atomic_utils_test PRIVATE dvstor_runtime)
-target_compile_options(common_atomic_utils_test PRIVATE -UNDEBUG)
-add_test(NAME common_atomic_utils_test COMMAND common_atomic_utils_test)
 
-add_executable(vector_dtype_test vector_dtype_test.cc)
-dvstor_target_common_includes(vector_dtype_test)
-target_compile_options(vector_dtype_test PRIVATE -UNDEBUG)
-add_test(NAME vector_dtype_test COMMAND vector_dtype_test)
-
-add_executable(index_metadata_test
-    index_metadata_test.cc
-    ../src/service/index_metadata.cc
-    ../src/gpu_search/index_format.cc)
-dvstor_target_common_includes(index_metadata_test)
-target_compile_options(index_metadata_test PRIVATE -UNDEBUG)
-add_test(NAME index_metadata_test COMMAND index_metadata_test)
-set_tests_properties(index_metadata_test PROPERTIES TIMEOUT 10)
-
-add_executable(offline_local_id_set_test offline_local_id_set_test.cc)
-dvstor_target_tool_includes(offline_local_id_set_test)
-target_compile_options(offline_local_id_set_test PRIVATE -UNDEBUG)
-add_test(NAME offline_local_id_set_test COMMAND offline_local_id_set_test)
-set_tests_properties(offline_local_id_set_test PROPERTIES TIMEOUT 10)
-
-add_executable(shard_publication_test
-    shard_publication_test.cc
-    ../tools/vamana_offline/dataset_io.cc
-    ../tools/vamana_offline/graph.cc
-    ../tools/vamana_offline/partitioning.cc
-    ../tools/vamana_offline/progress.cc
-    ../tools/vamana_offline/shard_writer.cc)
-dvstor_target_tool_includes(shard_publication_test)
-target_link_libraries(shard_publication_test PRIVATE rdma_library)
-target_compile_options(shard_publication_test PRIVATE -UNDEBUG)
-add_test(NAME shard_publication_test COMMAND shard_publication_test)
-set_tests_properties(shard_publication_test PROPERTIES TIMEOUT 20)
-
-add_executable(vamana_offline_graph_test
-    vamana_offline_graph_test.cc
-    ../tools/vamana_offline/dataset_io.cc
-    ../tools/vamana_offline/graph.cc
-    ../tools/vamana_offline/progress.cc)
-dvstor_target_tool_includes(vamana_offline_graph_test)
-target_link_libraries(vamana_offline_graph_test PRIVATE rdma_library)
-target_compile_options(vamana_offline_graph_test PRIVATE -UNDEBUG)
-add_test(NAME vamana_offline_graph_test COMMAND vamana_offline_graph_test)
-set_tests_properties(vamana_offline_graph_test PROPERTIES TIMEOUT 10)
-
-add_executable(adaptive_frontier_policy_test adaptive_frontier_policy_test.cc)
+dvstor_add_test(adaptive_frontier_policy_test)
 dvstor_target_common_includes(adaptive_frontier_policy_test)
 target_link_libraries(adaptive_frontier_policy_test PRIVATE rdma_library)
-target_compile_options(adaptive_frontier_policy_test PRIVATE -UNDEBUG)
-add_test(NAME adaptive_frontier_policy_test COMMAND adaptive_frontier_policy_test)
 
-add_executable(storage_owner_wire_size_test storage_owner_wire_size_test.cc)
+dvstor_add_test(storage_owner_wire_size_test)
 dvstor_target_common_includes(storage_owner_wire_size_test)
-target_compile_options(storage_owner_wire_size_test PRIVATE -UNDEBUG)
-add_test(NAME storage_owner_wire_size_test COMMAND storage_owner_wire_size_test)
 
-add_executable(storage_owner_graph_pointer_validation_test
-    storage_owner_graph_pointer_validation_test.cc)
+dvstor_add_test(storage_owner_graph_pointer_validation_test)
 dvstor_target_common_includes(storage_owner_graph_pointer_validation_test)
-target_compile_options(storage_owner_graph_pointer_validation_test PRIVATE -UNDEBUG)
-add_test(NAME storage_owner_graph_pointer_validation_test
-         COMMAND storage_owner_graph_pointer_validation_test)
 
-add_executable(core_partition_test core_partition_test.cc)
+dvstor_add_test(core_partition_test)
 dvstor_target_common_includes(core_partition_test)
-target_compile_options(core_partition_test PRIVATE -UNDEBUG)
-add_test(NAME core_partition_test COMMAND core_partition_test)
 
-add_executable(peer_rdma_credit_policy_test peer_rdma_credit_policy_test.cc)
+dvstor_add_test(peer_rdma_credit_policy_test)
 dvstor_target_common_includes(peer_rdma_credit_policy_test)
-target_compile_options(peer_rdma_credit_policy_test PRIVATE -UNDEBUG)
-add_test(NAME peer_rdma_credit_policy_test COMMAND peer_rdma_credit_policy_test)
 
-add_executable(stage1_control_fanout_policy_test
-    stage1_control_fanout_policy_test.cc)
+dvstor_add_test(stage1_control_fanout_policy_test)
 dvstor_target_common_includes(stage1_control_fanout_policy_test)
-target_compile_options(stage1_control_fanout_policy_test PRIVATE -UNDEBUG)
-add_test(NAME stage1_control_fanout_policy_test
-         COMMAND stage1_control_fanout_policy_test)
 
-add_executable(stage2_score_round_robin_test
-    stage2_score_round_robin_test.cc)
+dvstor_add_test(stage2_score_round_robin_test)
 dvstor_target_common_includes(stage2_score_round_robin_test)
-target_compile_options(stage2_score_round_robin_test PRIVATE -UNDEBUG)
-add_test(NAME stage2_score_round_robin_test
-         COMMAND stage2_score_round_robin_test)
 
-add_executable(bounded_update_primitives_test bounded_update_primitives_test.cc)
+dvstor_add_test(bounded_update_primitives_test)
 target_link_libraries(bounded_update_primitives_test PRIVATE dvstor_runtime)
-target_compile_options(bounded_update_primitives_test PRIVATE -UNDEBUG)
-add_test(NAME bounded_update_primitives_test COMMAND bounded_update_primitives_test)
 
-add_executable(compute_update_hot_path_test compute_update_hot_path_test.cc)
+dvstor_add_test(compute_update_hot_path_test)
 target_link_libraries(compute_update_hot_path_test PRIVATE dvstor_runtime)
-target_compile_options(compute_update_hot_path_test PRIVATE -UNDEBUG)
-add_test(NAME compute_update_hot_path_test COMMAND compute_update_hot_path_test)
 
-add_executable(authority_directory_policy_test
-    authority_directory_policy_test.cc)
+dvstor_add_test(authority_directory_policy_test)
 dvstor_target_common_includes(authority_directory_policy_test)
-target_compile_options(authority_directory_policy_test PRIVATE -UNDEBUG)
-add_test(NAME authority_directory_policy_test
-         COMMAND authority_directory_policy_test)
 
-add_executable(idmap_v2_test idmap_v2_test.cc)
+dvstor_add_test(idmap_v2_test)
 dvstor_target_common_includes(idmap_v2_test)
-target_compile_options(idmap_v2_test PRIVATE -UNDEBUG)
-add_test(NAME idmap_v2_test COMMAND idmap_v2_test)
 
 if (TARGET FaissCPU::FaissCPU)
-    add_executable(legacy_index_converter_test
+    dvstor_add_test(legacy_index_converter_test
         legacy_index_converter_test.cc
         ${CMAKE_SOURCE_DIR}/tools/vamana_offline/legacy_index_converter.cc
         ${CMAKE_SOURCE_DIR}/tools/vamana_offline/pq_indexer.cc
@@ -157,114 +78,62 @@ if (TARGET FaissCPU::FaissCPU)
     dvstor_target_tool_includes(legacy_index_converter_test)
     target_link_libraries(legacy_index_converter_test PRIVATE
         rdma_library FaissCPU::FaissCPU)
-    target_compile_options(legacy_index_converter_test PRIVATE -UNDEBUG)
-    add_test(NAME legacy_index_converter_test
-             COMMAND legacy_index_converter_test)
 endif ()
 
-add_executable(dynamic_allocation_receipt_policy_test
-    dynamic_allocation_receipt_policy_test.cc)
+dvstor_add_test(dynamic_allocation_receipt_policy_test)
 dvstor_target_common_includes(dynamic_allocation_receipt_policy_test)
-target_compile_options(dynamic_allocation_receipt_policy_test PRIVATE -UNDEBUG)
-add_test(NAME dynamic_allocation_receipt_policy_test
-         COMMAND dynamic_allocation_receipt_policy_test)
 
-add_executable(centroid_router_test
+dvstor_add_test(dynamic_allocation_policy_test)
+dvstor_target_common_includes(dynamic_allocation_policy_test)
+
+dvstor_add_test(centroid_router_test
     centroid_router_test.cc
     ${CMAKE_SOURCE_DIR}/src/vamana/centroid_router.cc)
 dvstor_target_common_includes(centroid_router_test)
 target_link_libraries(centroid_router_test PRIVATE rdma_library)
-target_compile_options(centroid_router_test PRIVATE -UNDEBUG)
-add_test(NAME centroid_router_test COMMAND centroid_router_test)
 
-add_executable(centroid_home_selector_test centroid_home_selector_test.cc)
+dvstor_add_test(centroid_home_selector_test)
 dvstor_target_common_includes(centroid_home_selector_test)
-target_compile_options(centroid_home_selector_test PRIVATE -UNDEBUG)
-add_test(NAME centroid_home_selector_test COMMAND centroid_home_selector_test)
 
-add_executable(centroid_route_poll_policy_test
-    centroid_route_poll_policy_test.cc)
+dvstor_add_test(centroid_route_poll_policy_test)
 dvstor_target_common_includes(centroid_route_poll_policy_test)
-target_compile_options(centroid_route_poll_policy_test PRIVATE -UNDEBUG)
-add_test(NAME centroid_route_poll_policy_test
-         COMMAND centroid_route_poll_policy_test)
 
-add_executable(centroid_membership_lifecycle_test
-    centroid_membership_lifecycle_test.cc)
+dvstor_add_test(centroid_membership_lifecycle_test)
 dvstor_target_common_includes(centroid_membership_lifecycle_test)
-target_compile_options(centroid_membership_lifecycle_test PRIVATE -UNDEBUG)
-add_test(NAME centroid_membership_lifecycle_test
-         COMMAND centroid_membership_lifecycle_test)
 
-add_executable(centroid_seed_policy_test centroid_seed_policy_test.cc)
+dvstor_add_test(centroid_seed_policy_test)
 dvstor_target_common_includes(centroid_seed_policy_test)
-target_compile_options(centroid_seed_policy_test PRIVATE -UNDEBUG)
-add_test(NAME centroid_seed_policy_test COMMAND centroid_seed_policy_test)
 
-add_executable(centroid_route_ranking_test centroid_route_ranking_test.cc)
+dvstor_add_test(centroid_route_ranking_test)
 dvstor_target_common_includes(centroid_route_ranking_test)
-target_compile_options(centroid_route_ranking_test PRIVATE -UNDEBUG)
-add_test(NAME centroid_route_ranking_test COMMAND centroid_route_ranking_test)
 
-add_executable(storage_owner_reconcile_reverse_test
-    storage_owner_reconcile_reverse_test.cc)
+dvstor_add_test(storage_owner_reconcile_reverse_test)
 dvstor_target_common_includes(storage_owner_reconcile_reverse_test)
 target_link_libraries(storage_owner_reconcile_reverse_test PRIVATE rdma_library)
-target_compile_options(storage_owner_reconcile_reverse_test PRIVATE -UNDEBUG)
-add_test(NAME storage_owner_reconcile_reverse_test
-         COMMAND storage_owner_reconcile_reverse_test)
 
-add_executable(stage1_reachability_policy_test
-    stage1_reachability_policy_test.cc)
+dvstor_add_test(stage1_reachability_policy_test)
 dvstor_target_common_includes(stage1_reachability_policy_test)
-target_compile_options(stage1_reachability_policy_test PRIVATE -UNDEBUG)
-add_test(NAME stage1_reachability_policy_test
-         COMMAND stage1_reachability_policy_test)
 
-add_executable(configuration_update_protocol_test configuration_update_protocol_test.cc)
-dvstor_target_common_includes(configuration_update_protocol_test)
-target_link_libraries(configuration_update_protocol_test PRIVATE rdma_library)
-target_compile_options(configuration_update_protocol_test PRIVATE -UNDEBUG)
-add_test(NAME configuration_update_protocol_test COMMAND configuration_update_protocol_test)
-
-add_executable(partition_local_search_test partition_local_search_test.cc)
+dvstor_add_test(partition_local_search_test)
 dvstor_target_common_includes(partition_local_search_test)
-target_compile_options(partition_local_search_test PRIVATE -UNDEBUG)
-add_test(NAME partition_local_search_test COMMAND partition_local_search_test)
 
-add_executable(persistent_grid_plan_test persistent_grid_plan_test.cc)
+dvstor_add_test(persistent_grid_plan_test)
 dvstor_target_common_includes(persistent_grid_plan_test)
-target_compile_options(persistent_grid_plan_test PRIVATE -UNDEBUG)
-add_test(NAME persistent_grid_plan_test COMMAND persistent_grid_plan_test)
 
-add_executable(persistent_owner_watchdog_test
-    persistent_owner_watchdog_test.cc)
+dvstor_add_test(persistent_owner_watchdog_test)
 dvstor_target_common_includes(persistent_owner_watchdog_test)
-target_compile_options(persistent_owner_watchdog_test PRIVATE -UNDEBUG)
-add_test(NAME persistent_owner_watchdog_test
-         COMMAND persistent_owner_watchdog_test)
 
-add_executable(direct_owner_train_layout_test
-    direct_owner_train_layout_test.cc)
+dvstor_add_test(direct_owner_train_layout_test)
 dvstor_target_common_includes(direct_owner_train_layout_test)
-target_compile_options(direct_owner_train_layout_test PRIVATE -UNDEBUG)
-add_test(NAME direct_owner_train_layout_test
-         COMMAND direct_owner_train_layout_test)
 
-add_executable(frontier_staging_test frontier_staging_test.cc)
+dvstor_add_test(frontier_staging_test)
 dvstor_target_common_includes(frontier_staging_test)
-target_compile_options(frontier_staging_test PRIVATE -UNDEBUG)
-add_test(NAME frontier_staging_test COMMAND frontier_staging_test)
 
-add_executable(maintenance_fence_test maintenance_fence_test.cc)
+dvstor_add_test(maintenance_fence_test)
 dvstor_target_common_includes(maintenance_fence_test)
-target_compile_options(maintenance_fence_test PRIVATE -UNDEBUG)
-add_test(NAME maintenance_fence_test COMMAND maintenance_fence_test)
 
-add_executable(maintenance_telemetry_test maintenance_telemetry_test.cc)
+dvstor_add_test(maintenance_telemetry_test)
 dvstor_target_common_includes(maintenance_telemetry_test)
-target_compile_options(maintenance_telemetry_test PRIVATE -UNDEBUG)
-add_test(NAME maintenance_telemetry_test COMMAND maintenance_telemetry_test)
 
 if (TARGET dvstor_gpu_kernels)
     add_executable(host_distance_kernel_test host_distance_kernel_test.cu)
@@ -273,277 +142,105 @@ if (TARGET dvstor_gpu_kernels)
     add_test(NAME host_distance_kernel_test COMMAND host_distance_kernel_test)
     set_tests_properties(host_distance_kernel_test PROPERTIES
         TIMEOUT 15
+        RESOURCE_LOCK dvstor_gpu
         SKIP_REGULAR_EXPRESSION "^SKIP:")
 
-    add_executable(gpu_centroid_route_ranking_test
-        gpu_centroid_route_ranking_test.cu)
-    dvstor_target_common_includes(gpu_centroid_route_ranking_test)
-    target_link_libraries(gpu_centroid_route_ranking_test PRIVATE CUDA::cudart)
-    target_compile_options(gpu_centroid_route_ranking_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_centroid_route_ranking_test
-        COMMAND gpu_centroid_route_ranking_test)
-    set_tests_properties(gpu_centroid_route_ranking_test PROPERTIES
-        TIMEOUT 15
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
-
-    add_executable(gpu_compact_beam_merge_test
-        gpu_compact_beam_merge_test.cu)
-    dvstor_target_common_includes(gpu_compact_beam_merge_test)
-    target_link_libraries(gpu_compact_beam_merge_test PRIVATE CUDA::cudart)
-    target_compile_options(gpu_compact_beam_merge_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_compact_beam_merge_test
-        COMMAND gpu_compact_beam_merge_test)
-    set_tests_properties(gpu_compact_beam_merge_test PROPERTIES
-        TIMEOUT 15
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
-
-    add_executable(gpu_pq_packed_scoring_test
-        gpu_pq_packed_scoring_test.cu)
-    dvstor_target_common_includes(gpu_pq_packed_scoring_test)
-    target_link_libraries(gpu_pq_packed_scoring_test PRIVATE CUDA::cudart)
-    target_compile_options(gpu_pq_packed_scoring_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_pq_packed_scoring_test
-        COMMAND gpu_pq_packed_scoring_test)
-    set_tests_properties(gpu_pq_packed_scoring_test PROPERTIES
-        TIMEOUT 15
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
-
-    add_executable(gpu_beam_merge_equivalence_test
-        gpu_beam_merge_equivalence_test.cu)
-    dvstor_target_common_includes(gpu_beam_merge_equivalence_test)
-    target_link_libraries(gpu_beam_merge_equivalence_test PRIVATE CUDA::cudart)
-    target_compile_options(gpu_beam_merge_equivalence_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_beam_merge_equivalence_test
-        COMMAND gpu_beam_merge_equivalence_test)
-    set_tests_properties(gpu_beam_merge_equivalence_test PROPERTIES
-        TIMEOUT 15
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
-
-    add_executable(gpu_stable_run_merge_microbench
-        gpu_stable_run_merge_microbench.cu)
-    dvstor_target_common_includes(gpu_stable_run_merge_microbench)
-    target_link_libraries(gpu_stable_run_merge_microbench PRIVATE CUDA::cudart)
-    target_compile_options(gpu_stable_run_merge_microbench PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_stable_run_merge_microbench
-        COMMAND gpu_stable_run_merge_microbench)
-    set_tests_properties(gpu_stable_run_merge_microbench PROPERTIES
-        TIMEOUT 30
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
-
-    add_executable(gpu_stable_frontier_preview_test
-        gpu_stable_frontier_preview_test.cu)
-    dvstor_target_common_includes(gpu_stable_frontier_preview_test)
-    target_link_libraries(gpu_stable_frontier_preview_test PRIVATE CUDA::cudart)
-    target_compile_options(gpu_stable_frontier_preview_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_stable_frontier_preview_test
-        COMMAND gpu_stable_frontier_preview_test)
-    set_tests_properties(gpu_stable_frontier_preview_test PROPERTIES
-        TIMEOUT 30
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
-
-    add_executable(gpu_partition_bounded_certificate_test
-        gpu_partition_bounded_certificate_test.cu)
-    dvstor_target_common_includes(gpu_partition_bounded_certificate_test)
-    target_link_libraries(gpu_partition_bounded_certificate_test
-        PRIVATE CUDA::cudart)
-    target_compile_options(gpu_partition_bounded_certificate_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_partition_bounded_certificate_test
-        COMMAND gpu_partition_bounded_certificate_test)
-    set_tests_properties(gpu_partition_bounded_certificate_test PROPERTIES
-        TIMEOUT 30
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
-
-    add_executable(gpu_dominance_envelope_certificate_test
-        gpu_dominance_envelope_certificate_test.cu)
-    dvstor_target_common_includes(gpu_dominance_envelope_certificate_test)
-    target_link_libraries(gpu_dominance_envelope_certificate_test
-        PRIVATE CUDA::cudart)
-    target_compile_options(gpu_dominance_envelope_certificate_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_dominance_envelope_certificate_test
-        COMMAND gpu_dominance_envelope_certificate_test)
-    set_tests_properties(gpu_dominance_envelope_certificate_test PROPERTIES
-        TIMEOUT 60
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
-
-    add_executable(gpu_fused_prefix_materialization_test
-        gpu_fused_prefix_materialization_test.cu)
-    dvstor_target_common_includes(gpu_fused_prefix_materialization_test)
-    target_link_libraries(gpu_fused_prefix_materialization_test
-        PRIVATE CUDA::cudart)
-    target_compile_options(gpu_fused_prefix_materialization_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_fused_prefix_materialization_test
-        COMMAND gpu_fused_prefix_materialization_test)
-    set_tests_properties(gpu_fused_prefix_materialization_test PROPERTIES
-        TIMEOUT 30
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
-
-    add_executable(gpu_frontier_rob_test gpu_frontier_rob_test.cu)
-    dvstor_target_common_includes(gpu_frontier_rob_test)
-    target_link_libraries(gpu_frontier_rob_test PRIVATE CUDA::cudart)
-    target_compile_options(gpu_frontier_rob_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_frontier_rob_test COMMAND gpu_frontier_rob_test)
-    set_tests_properties(gpu_frontier_rob_test PROPERTIES
-        TIMEOUT 30
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
+    dvstor_add_cuda_test(gpu_centroid_route_ranking_test 15)
+    dvstor_add_cuda_test(gpu_compact_beam_merge_test 15)
+    dvstor_add_cuda_test(gpu_pq_packed_scoring_test 15)
+    dvstor_add_cuda_test(gpu_beam_merge_equivalence_test 15)
+    dvstor_add_cuda_test(gpu_stable_run_merge_microbench 30)
+    dvstor_add_cuda_test(gpu_stable_frontier_preview_test 30)
+    dvstor_add_cuda_test(gpu_partition_bounded_certificate_test 30)
+    dvstor_add_cuda_test(gpu_dominance_envelope_certificate_test 60)
+    dvstor_add_cuda_test(gpu_fused_prefix_materialization_test 30)
+    dvstor_add_cuda_test(gpu_frontier_rob_test 30)
 
     add_executable(gpu_persistent_dispatch_test gpu_persistent_dispatch_test.cc)
     target_link_libraries(gpu_persistent_dispatch_test PRIVATE dvstor_runtime)
     add_test(NAME gpu_persistent_dispatch_test COMMAND gpu_persistent_dispatch_test)
-    set_tests_properties(gpu_persistent_dispatch_test PROPERTIES
-        TIMEOUT 15
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
     add_test(NAME gpu_persistent_dispatch_pq32_test
         COMMAND gpu_persistent_dispatch_test 1024 10 8 32)
-    set_tests_properties(gpu_persistent_dispatch_pq32_test PROPERTIES
-        TIMEOUT 15
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
     add_test(NAME gpu_persistent_dispatch_pq20_test
         COMMAND gpu_persistent_dispatch_test 128 10 8 20)
-    set_tests_properties(gpu_persistent_dispatch_pq20_test PROPERTIES
-        TIMEOUT 15
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
     add_test(NAME gpu_persistent_dispatch_pq25_test
         COMMAND gpu_persistent_dispatch_test 128 10 8 25)
-    set_tests_properties(gpu_persistent_dispatch_pq25_test PROPERTIES
-        TIMEOUT 15
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
     add_test(NAME gpu_persistent_dispatch_256_test
         COMMAND gpu_persistent_dispatch_test 128 10 8 32 256)
-    set_tests_properties(gpu_persistent_dispatch_256_test PROPERTIES
+    # Each test selects device 0. Persistent kernels can prevent another
+    # process from making progress, so serialize GPU tests under ctest -j.
+    set_tests_properties(
+        gpu_persistent_dispatch_test
+        gpu_persistent_dispatch_pq32_test
+        gpu_persistent_dispatch_pq20_test
+        gpu_persistent_dispatch_pq25_test
+        gpu_persistent_dispatch_256_test PROPERTIES
         TIMEOUT 15
+        RESOURCE_LOCK dvstor_gpu
         SKIP_REGULAR_EXPRESSION "^SKIP:")
 endif ()
 
-add_executable(gpu_navigation_layout_test gpu_navigation_layout_test.cc)
+dvstor_add_test(gpu_navigation_layout_test)
 target_link_libraries(gpu_navigation_layout_test PRIVATE dvstor_runtime)
-target_compile_options(gpu_navigation_layout_test PRIVATE -UNDEBUG)
-add_test(NAME gpu_navigation_layout_test COMMAND gpu_navigation_layout_test)
 
-add_executable(host_orchestrated_policy_test
-    host_orchestrated_policy_test.cc)
+dvstor_add_test(host_orchestrated_policy_test)
 target_link_libraries(host_orchestrated_policy_test PRIVATE dvstor_runtime)
-target_compile_options(host_orchestrated_policy_test PRIVATE -UNDEBUG)
-add_test(NAME host_orchestrated_policy_test
-         COMMAND host_orchestrated_policy_test)
 
-add_executable(gpu_pq_index_test gpu_pq_index_test.cc)
+dvstor_add_test(gpu_pq_index_test)
 target_link_libraries(gpu_pq_index_test PRIVATE dvstor_runtime)
-target_compile_options(gpu_pq_index_test PRIVATE -UNDEBUG)
-add_test(NAME gpu_pq_index_test COMMAND gpu_pq_index_test)
 
-add_executable(graph_extent_indexer_test
+dvstor_add_test(graph_extent_indexer_test
     graph_extent_indexer_test.cc
     ${CMAKE_SOURCE_DIR}/tools/vamana_offline/graph_extent_indexer.cc)
 dvstor_target_tool_includes(graph_extent_indexer_test)
 target_link_libraries(graph_extent_indexer_test PRIVATE dvstor_runtime)
-target_compile_options(graph_extent_indexer_test PRIVATE -UNDEBUG)
-add_test(NAME graph_extent_indexer_test COMMAND graph_extent_indexer_test)
 
-add_executable(storage_reclaim_test storage_reclaim_test.cc)
+dvstor_add_test(storage_reclaim_test)
 target_link_libraries(storage_reclaim_test PRIVATE dvstor_runtime)
-target_compile_options(storage_reclaim_test PRIVATE -UNDEBUG)
-add_test(NAME storage_reclaim_test COMMAND storage_reclaim_test)
 
 find_package(Threads REQUIRED)
-add_executable(incarnation_lock_test incarnation_lock_test.cc)
+dvstor_add_test(incarnation_lock_test)
 dvstor_target_common_includes(incarnation_lock_test)
 target_link_libraries(incarnation_lock_test PRIVATE Threads::Threads)
-target_compile_options(incarnation_lock_test PRIVATE -UNDEBUG)
-add_test(NAME incarnation_lock_test COMMAND incarnation_lock_test)
 
-add_executable(stage2_remote_publication_test
-    stage2_remote_publication_test.cc)
+dvstor_add_test(stage2_remote_publication_test)
 dvstor_target_common_includes(stage2_remote_publication_test)
-target_compile_options(stage2_remote_publication_test PRIVATE -UNDEBUG)
-add_test(NAME stage2_remote_publication_test
-         COMMAND stage2_remote_publication_test)
 
-add_executable(storage_owner_protocol_test storage_owner_protocol_test.cc)
+dvstor_add_test(storage_owner_protocol_test)
 target_link_libraries(storage_owner_protocol_test PRIVATE dvstor_runtime)
-target_compile_options(storage_owner_protocol_test PRIVATE -UNDEBUG)
-add_test(NAME storage_owner_protocol_test COMMAND storage_owner_protocol_test)
 
-add_executable(storage_startup_protocol_test storage_startup_protocol_test.cc)
+dvstor_add_test(storage_startup_protocol_test)
 dvstor_target_common_includes(storage_startup_protocol_test)
-target_compile_options(storage_startup_protocol_test PRIVATE -UNDEBUG)
-add_test(NAME storage_startup_protocol_test
-         COMMAND storage_startup_protocol_test)
 
-add_executable(explicit_release_replay_test
-    explicit_release_replay_test.cc)
+dvstor_add_test(explicit_release_replay_test)
 dvstor_target_common_includes(explicit_release_replay_test)
-target_compile_options(explicit_release_replay_test PRIVATE -UNDEBUG)
-add_test(NAME explicit_release_replay_test
-         COMMAND explicit_release_replay_test)
 
-add_executable(storage_owner_stage2_tracker_test
-    storage_owner_stage2_tracker_test.cc)
-target_compile_options(storage_owner_stage2_tracker_test PRIVATE -UNDEBUG)
-add_test(NAME storage_owner_stage2_tracker_test
-    COMMAND storage_owner_stage2_tracker_test)
+dvstor_add_test(storage_owner_stage2_tracker_test)
 
-add_executable(stage2_reconcile_batch_state_test
-    stage2_reconcile_batch_state_test.cc)
+dvstor_add_test(stage2_reconcile_batch_state_test)
 dvstor_target_common_includes(stage2_reconcile_batch_state_test)
-target_compile_options(stage2_reconcile_batch_state_test PRIVATE -UNDEBUG)
-add_test(NAME stage2_reconcile_batch_state_test
-    COMMAND stage2_reconcile_batch_state_test)
 
-add_executable(stage2_batch_policy_test stage2_batch_policy_test.cc)
+dvstor_add_test(stage2_batch_policy_test)
 dvstor_target_common_includes(stage2_batch_policy_test)
-target_compile_options(stage2_batch_policy_test PRIVATE -UNDEBUG)
-add_test(NAME stage2_batch_policy_test COMMAND stage2_batch_policy_test)
 
-add_executable(storage_owner_reverse_outbox_test
-    storage_owner_reverse_outbox_test.cc)
+dvstor_add_test(stage2_budget_backlog_policy_test)
+dvstor_target_common_includes(stage2_budget_backlog_policy_test)
+
+dvstor_add_test(storage_owner_flow_control_policy_test)
+dvstor_target_common_includes(storage_owner_flow_control_policy_test)
+
+dvstor_add_test(storage_owner_reverse_outbox_test)
 dvstor_target_common_includes(storage_owner_reverse_outbox_test)
-target_compile_options(storage_owner_reverse_outbox_test PRIVATE -UNDEBUG)
-add_test(NAME storage_owner_reverse_outbox_test
-    COMMAND storage_owner_reverse_outbox_test)
 
-add_executable(storage_owner_home_rpc_outbox_test
-    storage_owner_home_rpc_outbox_test.cc)
+dvstor_add_test(storage_owner_home_rpc_outbox_test)
 dvstor_target_common_includes(storage_owner_home_rpc_outbox_test)
-target_compile_options(storage_owner_home_rpc_outbox_test PRIVATE -UNDEBUG)
-add_test(NAME storage_owner_home_rpc_outbox_test
-    COMMAND storage_owner_home_rpc_outbox_test)
 
-add_executable(storage_owner_ready_context_queue_test
-    storage_owner_ready_context_queue_test.cc)
+dvstor_add_test(storage_owner_ready_context_queue_test)
 dvstor_target_common_includes(storage_owner_ready_context_queue_test)
 target_link_libraries(storage_owner_ready_context_queue_test PRIVATE Threads::Threads)
-target_compile_options(storage_owner_ready_context_queue_test PRIVATE -UNDEBUG)
-add_test(NAME storage_owner_ready_context_queue_test
-    COMMAND storage_owner_ready_context_queue_test)
 
-add_executable(peer_async_response_registry_test
-    peer_async_response_registry_test.cc)
+dvstor_add_test(peer_async_response_registry_test)
 dvstor_target_common_includes(peer_async_response_registry_test)
-target_compile_options(peer_async_response_registry_test PRIVATE -UNDEBUG)
-add_test(NAME peer_async_response_registry_test
-    COMMAND peer_async_response_registry_test)
 
-add_executable(gpu_memory_budget_test gpu_memory_budget_test.cc)
+dvstor_add_test(gpu_memory_budget_test)
 target_link_libraries(gpu_memory_budget_test PRIVATE dvstor_runtime)
-target_compile_options(gpu_memory_budget_test PRIVATE -UNDEBUG)
-add_test(NAME gpu_memory_budget_test COMMAND gpu_memory_budget_test)

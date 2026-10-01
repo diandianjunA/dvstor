@@ -289,16 +289,6 @@ void set_error(std::string* error, const std::string& value) {
   if (error != nullptr) *error = value;
 }
 
-u32 shard_bits_for(u32 shard_count) {
-  u32 bits = 0;
-  u32 capacity = 1;
-  while (capacity < shard_count && bits < 31) {
-    capacity <<= 1;
-    ++bits;
-  }
-  return bits;
-}
-
 }  // namespace
 
 u64 align_up(u64 value, u64 alignment) {
@@ -352,7 +342,8 @@ bool validate_layout(const NavigationLayout& layout, std::string* error) {
         vamana::hot_graph::kTaggedNeighborBaseOffset +
           static_cast<u64>(layout.graph_degree) * kCompactPointerBytes ||
       layout.graph_entry_bytes > kMaxGraphEntryBytes ||
-      layout.graph_shard_bits != shard_bits_for(layout.num_shards) ||
+      layout.graph_shard_bits !=
+        vamana::hot_graph::shard_bits_for(layout.num_shards) ||
       layout.graph_shard_bits > RemotePtr::MEMORY_NODE_BITS) {
     set_error(error, "GPU navigation requires tagged graph records within one read block");
     return false;

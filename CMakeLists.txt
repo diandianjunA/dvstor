@@ -109,7 +109,6 @@ add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-math-errno>)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-trapping-math>)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
 add_compile_options(-DNOHUGEPAGES)
-#add_compile_options(-g -fno-omit-frame-pointer -fno-inline)  # for profiling
 
 set(DVSTOR_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(DVSTOR_CONDA_LIB_DIR "" CACHE PATH
@@ -197,6 +196,20 @@ set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
     tools/breakdown_benchmark/workload.cc
 )
 
+set(DVSTOR_METIS_REPARTITIONER_SOURCES
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/metis_repartitioner.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/dataset_io.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/graph.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/partitioning.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/progress.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/shard_writer.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/pq_indexer.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/graph_extent_indexer.cc
+    ${DVSTOR_SOURCE_ROOT}/src/service/index_metadata.cc
+    ${DVSTOR_SOURCE_ROOT}/src/gpu_search/index_format.cc
+    ${DVSTOR_SOURCE_ROOT}/src/gpu_search/pq_index.cc
+)
+
 function(dvstor_add_offline_tools)
     add_executable(vamana_offline_builder
         tools/vamana_offline_builder.cc
@@ -231,17 +244,7 @@ function(dvstor_add_offline_tools)
 
     add_executable(vamana_metis_repartitioner
         tools/vamana_metis_repartitioner.cc
-        tools/vamana_offline/metis_repartitioner.cc
-        tools/vamana_offline/dataset_io.cc
-        tools/vamana_offline/graph.cc
-        tools/vamana_offline/partitioning.cc
-        tools/vamana_offline/progress.cc
-        tools/vamana_offline/shard_writer.cc
-        tools/vamana_offline/pq_indexer.cc
-        tools/vamana_offline/graph_extent_indexer.cc
-        src/service/index_metadata.cc
-        src/gpu_search/index_format.cc
-        src/gpu_search/pq_index.cc)
+        ${DVSTOR_METIS_REPARTITIONER_SOURCES})
     dvstor_target_tool_includes(vamana_metis_repartitioner)
     target_link_libraries(vamana_metis_repartitioner
         rdma_library FaissCPU::FaissCPU)
@@ -249,107 +252,25 @@ function(dvstor_add_offline_tools)
 
 endfunction()
 
+add_executable(dvstor_memory_node
+    src/memory_node_main.cc
+    ${DVSTOR_MEMORY_NODE_SOURCES}
+    src/common/core_assignment.cc
+    src/common/timing.cc
+    src/service/index_metadata.cc
+)
+dvstor_target_common_includes(dvstor_memory_node)
+target_link_libraries(dvstor_memory_node rdma_library)
+
 if (DVSTOR_STORAGE_NODE_ONLY)
     message(STATUS "Storage-node build: CUDA and DOCA are disabled; CPU offline tools=${DVSTOR_BUILD_OFFLINE_TOOLS}")
-    add_executable(dvstor_memory_node
-        src/memory_node_main.cc
-        ${DVSTOR_MEMORY_NODE_SOURCES}
-        src/common/core_assignment.cc
-        src/common/timing.cc
-        src/service/index_metadata.cc
-    )
-    dvstor_target_common_includes(dvstor_memory_node)
-    target_link_libraries(dvstor_memory_node rdma_library)
     if (DVSTOR_BUILD_OFFLINE_TOOLS)
         dvstor_add_offline_tools()
     endif ()
     if (DVSTOR_BUILD_TESTS)
         enable_testing()
-        add_executable(vector_dtype_test test/vector_dtype_test.cc)
-        dvstor_target_common_includes(vector_dtype_test)
-        target_compile_options(vector_dtype_test PRIVATE -UNDEBUG)
-        add_test(NAME vector_dtype_test COMMAND vector_dtype_test)
-
-        add_executable(index_metadata_test
-            test/index_metadata_test.cc
-            src/service/index_metadata.cc
-            src/gpu_search/index_format.cc)
-        dvstor_target_common_includes(index_metadata_test)
-        target_compile_options(index_metadata_test PRIVATE -UNDEBUG)
-        add_test(NAME index_metadata_test COMMAND index_metadata_test)
-        set_tests_properties(index_metadata_test PROPERTIES TIMEOUT 10)
-
-        add_executable(rdma_contract_test test/rdma_contract_test.cc)
-        dvstor_target_common_includes(rdma_contract_test)
-        target_link_libraries(rdma_contract_test PRIVATE rdma_library)
-        target_compile_options(rdma_contract_test PRIVATE -UNDEBUG)
-        add_test(NAME rdma_contract_test COMMAND rdma_contract_test)
-        set_tests_properties(rdma_contract_test PROPERTIES TIMEOUT 10)
-
-        add_executable(configuration_update_protocol_test
-            test/configuration_update_protocol_test.cc)
-        dvstor_target_common_includes(configuration_update_protocol_test)
-        target_link_libraries(configuration_update_protocol_test PRIVATE rdma_library)
-        target_compile_options(configuration_update_protocol_test PRIVATE -UNDEBUG)
-        add_test(NAME configuration_update_protocol_test
-                 COMMAND configuration_update_protocol_test)
-        set_tests_properties(configuration_update_protocol_test PROPERTIES TIMEOUT 10)
-
-        add_executable(offline_local_id_set_test
-            test/offline_local_id_set_test.cc)
-        dvstor_target_tool_includes(offline_local_id_set_test)
-        target_compile_options(offline_local_id_set_test PRIVATE -UNDEBUG)
-        add_test(NAME offline_local_id_set_test
-                 COMMAND offline_local_id_set_test)
-        set_tests_properties(offline_local_id_set_test PROPERTIES TIMEOUT 10)
-
-        add_executable(shard_publication_test
-            test/shard_publication_test.cc
-            tools/vamana_offline/dataset_io.cc
-            tools/vamana_offline/graph.cc
-            tools/vamana_offline/partitioning.cc
-            tools/vamana_offline/progress.cc
-            tools/vamana_offline/shard_writer.cc)
-        dvstor_target_tool_includes(shard_publication_test)
-        target_link_libraries(shard_publication_test PRIVATE rdma_library)
-        target_compile_options(shard_publication_test PRIVATE -UNDEBUG)
-        add_test(NAME shard_publication_test
-                 COMMAND shard_publication_test)
-        set_tests_properties(shard_publication_test PROPERTIES TIMEOUT 20)
-
-        add_executable(vamana_offline_graph_test
-            test/vamana_offline_graph_test.cc
-            tools/vamana_offline/dataset_io.cc
-            tools/vamana_offline/graph.cc
-            tools/vamana_offline/progress.cc)
-        dvstor_target_tool_includes(vamana_offline_graph_test)
-        target_link_libraries(vamana_offline_graph_test PRIVATE rdma_library)
-        target_compile_options(vamana_offline_graph_test PRIVATE -UNDEBUG)
-        add_test(NAME vamana_offline_graph_test
-                 COMMAND vamana_offline_graph_test)
-        set_tests_properties(vamana_offline_graph_test PROPERTIES TIMEOUT 10)
-
-        add_executable(metis_repartitioner_test
-            test/metis_repartitioner_test.cc
-            tools/vamana_offline/metis_repartitioner.cc
-            tools/vamana_offline/dataset_io.cc
-            tools/vamana_offline/graph.cc
-            tools/vamana_offline/partitioning.cc
-            tools/vamana_offline/progress.cc
-            tools/vamana_offline/shard_writer.cc
-            tools/vamana_offline/pq_indexer.cc
-            tools/vamana_offline/graph_extent_indexer.cc
-            src/service/index_metadata.cc
-            src/gpu_search/index_format.cc
-            src/gpu_search/pq_index.cc)
-        dvstor_target_tool_includes(metis_repartitioner_test)
-        target_link_libraries(metis_repartitioner_test
-            rdma_library FaissCPU::FaissCPU)
-        target_link_metis(metis_repartitioner_test)
-        target_compile_options(metis_repartitioner_test PRIVATE -UNDEBUG)
-        add_test(NAME metis_repartitioner_test
-                 COMMAND metis_repartitioner_test)
-        set_tests_properties(metis_repartitioner_test PROPERTIES TIMEOUT 180)
+        include(DvstorTestHelpers)
+        include(test/cpu_tests.cmake)
     endif ()
 else ()
     find_path(DVSTOR_DOCA_INCLUDE_DIR doca_gpunetio.h
@@ -456,6 +377,7 @@ else ()
         src/service/compute_service/lifecycle.cc
         src/service/compute_service/search.cc
         src/service/compute_service/storage_owner/completion.cc
+        src/service/compute_service/storage_owner/flow_control.cc
         src/service/compute_service/storage_owner/lifecycle.cc
         src/service/compute_service/storage_owner/public_mutations.cc
         src/service/compute_service/storage_owner/sender.cc
@@ -494,16 +416,6 @@ else ()
         dvstor_target_tool_includes(dvstor_breakdown_support)
         target_link_libraries(dvstor_breakdown_support PUBLIC dvstor_runtime)
     endif ()
-
-    add_executable(dvstor_memory_node
-        src/memory_node_main.cc
-        ${DVSTOR_MEMORY_NODE_SOURCES}
-        src/common/core_assignment.cc
-        src/common/timing.cc
-        src/service/index_metadata.cc
-    )
-    dvstor_target_common_includes(dvstor_memory_node)
-    target_link_libraries(dvstor_memory_node rdma_library)
 
     if (DVSTOR_BUILD_EXECUTABLES)
         add_executable(dvstor_compute_node src/main.cc)

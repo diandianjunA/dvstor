@@ -28,9 +28,6 @@ void ComputeService::reset_breakdown_state() {
   storage_owner_max_rpc_wall_ns_.store(0, std::memory_order_relaxed);
 }
 
-void ComputeService::clear_thread_statistics() {
-}
-
 service::breakdown::Report ComputeService::collect_breakdown_report() const {
   return completed_breakdown_report_.collect();
 }

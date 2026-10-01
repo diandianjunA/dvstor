@@ -408,6 +408,13 @@ void MemoryNode::wake_peer_stage1_admission_waiters() {
   }
 }
 
+u64 MemoryNode::storage_owner_maintenance_incomplete() const {
+  return storage_owner_maintenance_completion_ring_ == nullptr
+    ? 0
+    : static_cast<u64>(
+        storage_owner_maintenance_completion_ring_->incomplete());
+}
+
 bool MemoryNode::storage_owner_cleanup_ready(u64 sequence) const {
   if (sequence <= 1) {
     return cleanup_predecessors_durable(sequence, 0);

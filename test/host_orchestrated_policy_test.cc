@@ -17,6 +17,15 @@ int main() {
   static_assert(!graph_snapshot_decodable(false, false));  // unresolved
   static_assert(!graph_snapshot_decodable(false, true));   // stale handle
   static_assert(!graph_snapshot_decodable(true, true));
+  using gpu_search::host_orchestrated_policy::
+    graph_snapshot_retry_backoff_us;
+  static_assert(graph_snapshot_retry_backoff_us(0) == 2);
+  static_assert(graph_snapshot_retry_backoff_us(1) == 4);
+  static_assert(graph_snapshot_retry_backoff_us(2) == 8);
+  static_assert(graph_snapshot_retry_backoff_us(3) == 16);
+  static_assert(graph_snapshot_retry_backoff_us(4) == 32);
+  static_assert(graph_snapshot_retry_backoff_us(5) == 64);
+  static_assert(graph_snapshot_retry_backoff_us(6) == 64);
 
   constexpr u32 kDim = 8;
   constexpr u32 kDegree = 8;

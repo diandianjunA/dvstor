@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 QUERY_THREADS="${QUERY_THREADS:-20}"
-UPDATE_THREADS="${UPDATE_THREADS:-0}"
+UPDATE_THREADS="${UPDATE_THREADS:-180}"
 PROFILES="${PROFILES:-baseline}"
 DATASET="${DATASET:-sift100m}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-15}"
@@ -181,15 +181,23 @@ for profile in "${profiles[@]}"; do
         read -r -p "看到 storage ready 后按 Enter（输入 q 退出）: " answer
         [[ "$answer" != q && "$answer" != Q ]] || exit 130
         ready_file="$SCRIPT_DIR/.storage_ready.tsv"
-        [[ -s "$ready_file" ]] || {
-          echo "missing storage ready marker: $ready_file" >&2; exit 1;
-        }
-        IFS=$'\t' read -r ready_token ready_dataset ready_profile storage_log_dir _ < "$ready_file"
-        if [[ "$ready_token" != "$run_token" || "$ready_dataset" != "$DATASET" ||
-              "$ready_profile" != "$profile" ]]; then
-          echo "storage marker does not match this case" >&2
-          echo "marker: $(<"$ready_file")" >&2
-          exit 1
+        if [[ -s "$ready_file" ]]; then
+          IFS=$'\t' read -r ready_token ready_dataset ready_profile \
+            ready_log_dir _ < "$ready_file"
+          if [[ "$ready_token" == "$run_token" &&
+                "$ready_dataset" == "$DATASET" &&
+                "$ready_profile" == "$profile" ]]; then
+            if [[ -d "$ready_log_dir" ]]; then
+              storage_log_dir="$ready_log_dir"
+              echo "[mixed-test] shared storage marker matched; collecting logs from $storage_log_dir"
+            else
+              echo "[mixed-test][warning] storage marker matched, but its log directory is not accessible on this compute node; continuing without storage-log collection" >&2
+            fi
+          else
+            echo "[mixed-test][warning] ignoring a stale/non-matching local storage marker; remote storage will be verified by the benchmark handshake and report" >&2
+          fi
+        else
+          echo "[mixed-test] no shared storage marker (normal for separate compute/storage filesystems); continuing with benchmark handshake validation"
         fi
       else
         echo "[mixed-test][warning] storage reset is delegated to the caller"

@@ -776,6 +776,11 @@ HostOrchestratedSearchEngine::read_maintenance_telemetry() {
   return impl_->read_maintenance_telemetry();
 }
 
+std::vector<MaintenanceWatermark>
+HostOrchestratedSearchEngine::read_maintenance_watermarks() {
+  return impl_->read_maintenance_watermarks();
+}
+
 TelemetrySnapshot HostOrchestratedSearchEngine::telemetry() const {
   return telemetry_.snapshot();
 }

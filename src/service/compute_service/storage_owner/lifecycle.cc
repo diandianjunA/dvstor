@@ -74,8 +74,16 @@ void ComputeService::start_storage_insert_runtime() {
     std::make_unique<service::breakdown::Sample[]>(total_task_capacity_u64);
   storage_maintenance_targets_ =
     std::make_unique<std::atomic<u64>[]>(owner_count);
+  storage_flow_control_next_sequences_ =
+    std::make_unique<std::atomic<u64>[]>(owner_count);
+  storage_flow_control_durable_sequences_ =
+    std::make_unique<std::atomic<u64>[]>(owner_count);
   for (u32 shard = 0; shard < owner_count; ++shard) {
     storage_maintenance_targets_[shard].store(0, std::memory_order_relaxed);
+    storage_flow_control_next_sequences_[shard].store(
+      1, std::memory_order_relaxed);
+    storage_flow_control_durable_sequences_[shard].store(
+      0, std::memory_order_relaxed);
   }
 
   storage_insert_owners_.reserve(owner_count);
@@ -141,6 +149,24 @@ void ComputeService::start_storage_insert_runtime() {
     std::thread([this]() { run_storage_insert_completion_loop(); });
   storage_insert_progress_thread_ =
     std::thread([this]() { run_storage_insert_progress_loop(); });
+  // Coupled mode publishes no Stage2 watermarks, so the poll thread would
+  // read a permanently idle control block; only decoupled inserts benefit.
+  const bool flow_control_enabled =
+    config_.storage_owner_flow_control_backlog_low != 0 &&
+    !config_.synchronous_exact_updates_enabled() &&
+    search_engine_ != nullptr;
+  if (flow_control_enabled) {
+    storage_flow_control_poll_thread_ =
+      std::thread([this]() { run_storage_flow_control_poll_loop(); });
+    print_status(
+      "storage-owner sender flow control: backlog low/high=" +
+      std::to_string(config_.storage_owner_flow_control_backlog_low) + "/" +
+      std::to_string(config_.storage_owner_flow_control_backlog_high) +
+      " poll_ms=" +
+      std::to_string(config_.storage_owner_flow_control_poll_ms) +
+      " max_delay_us=" +
+      std::to_string(config_.storage_owner_flow_control_max_delay_us));
+  }
   if (!config_.disable_thread_pinning) {
     const u32 progress_core = core_assignment_.get_available_core();
     const u32 completion_core = core_assignment_.get_available_core();
@@ -166,6 +192,23 @@ void ComputeService::stop_storage_insert_runtime() {
   }
   if (storage_ready_slots_) storage_ready_slots_->notify_all();
   if (storage_released_slots_) storage_released_slots_->notify_all();
+
+  // Join the watermark poller before the engine can be destroyed; it is the
+  // only flow-control thread that dereferences search_engine_.
+  if (storage_flow_control_poll_thread_.joinable()) {
+    storage_flow_control_poll_thread_.join();
+  }
+  if (storage_flow_control_refreshes_.load(std::memory_order_relaxed) != 0 ||
+      storage_flow_control_refresh_failures_.load(
+        std::memory_order_relaxed) != 0) {
+    print_status(
+      "storage-owner sender flow control: refreshes=" +
+      std::to_string(
+        storage_flow_control_refreshes_.load(std::memory_order_relaxed)) +
+      " refresh_failures=" +
+      std::to_string(storage_flow_control_refresh_failures_.load(
+        std::memory_order_relaxed)));
+  }
 
   if (storage_insert_progress_thread_.joinable()) {
     storage_insert_progress_thread_.join();
@@ -233,4 +276,6 @@ void ComputeService::release_storage_insert_runtime() {
   storage_completion_pool_.reset();
   storage_completion_samples_.reset();
   storage_maintenance_targets_.reset();
+  storage_flow_control_next_sequences_.reset();
+  storage_flow_control_durable_sequences_.reset();
 }
