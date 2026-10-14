@@ -771,9 +771,6 @@ void write_vamana_shards(const VamanaGraph& graph,
     shard_files[shard].write(reinterpret_cast<const char*>(&header), sizeof(header));
   }
 
-  vec<byte_t> node_buf(aligned_size, 0);
-  vec<byte_t> hot_graph_entry(hot_graph_entry_size, 0);
-  vec<RemotePtr> hot_neighbors(config.R);
   vec<u64> expected_node_checksums(
     config.num_memory_nodes, serialized_checksum_initial());
   vec<u64> expected_graph_checksums(
@@ -789,78 +786,136 @@ void write_vamana_shards(const VamanaGraph& graph,
   for (auto& entries : route_entries) {
     entries.reserve(vamana::centroid_state::kMaxLiveEntries);
   }
-  vec<u32> nbrs;
+
+  // Group node ordinals by owning shard in increasing order. Each shard's
+  // file stream, checksums, and centroid accumulators are then touched by
+  // exactly one writer thread, and per-shard accumulation order matches the
+  // former serial pass bit for bit.
+  vec<vec<u32>> shard_nodes(config.num_memory_nodes);
   for (size_t i = 0; i < n; ++i) {
-    std::fill(node_buf.begin(), node_buf.end(), 0);
-    byte_t* buf = node_buf.data();
-
-    const u64 node_header = VamanaNode::make_header(
-      0, VamanaNode::HEADER_CENTROID_ACCOUNTED);
-    const u32 node_id = dataset.id(i);
-    std::memcpy(buf, &node_header, sizeof(node_header));
-    std::memcpy(buf + VamanaNode::HEADER_SIZE, &node_id, sizeof(node_id));
-
-    graph.copy_neighbors(i, nbrs);
-    const u8 edge_count = static_cast<u8>(std::min<size_t>(nbrs.size(), config.R));
-    const u32 zero = 0;
-    std::memcpy(buf + VamanaNode::offset_generation(), &zero, sizeof(zero));
-    std::memcpy(
-      buf + VamanaNode::offset_slot_incarnation(), &zero, sizeof(zero));
-
-    std::memcpy(buf + VamanaNode::offset_vector(), dataset.raw_vector(i), dataset.vector_bytes);
-
-    std::fill(hot_neighbors.begin(), hot_neighbors.end(), RemotePtr{});
-    for (u8 j = 0; j < edge_count; ++j) {
-      const u32 nbr = nbrs[j];
-      RemotePtr nbr_ptr{placements[nbr].memory_node, placements[nbr].offset};
-      hot_neighbors[j] = nbr_ptr;
-    }
-
-    const auto& placement = placements[i];
-    for (u32 dimension = 0; dimension < dim; ++dimension) {
-      centroid_sums[placement.memory_node][dimension] +=
-        static_cast<f64>(vector_component_as_float(
-          dataset.raw_vector(i), dataset.dtype, dimension));
-    }
-    ++centroid_counts[placement.memory_node];
-    auto& file = shard_files[placement.memory_node];
-    file.seekp(static_cast<std::streamoff>(placement.offset));
-    file.write(reinterpret_cast<const char*>(node_buf.data()), static_cast<std::streamsize>(node_buf.size()));
-    lib_assert(file.good(), "failed to write temporary output shard node");
-    expected_node_checksums[placement.memory_node] =
-      serialized_checksum_update(
-        expected_node_checksums[placement.memory_node],
-        node_buf.data(), node_buf.size());
-    VamanaNode::encode_hot_graph_entry(hot_graph_entry.data(),
-                                       edge_count,
-                                       hot_neighbors.data(),
-                                       edge_count,
-                                       hot_graph_shard_bits,
-                                       0);
-    const u64 slot = (placement.offset - 16) / aligned_size;
-    const u64 hot_offset = hot_graph_entry_offsets[placement.memory_node] +
-      slot * hot_graph_entry_size;
-    file.seekp(static_cast<std::streamoff>(hot_offset));
-    file.write(reinterpret_cast<const char*>(hot_graph_entry.data()),
-               static_cast<std::streamsize>(hot_graph_entry_size));
-    lib_assert(file.good(),
-               "failed to write temporary compact hot graph entry");
-    expected_graph_checksums[placement.memory_node] =
-      serialized_checksum_update(
-        expected_graph_checksums[placement.memory_node],
-        hot_graph_entry.data(), hot_graph_entry_size);
-    progress.increment();
+    shard_nodes[placements[i].memory_node].push_back(static_cast<u32>(i));
   }
+  const auto route_less = [](const RouteEntryCandidate& lhs,
+                             const RouteEntryCandidate& rhs) {
+    return vamana::routing::centroid_seed_rank_less(lhs.rank, rhs.rank);
+  };
+  const size_t export_threads = effective_thread_count(config.threads);
+  parallel_for(static_cast<size_t>(0), config.num_memory_nodes, export_threads,
+               [&](size_t shard, size_t) {
+    vec<byte_t> node_buf(aligned_size, 0);
+    vec<byte_t> hot_graph_entry(hot_graph_entry_size, 0);
+    vec<RemotePtr> hot_neighbors(config.R);
+    vec<u32> nbrs;
+    auto& file = shard_files[shard];
+    for (const u32 i : shard_nodes[shard]) {
+      std::fill(node_buf.begin(), node_buf.end(), 0);
+      byte_t* buf = node_buf.data();
 
-  for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
-    shard_files[shard].flush();
-    lib_assert(shard_files[shard].good(),
+      const u64 node_header = VamanaNode::make_header(
+        0, VamanaNode::HEADER_CENTROID_ACCOUNTED);
+      const u32 node_id = dataset.id(i);
+      std::memcpy(buf, &node_header, sizeof(node_header));
+      std::memcpy(buf + VamanaNode::HEADER_SIZE, &node_id, sizeof(node_id));
+
+      graph.copy_neighbors(i, nbrs);
+      const u8 edge_count = static_cast<u8>(std::min<size_t>(nbrs.size(), config.R));
+      const u32 zero = 0;
+      std::memcpy(buf + VamanaNode::offset_generation(), &zero, sizeof(zero));
+      std::memcpy(
+        buf + VamanaNode::offset_slot_incarnation(), &zero, sizeof(zero));
+
+      std::memcpy(buf + VamanaNode::offset_vector(), dataset.raw_vector(i), dataset.vector_bytes);
+
+      std::fill(hot_neighbors.begin(), hot_neighbors.end(), RemotePtr{});
+      for (u8 j = 0; j < edge_count; ++j) {
+        const u32 nbr = nbrs[j];
+        RemotePtr nbr_ptr{placements[nbr].memory_node, placements[nbr].offset};
+        hot_neighbors[j] = nbr_ptr;
+      }
+
+      const auto& placement = placements[i];
+      for (u32 dimension = 0; dimension < dim; ++dimension) {
+        centroid_sums[shard][dimension] +=
+          static_cast<f64>(vector_component_as_float(
+            dataset.raw_vector(i), dataset.dtype, dimension));
+      }
+      ++centroid_counts[shard];
+      file.seekp(static_cast<std::streamoff>(placement.offset));
+      file.write(reinterpret_cast<const char*>(node_buf.data()), static_cast<std::streamsize>(node_buf.size()));
+      lib_assert(file.good(), "failed to write temporary output shard node");
+      expected_node_checksums[shard] =
+        serialized_checksum_update(
+          expected_node_checksums[shard],
+          node_buf.data(), node_buf.size());
+      VamanaNode::encode_hot_graph_entry(hot_graph_entry.data(),
+                                         edge_count,
+                                         hot_neighbors.data(),
+                                         edge_count,
+                                         hot_graph_shard_bits,
+                                         0);
+      const u64 slot = (placement.offset - 16) / aligned_size;
+      const u64 hot_offset = hot_graph_entry_offsets[shard] +
+        slot * hot_graph_entry_size;
+      file.seekp(static_cast<std::streamoff>(hot_offset));
+      file.write(reinterpret_cast<const char*>(hot_graph_entry.data()),
+                 static_cast<std::streamsize>(hot_graph_entry_size));
+      lib_assert(file.good(),
+                 "failed to write temporary compact hot graph entry");
+      expected_graph_checksums[shard] =
+        serialized_checksum_update(
+          expected_graph_checksums[shard],
+          hot_graph_entry.data(), hot_graph_entry_size);
+      progress.increment();
+    }
+    file.flush();
+    lib_assert(file.good(),
                "failed to flush temporary output shard file: " +
                  shard_temporary_paths[shard].string());
-    shard_files[shard].close();
-    lib_assert(!shard_files[shard].fail(),
+    file.close();
+    lib_assert(!file.fail(),
                "failed to close temporary output shard file: " +
                  shard_temporary_paths[shard].string());
+
+    // Initialize the runtime-maintained live route entries with the real
+    // base nodes nearest this physical shard's final compensated FP64
+    // centroid. This is O(shard_nodes*dim), uses O(1) extra memory and is
+    // dtype-independent; online maintenance later replaces entries from the
+    // authoritative live membership under the updated centroid.
+    if (centroid_counts[shard] == 0) return;
+    const f64 inverse_count =
+      1.0 / static_cast<f64>(centroid_counts[shard]);
+    auto& entries = route_entries[shard];
+    for (const u32 i : shard_nodes[shard]) {
+      const auto& placement = placements[i];
+      long double squared_l2 = 0;
+      for (u32 dimension = 0; dimension < dim; ++dimension) {
+        const long double component = static_cast<long double>(
+          vector_component_as_float(
+            dataset.raw_vector(i), dataset.dtype, dimension));
+        const long double centroid = static_cast<long double>(
+          centroid_sums[shard][dimension] * inverse_count);
+        const long double difference = component - centroid;
+        squared_l2 += difference * difference;
+      }
+      const RemotePtr pointer{static_cast<u32>(shard), placement.offset};
+      const RouteEntryCandidate candidate{
+        .rank = {
+          .squared_l2 = squared_l2,
+          .pointer_raw = pointer.raw_address,
+        },
+        .entry = {.remote_node = pointer.raw_address},
+      };
+      if (entries.size() < vamana::centroid_state::kMaxLiveEntries) {
+        entries.push_back(candidate);
+        std::sort(entries.begin(), entries.end(), route_less);
+      } else if (route_less(candidate, entries.back())) {
+        entries.back() = candidate;
+        std::sort(entries.begin(), entries.end(), route_less);
+      }
+    }
+  });
+
+  for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
     sync_file(shard_temporary_paths[shard]);
     validate_temporary_shard(
       shard_temporary_paths[shard], shard_sizes[shard],
@@ -871,50 +926,6 @@ void write_vamana_shards(const VamanaGraph& graph,
       shard_entry_counts[shard] * hot_graph_entry_size,
       expected_graph_checksums[shard]);
     progress.increment();
-  }
-
-  // Initialize the runtime-maintained live route entries with the real base
-  // nodes nearest each physical shard's final compensated FP64 centroid. This
-  // second offline pass is O(N*dim), uses O(shards) memory and is
-  // dtype-independent; online maintenance later replaces entries from the
-  // authoritative live membership under the updated centroid.
-  const auto route_less = [](const RouteEntryCandidate& lhs,
-                             const RouteEntryCandidate& rhs) {
-    return vamana::routing::centroid_seed_rank_less(lhs.rank, rhs.rank);
-  };
-  for (size_t i = 0; i < n; ++i) {
-    const auto& placement = placements[i];
-    const u32 shard = placement.memory_node;
-    lib_assert(centroid_counts[shard] != 0,
-               "centroid seed selection encountered an empty shard");
-    long double squared_l2 = 0;
-    const f64 inverse_count =
-      1.0 / static_cast<f64>(centroid_counts[shard]);
-    for (u32 dimension = 0; dimension < dim; ++dimension) {
-      const long double component = static_cast<long double>(
-        vector_component_as_float(
-          dataset.raw_vector(i), dataset.dtype, dimension));
-      const long double centroid = static_cast<long double>(
-        centroid_sums[shard][dimension] * inverse_count);
-      const long double difference = component - centroid;
-      squared_l2 += difference * difference;
-    }
-    const RemotePtr pointer{shard, placement.offset};
-    const RouteEntryCandidate candidate{
-      .rank = {
-        .squared_l2 = squared_l2,
-        .pointer_raw = pointer.raw_address,
-      },
-      .entry = {.remote_node = pointer.raw_address},
-    };
-    auto& entries = route_entries[shard];
-    if (entries.size() < vamana::centroid_state::kMaxLiveEntries) {
-      entries.push_back(candidate);
-      std::sort(entries.begin(), entries.end(), route_less);
-    } else if (route_less(candidate, entries.back())) {
-      entries.back() = candidate;
-      std::sort(entries.begin(), entries.end(), route_less);
-    }
   }
 
   vec<filepath_t> centroid_paths(config.num_memory_nodes);

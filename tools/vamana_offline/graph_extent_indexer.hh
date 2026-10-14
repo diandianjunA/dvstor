@@ -8,6 +8,7 @@ struct GraphExtentIndexOptions {
   filepath_t index_prefix;
   filepath_t output;
   u32 chunk_records{65'536};
+  u32 threads{};
   bool overwrite{};
 };
 

@@ -177,11 +177,13 @@ set(DVSTOR_PQ_INDEXER_SOURCES
     src/gpu_search/index_format.cc
     src/gpu_search/pq_index.cc
     tools/vamana_offline/pq_indexer.cc
+    tools/vamana_offline/progress.cc
 )
 
 set(DVSTOR_GRAPH_EXTENT_INDEXER_SOURCES
     src/gpu_search/index_format.cc
     tools/vamana_offline/graph_extent_indexer.cc
+    tools/vamana_offline/progress.cc
 )
 
 set(DVSTOR_BREAKDOWN_SUPPORT_SOURCES

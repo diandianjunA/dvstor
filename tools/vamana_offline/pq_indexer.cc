@@ -26,6 +26,7 @@
 #include "gpu_search/pq_index.hh"
 #include "nlohmann/json.hh"
 #include "remote_pointer.hh"
+#include "tools/vamana_offline/progress.hh"
 #include "vamana/centroid_state.hh"
 #include "vamana/vamana_node.hh"
 
@@ -500,7 +501,13 @@ gpu_search::pq::Model train_model(const vec<f32>& samples, const Layout& layout,
 void encode_shard(const filepath_t& prefix, const Layout& layout,
                   const gpu_search::pq::Model& model,
                   const PqIndexOptions& options, u32 shard,
-                  const filepath_t& output_path, u64 remote_offset) {
+                  const filepath_t& output_path, u64 remote_offset,
+                  u32 inner_threads) {
+  // omp_set_num_threads is a per-thread ICV: shard workers bound their own
+  // decode/Faiss encode teams so shard parallelism does not oversubscribe.
+  if (inner_threads > 0) {
+    omp_set_num_threads(static_cast<int>(inner_threads));
+  }
   const filepath_t input_path = index_path::shard_file(prefix, shard + 1, layout.shards);
   std::ifstream input(input_path, std::ios::binary);
   if (!input.good()) throw std::runtime_error("missing index shard: " + input_path.string());
@@ -706,9 +713,12 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   if (options.chunk_vectors == 0) {
     throw std::invalid_argument("PQ encode chunk size must be greater than zero");
   }
-  if (options.threads > 32) {
+  const u32 hardware_threads = std::max(1u, std::thread::hardware_concurrency());
+  const u32 max_configurable_threads = std::max(1024u, hardware_threads);
+  if (options.threads > max_configurable_threads) {
     throw std::invalid_argument(
-      "PQ training threads must be zero (automatic) or at most 32");
+      "PQ training threads must be zero (automatic) or at most " +
+      std::to_string(max_configurable_threads));
   }
   if (options.reuse_model.empty() &&
       std::min<u64>(options.train_samples, layout.node_count) <
@@ -719,9 +729,8 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   const PersistentLayout persistent = make_persistent_layout(
     metadata, layout, options.subquantizers);
   preflight_shard_files(options.index_prefix, layout);
-  const u32 hardware_threads = std::max(1u, std::thread::hardware_concurrency());
   const u32 training_threads = options.threads == 0
-    ? std::min<u32>(hardware_threads, 32) : std::min(options.threads, hardware_threads);
+    ? hardware_threads : std::min(options.threads, hardware_threads);
   if (training_threads == 0) {
     throw std::invalid_argument("PQ training threads must be greater than zero");
   }
@@ -786,13 +795,23 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   validate_temporary_model(temporary_model_file, model);
   sync_file(temporary_model_file);
 
-  for (u32 shard = 0; shard < layout.shards; ++shard) {
-    encode_shard(options.index_prefix, layout, model, options, shard,
+  const u32 encode_workers = static_cast<u32>(std::min<u64>(
+    layout.shards, training_threads));
+  const u32 encode_inner_threads =
+    std::max(1u, training_threads / encode_workers);
+  parallel_for(static_cast<size_t>(0), layout.shards, encode_workers,
+               [&](size_t shard, size_t) {
+    encode_shard(options.index_prefix, layout, model, options,
+                 static_cast<u32>(shard),
                  temporary_code_files[shard],
-                 persistent.code_offsets[shard]);
+                 persistent.code_offsets[shard],
+                 encode_inner_threads);
     validate_temporary_sidecar(
-      temporary_code_files[shard], layout, model, shard, persistent);
+      temporary_code_files[shard], layout, model,
+      static_cast<u32>(shard), persistent);
     sync_file(temporary_code_files[shard]);
+  });
+  for (u32 shard = 0; shard < layout.shards; ++shard) {
     if (persistent.code_region_bytes[shard] >
         std::numeric_limits<u64>::max() - result.code_bytes) {
       throw std::runtime_error("total PQ code byte count overflows");

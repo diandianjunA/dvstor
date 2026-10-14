@@ -21,6 +21,9 @@ int main(int argc, char** argv) {
      po::value<u32>(&options.chunk_records)
        ->default_value(options.chunk_records),
      "Complete graph records validated per sequential I/O chunk")
+    ("threads",
+     po::value<u32>(&options.threads)->default_value(options.threads),
+     "Shard validation threads; 0 uses all hardware threads")
     ("overwrite", po::bool_switch(&options.overwrite),
      "Atomically replace an existing graph extent sidecar");
   try {

@@ -135,7 +135,7 @@ void VamanaGraph::unlock_node(size_t node) {
   lock_stripes[node & (lock_stripe_count - 1)].clear(std::memory_order_release);
 }
 
-size_t compute_medoid(const Dataset& dataset) {
+size_t compute_medoid(const Dataset& dataset, size_t num_threads) {
   const size_t n = dataset.size();
   const u32 dim = dataset.dim;
   const size_t sample_size = std::min<size_t>(n, 10000);
@@ -155,13 +155,28 @@ size_t compute_medoid(const Dataset& dataset) {
   }
   for (u32 d = 0; d < dim; ++d) centroid[d] /= static_cast<float>(sample_size);
 
+  const size_t workers =
+    std::min(effective_thread_count(static_cast<u32>(num_threads)), n);
+  vec<float> worker_best_dist(workers, std::numeric_limits<float>::max());
+  vec<size_t> worker_best(workers, 0);
+  parallel_for(static_cast<size_t>(0), n, workers, [&](size_t i, size_t tid) {
+    const float dist = dataset_distance_float_query(dataset, centroid.data(), i);
+    if (dist < worker_best_dist[tid]) {
+      worker_best_dist[tid] = dist;
+      worker_best[tid] = i;
+    }
+  });
+
+  // Deterministic reduction: smallest distance wins, ties resolve to the
+  // lowest node id exactly as the serial scan did.
   size_t best = 0;
   float best_dist = std::numeric_limits<float>::max();
-  for (size_t i = 0; i < n; ++i) {
-    const float dist = dataset_distance_float_query(dataset, centroid.data(), i);
-    if (dist < best_dist) {
-      best_dist = dist;
-      best = i;
+  for (size_t tid = 0; tid < workers; ++tid) {
+    if (worker_best_dist[tid] == std::numeric_limits<float>::max()) continue;
+    if (worker_best_dist[tid] < best_dist ||
+        (worker_best_dist[tid] == best_dist && worker_best[tid] < best)) {
+      best_dist = worker_best_dist[tid];
+      best = worker_best[tid];
     }
   }
   return best;
@@ -389,7 +404,7 @@ void build_vamana_graph(VamanaGraph& graph,
   graph.init(n, dataset.dim, R);
 
   std::cerr << "computing medoid...\n";
-  graph.medoid = compute_medoid(dataset);
+  graph.medoid = compute_medoid(dataset, num_threads);
   std::cerr << "medoid: node " << graph.medoid << "\n";
 
   vec<u32> order(n);

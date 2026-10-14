@@ -124,16 +124,22 @@ Dataset read_dataset(const VamanaBuildConfig& config) {
     progress.increment(chunk_rows);
   }
   if (dataset.dtype == VectorDType::float32) {
-    const size_t component_count = dataset.vector_count * dataset.dim;
-    for (size_t index = 0; index < component_count; ++index) {
-      f32 component = 0.0f;
-      std::memcpy(&component,
-                  dataset.raw_vectors.data() + index * sizeof(component),
-                  sizeof(component));
-      if (!floating_value_is_finite(component)) {
-        lib_failure("float32 dataset contains a non-finite component");
+    const size_t validation_threads = effective_thread_count(config.threads);
+    parallel_for(static_cast<size_t>(0), dataset.vector_count, validation_threads,
+                 [&](size_t row, size_t) {
+      const byte_t* base =
+        dataset.raw_vectors.data() + row * dataset.vector_bytes;
+      for (u32 component_index = 0; component_index < dataset.dim;
+           ++component_index) {
+        f32 component = 0.0f;
+        std::memcpy(&component,
+                    base + component_index * sizeof(component),
+                    sizeof(component));
+        if (!floating_value_is_finite(component)) {
+          lib_failure("float32 dataset contains a non-finite component");
+        }
       }
-    }
+    });
   }
   progress.finish();
 

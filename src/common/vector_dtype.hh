@@ -178,6 +178,10 @@ inline vec<byte_t> encode_float_vector_to_storage(const span<const element_t> sr
 }
 
 inline void decode_storage_vector_to_float(const byte_t* src, VectorDType dtype, u32 dim, float* dst) {
+  if (dtype == VectorDType::float32) {
+    std::memcpy(dst, src, static_cast<size_t>(dim) * sizeof(float));
+    return;
+  }
   for (u32 i = 0; i < dim; ++i) {
     dst[i] = vector_component_as_float(src, dtype, i);
   }
@@ -451,6 +455,122 @@ inline float horizontal_sum_ps(__m256 value) {
   return _mm_cvtss_f32(sum);
 }
 
+inline __m256 squared_l2_accumulate_ps(__m256 acc, __m256 diff) {
+#ifdef __FMA__
+  return _mm256_fmadd_ps(diff, diff, acc);
+#else
+  return _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+#endif
+}
+
+#if defined(__AVX512F__)
+inline float horizontal_sum_ps(__m512 value) {
+  return horizontal_sum_ps(
+    _mm256_add_ps(_mm512_castps512_ps256(value),
+                  _mm512_extractf32x8_ps(value, 1)));
+}
+
+inline __m512 squared_l2_accumulate_ps(__m512 acc, __m512 diff) {
+  return _mm512_fmadd_ps(diff, diff, acc);
+}
+#endif  // __AVX512F__
+
+// Squared-L2 over float32 lanes. Unlike the integral byte kernels the float
+// accumulation order differs from the scalar f64 reference, so the result is
+// the correctly-rounded f32 sum of pairwise f32 partial sums; relative error
+// versus the f64 reference stays near float epsilon (verified by tests and
+// microbenchmarks). Non-finite intermediate results fall back to the scalar
+// f64 path so saturation semantics are preserved for extreme inputs.
+inline float l2_distance_float32_simd(const float* a, const float* b, u32 dim) {
+  float sum = 0.0f;
+  u32 i = 0;
+#if defined(__AVX512F__)
+  __m512 wacc0 = _mm512_setzero_ps();
+  __m512 wacc1 = _mm512_setzero_ps();
+  __m512 wacc2 = _mm512_setzero_ps();
+  __m512 wacc3 = _mm512_setzero_ps();
+  for (; i + 64 <= dim; i += 64) {
+    wacc0 = squared_l2_accumulate_ps(
+      wacc0, _mm512_sub_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i)));
+    wacc1 = squared_l2_accumulate_ps(
+      wacc1, _mm512_sub_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16)));
+    wacc2 = squared_l2_accumulate_ps(
+      wacc2, _mm512_sub_ps(_mm512_loadu_ps(a + i + 32), _mm512_loadu_ps(b + i + 32)));
+    wacc3 = squared_l2_accumulate_ps(
+      wacc3, _mm512_sub_ps(_mm512_loadu_ps(a + i + 48), _mm512_loadu_ps(b + i + 48)));
+  }
+  wacc0 = _mm512_add_ps(_mm512_add_ps(wacc0, wacc1), _mm512_add_ps(wacc2, wacc3));
+  for (; i + 16 <= dim; i += 16) {
+    wacc0 = squared_l2_accumulate_ps(
+      wacc0, _mm512_sub_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i)));
+  }
+  if (i < dim) {
+    const __mmask16 lane_mask =
+      static_cast<__mmask16>((1u << (dim - i)) - 1);
+    const __m512 diff = _mm512_sub_ps(
+      _mm512_maskz_loadu_ps(lane_mask, a + i),
+      _mm512_maskz_loadu_ps(lane_mask, b + i));
+    wacc0 = squared_l2_accumulate_ps(wacc0, diff);
+    i = dim;
+  }
+  sum = horizontal_sum_ps(wacc0);
+#endif  // __AVX512F__
+  __m256 acc0 = _mm256_setzero_ps();
+  __m256 acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps();
+  __m256 acc3 = _mm256_setzero_ps();
+  for (; i + 32 <= dim; i += 32) {
+    acc0 = squared_l2_accumulate_ps(
+      acc0, _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    acc1 = squared_l2_accumulate_ps(
+      acc1, _mm256_sub_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8)));
+    acc2 = squared_l2_accumulate_ps(
+      acc2, _mm256_sub_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16)));
+    acc3 = squared_l2_accumulate_ps(
+      acc3, _mm256_sub_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24)));
+  }
+  acc0 = _mm256_add_ps(acc0, acc1);
+  acc2 = _mm256_add_ps(acc2, acc3);
+  acc0 = _mm256_add_ps(acc0, acc2);
+  sum += horizontal_sum_ps(acc0);
+
+  for (; i < dim; ++i) {
+    const float diff = a[i] - b[i];
+    sum += diff * diff;
+  }
+  return sum;
+}
+
+inline float typed_l2_distance_float32_simd(const byte_t* lhs,
+                                            const byte_t* rhs,
+                                            u32 dim) {
+  const float* a = reinterpret_cast<const float*>(lhs);
+  const float* b = reinterpret_cast<const float*>(rhs);
+  const float sum = l2_distance_float32_simd(a, b, dim);
+  if (floating_value_is_finite(sum)) {
+    return std::min(sum, kMaxValidSquaredL2);
+  }
+  f64 wide_sum = 0.0;
+  for (u32 i = 0; i < dim; ++i) {
+    const f64 diff = static_cast<f64>(a[i]) - static_cast<f64>(b[i]);
+    wide_sum += diff * diff;
+  }
+  return saturate_squared_l2(wide_sum);
+}
+
+inline float typed_l2_distance_float_query_float32_simd(const span<const element_t> query,
+                                                        const byte_t* stored,
+                                                        u32 dim) {
+  const float* q = query.data();
+  const float* s = reinterpret_cast<const float*>(stored);
+  const float sum = l2_distance_float32_simd(q, s, dim);
+  if (floating_value_is_finite(sum)) {
+    return std::min(sum, kMaxValidSquaredL2);
+  }
+  return typed_l2_distance_float_query_scalar(
+    query, stored, VectorDType::float32, dim);
+}
+
 inline float typed_l2_distance_float_query_uint8_simd(const span<const element_t> query,
                                                       const byte_t* stored,
                                                       u32 dim) {
@@ -557,6 +677,9 @@ inline float typed_l2_distance(const byte_t* lhs,
                                u32 dim) {
 #ifdef __AVX2__
   if (lhs_dtype == rhs_dtype) {
+    if (lhs_dtype == VectorDType::float32) {
+      return typed_l2_distance_float32_simd(lhs, rhs, dim);
+    }
     if (lhs_dtype == VectorDType::uint8) {
       return typed_l2_distance_uint8_simd(lhs, rhs, dim);
     }
@@ -671,6 +794,9 @@ inline float typed_l2_distance_float_query(const span<const element_t> query,
                                            VectorDType stored_dtype,
                                            u32 dim) {
 #ifdef __AVX2__
+  if (stored_dtype == VectorDType::float32) {
+    return typed_l2_distance_float_query_float32_simd(query, stored, dim);
+  }
   if (stored_dtype == VectorDType::uint8) {
     return typed_l2_distance_float_query_uint8_simd(query, stored, dim);
   }

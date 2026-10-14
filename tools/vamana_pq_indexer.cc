@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     ("chunk-vectors", po::value<u32>(&options.chunk_vectors)->default_value(options.chunk_vectors),
      "Vectors encoded per sequential shard chunk")
     ("threads", po::value<u32>(&options.threads)->default_value(0),
-     "CPU threads; 0 uses at most 32 hardware threads")
+     "CPU threads; 0 uses all hardware threads")
     ("seed", po::value<u64>(&options.seed)->default_value(options.seed), "Training seed")
     ("overwrite", po::bool_switch(&options.overwrite), "Replace existing PQ outputs");
   try {

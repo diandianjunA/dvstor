@@ -43,7 +43,7 @@ struct NodeLockGuard {
   NodeLockGuard& operator=(NodeLockGuard&&) = delete;
 };
 
-size_t compute_medoid(const Dataset& dataset);
+size_t compute_medoid(const Dataset& dataset, size_t num_threads = 0);
 vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
                                        const Dataset& dataset,
                                        u32 query_id,

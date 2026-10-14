@@ -77,6 +77,55 @@ void test_integer_simd_matches_canonical_distance_for_arbitrary_dimensions() {
   }
 }
 
+void test_float_simd_matches_canonical_distance_for_arbitrary_dimensions() {
+  constexpr std::array<u32, 11> dimensions{
+    1, 7, 31, 32, 127, 128, 255, 256, 257, 4097, 65537};
+  for (const u32 dim : dimensions) {
+    vec<byte_t> lhs(static_cast<size_t>(dim) * sizeof(f32));
+    vec<byte_t> rhs(static_cast<size_t>(dim) * sizeof(f32));
+    u32 state = 0x9e3779b9u + dim;
+    for (u32 index = 0; index < dim; ++index) {
+      state = state * 1664525u + 1013904223u;
+      const f32 lv = static_cast<f32>(static_cast<i32>(state >> 8)) *
+        (1.0F / 8388608.0F);
+      state = state * 1664525u + 1013904223u;
+      const f32 rv = static_cast<f32>(static_cast<i32>(state >> 8)) *
+        (1.0F / 8388608.0F);
+      std::memcpy(lhs.data() + index * sizeof(f32), &lv, sizeof(f32));
+      std::memcpy(rhs.data() + index * sizeof(f32), &rv, sizeof(f32));
+    }
+    const f32 expected = scalar_same_dtype_distance(
+      lhs, rhs, VectorDType::float32, dim);
+    const f32 actual = typed_l2_distance(
+      lhs.data(), VectorDType::float32,
+      rhs.data(), VectorDType::float32, dim);
+    const f32 tolerance = std::max(1.0F, expected) * 2.0e-5F;
+    assert(std::abs(actual - expected) <= tolerance);
+
+    vec<f32> fractional_query(dim);
+    for (u32 index = 0; index < dim; ++index) {
+      fractional_query[index] =
+        vector_component_as_float(lhs.data(), VectorDType::float32, index) +
+        (index % 2 == 0 ? 0.25F : -0.5F);
+    }
+    const f32 scalar_query = typed_l2_distance_float_query_scalar(
+      span<const f32>{fractional_query}, rhs.data(),
+      VectorDType::float32, dim);
+    const f32 vectorized_query = typed_l2_distance_float_query(
+      span<const f32>{fractional_query}, rhs.data(),
+      VectorDType::float32, dim);
+    const f32 query_tolerance =
+      std::max(1.0F, scalar_query) * 2.0e-5F;
+    assert(std::abs(vectorized_query - scalar_query) <= query_tolerance);
+
+    vec<f32> decoded(dim);
+    decode_storage_vector_to_float(
+      lhs.data(), VectorDType::float32, dim, decoded.data());
+    assert(std::memcmp(decoded.data(), lhs.data(),
+                       static_cast<size_t>(dim) * sizeof(f32)) == 0);
+  }
+}
+
 void test_integral_alpha_threshold_matches_complete_distance() {
   constexpr u32 dim = 128;
   vec<byte_t> lhs(dim);
@@ -253,6 +302,7 @@ int main() {
   }
   test_unaligned_float_component_load();
   test_integer_simd_matches_canonical_distance_for_arbitrary_dimensions();
+  test_float_simd_matches_canonical_distance_for_arbitrary_dimensions();
   test_integral_alpha_threshold_matches_complete_distance();
   test_integral_alpha_threshold_exits_early_and_fallbacks_are_unchanged();
   return 0;

@@ -1,9 +1,11 @@
 #include "tools/vamana_offline/config.hh"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <thread>
 
 #include <boost/program_options.hpp>
 #include <library/utils.hh>
@@ -75,8 +77,11 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
   if (config.num_memory_nodes == 0) lib_failure("--memory-nodes must be > 0");
   if (config.num_memory_nodes > RemotePtr::MEMORY_NODE_MASK + 1)
     lib_failure("--memory-nodes exceeds the 64-shard tagged pointer limit");
-  if (config.threads > 32)
-    lib_failure("--threads must be zero (automatic) or at most 32");
+  const u32 max_configurable_threads =
+    std::max<u32>(1024, std::thread::hardware_concurrency());
+  if (config.threads > max_configurable_threads)
+    lib_failure("--threads must be zero (automatic) or at most " +
+                std::to_string(max_configurable_threads));
   if (config.R == 0) lib_failure("--R must be > 0");
   if (config.beam_width == 0) lib_failure("--beam-width must be > 0");
   if (!std::isfinite(config.alpha) || config.alpha < 1.0)

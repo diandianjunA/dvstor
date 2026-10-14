@@ -12,6 +12,7 @@
 #include <limits>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -334,9 +335,13 @@ SourceContract load_source_contract(const MetisRepartitionOptions &options) {
       source.alpha < 1.0) {
     fail("METIS degree/imbalance or source alpha is invalid");
   }
-  if (options.threads == 0 || options.threads > 32 ||
+  const u32 max_repartitioner_threads =
+    std::max<u32>(1024, std::thread::hardware_concurrency());
+  if (options.threads == 0 || options.threads > max_repartitioner_threads ||
       options.pq_chunk_vectors == 0) {
-    fail("--threads must be in [1,32] and --pq-chunk-vectors must be > 0");
+    fail("--threads must be in [1," +
+         std::to_string(max_repartitioner_threads) +
+         "] and --pq-chunk-vectors must be > 0");
   }
   source.data_file = options.data_path.empty()
                          ? required<filepath_t>(source.document, "data_file")

@@ -3,9 +3,9 @@ set -euo pipefail
 
 # Safe offline defaults are established before sourcing the historical SIFT
 # common file. Explicit caller overrides are preserved after profile loading.
-BUILD_THREAD_LIMIT=32
-BUILD_JOBS="${BUILD_JOBS:-16}"
-BUILD_THREADS="${BUILD_THREADS:-16}"
+BUILD_THREAD_LIMIT="${BUILD_THREAD_LIMIT:-$(nproc)}"
+BUILD_JOBS="${BUILD_JOBS:-$BUILD_THREAD_LIMIT}"
+BUILD_THREADS="${BUILD_THREADS:-$BUILD_THREAD_LIMIT}"
 REQUESTED_PARTITION_STRATEGY="${PARTITION_STRATEGY:-balanced}"
 REQUESTED_INDEX_PREFIX="${PQ_INDEX_PREFIX:-${INDEX_PREFIX:-}}"
 
@@ -96,7 +96,7 @@ preflight_contract() {
     "$SHARDS" "$PARTITION_STRATEGY" "$PARTITION_MAX_DEGREE" \
     "$PARTITION_IMBALANCE" "$ALPHA" "$PQ_SUBQUANTIZERS" \
     "$PQ_TRAIN_SAMPLES" "$BUILD_THREADS" "$PQ_THREADS" \
-    "$check_resources" <<'PY_PREFLIGHT'
+    "$BUILD_THREAD_LIMIT" "$check_resources" <<'PY_PREFLIGHT'
 import math
 import os
 from pathlib import Path
@@ -172,7 +172,7 @@ def main():
     (raw_data, raw_output, raw_vectors, raw_dim, dtype, raw_degree,
      raw_beam, raw_shards, partition, raw_pmd, raw_imbalance, raw_alpha,
      raw_pq, raw_train, raw_build_threads, raw_pq_threads,
-     raw_check_resources) = sys.argv[1:]
+     raw_thread_limit, raw_check_resources) = sys.argv[1:]
     data = Path(raw_data)
     output = Path(raw_output)
     max_vectors = positive('MAX_VECTORS', raw_vectors)
@@ -185,6 +185,7 @@ def main():
     train = positive('PQ_TRAIN_SAMPLES', raw_train)
     build_threads = positive('BUILD_THREADS', raw_build_threads)
     pq_threads = positive('PQ_THREADS', raw_pq_threads)
+    thread_limit = positive('BUILD_THREAD_LIMIT', raw_thread_limit)
     imbalance = finite_at_least(
         'PARTITION_IMBALANCE', raw_imbalance, 1.0)
     alpha = finite_at_least('ALPHA', raw_alpha, 1.0)
@@ -231,8 +232,9 @@ def main():
         fail(f'DIM={dim} is not divisible by PQ_SUBQUANTIZERS={pq}')
     if train < 256:
         fail('PQ_TRAIN_SAMPLES must be >= 256')
-    if build_threads > 32 or pq_threads > 32:
-        fail('offline build thread counts must not exceed 32')
+    if build_threads > thread_limit or pq_threads > thread_limit:
+        fail('offline build thread counts must not exceed '
+             f'BUILD_THREAD_LIMIT={thread_limit}')
 
     if raw_check_resources == '1':
         output.mkdir(parents=True, exist_ok=True)

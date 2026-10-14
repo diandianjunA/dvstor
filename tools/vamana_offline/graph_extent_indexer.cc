@@ -15,6 +15,7 @@
 #include "gpu_search/index_format.hh"
 #include "nlohmann/json.hh"
 #include "remote_pointer.hh"
+#include "tools/vamana_offline/progress.hh"
 #include "vamana/hot_graph.hh"
 
 namespace tools::vamana_offline {
@@ -359,23 +360,39 @@ GraphExtentIndexResult build_graph_extent_index(
       std::numeric_limits<size_t>::max() / layout.entry_bytes) {
     fail("graph extent chunk allocation overflows size_t");
   }
-  vec<byte_t> records(
-    static_cast<size_t>(chunk_records) * layout.entry_bytes);
-  vec<u8> classes(chunk_records);
-  u64 payload_checksum = gpu_search::format::checksum64_initial();
-  u64 nodes_written = 0;
-  u64 graph_bytes_validated = 0;
-  u32 maximum_class = 0;
+
+  // Validate shards concurrently. Each worker reads only its own shard file
+  // and records extent classes into its own dense buffer, so the serial
+  // write/checksum pass below observes the identical byte sequence as the
+  // former single-threaded pipeline.
+  vec<vec<u8>> shard_classes(layout.shards);
+  vec<u32> shard_maximum_class(layout.shards, 0);
   for (u32 shard = 0; shard < layout.shards; ++shard) {
+    if (layout.entry_counts[shard] >
+        std::numeric_limits<size_t>::max()) {
+      fail("graph extent shard record count overflows size_t");
+    }
+    shard_classes[shard].resize(
+      static_cast<size_t>(layout.entry_counts[shard]));
+  }
+  const size_t validation_workers = std::min<size_t>(
+    effective_thread_count(options.threads), layout.shards);
+  parallel_for(static_cast<size_t>(0), layout.shards, validation_workers,
+               [&](size_t shard, size_t) {
     const filepath_t shard_path = index_path::shard_file(
       options.index_prefix, shard + 1, layout.shards);
     std::ifstream input(shard_path, std::ios::binary);
     if (!input.good()) {
       fail("missing graph shard: " + shard_path.string());
     }
-    validate_shard_envelope(input, shard_path, layout, shard);
+    validate_shard_envelope(input, shard_path, layout,
+                            static_cast<u32>(shard));
     input.seekg(
       static_cast<std::streamoff>(layout.entry_offsets[shard]));
+    vec<byte_t> records(
+      static_cast<size_t>(chunk_records) * layout.entry_bytes);
+    vec<u8> classes(chunk_records);
+    u32 maximum_class = 0;
     for (u64 base = 0; base < layout.entry_counts[shard];
          base += chunk_records) {
       const u32 count = static_cast<u32>(std::min<u64>(
@@ -389,24 +406,40 @@ GraphExtentIndexResult build_graph_extent_index(
         classes[index] = validate_record_and_class(
           records.data() + static_cast<size_t>(index) *
             layout.entry_bytes,
-          layout, shard, base + index);
+          layout, static_cast<u32>(shard), base + index);
         maximum_class =
           std::max(maximum_class, static_cast<u32>(classes[index]));
       }
+      std::memcpy(
+        shard_classes[shard].data() + static_cast<size_t>(base),
+        classes.data(), count);
+    }
+    shard_maximum_class[shard] = maximum_class;
+  });
+
+  u64 payload_checksum = gpu_search::format::checksum64_initial();
+  u64 nodes_written = 0;
+  const u64 graph_bytes_validated = layout.nodes * layout.entry_bytes;
+  u32 maximum_class = 0;
+  for (u32 shard = 0; shard < layout.shards; ++shard) {
+    const vec<u8>& classes = shard_classes[shard];
+    for (size_t base = 0; base < classes.size(); base += chunk_records) {
+      const size_t count =
+        std::min<size_t>(chunk_records, classes.size() - base);
       extent.write(
-        reinterpret_cast<const char*>(classes.data()),
+        reinterpret_cast<const char*>(classes.data() + base),
         static_cast<std::streamsize>(count));
       if (!extent.good()) {
         fail("failed to write graph extent sidecar payload");
       }
       payload_checksum = gpu_search::format::checksum64_update(
-        payload_checksum, classes.data(), count);
-      nodes_written += count;
-      graph_bytes_validated += bytes;
+        payload_checksum, classes.data() + base, count);
     }
+    nodes_written += layout.entry_counts[shard];
+    maximum_class = std::max(maximum_class, shard_maximum_class[shard]);
   }
-  if (nodes_written != layout.nodes ||
-      graph_bytes_validated != layout.nodes * layout.entry_bytes) {
+  vec<vec<u8>>().swap(shard_classes);
+  if (nodes_written != layout.nodes) {
     fail("graph extent sidecar cardinality mismatch");
   }
 
