@@ -35,6 +35,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "Number of output shards / memory nodes.")
     ("threads,t", po::value<u32>(&config.threads)->default_value(config.threads),
      "Number of threads. 0 = hardware concurrency.")
+    ("export-threads", po::value<u32>(&config.export_threads)->default_value(config.export_threads),
+     "Shard export worker count; caps concurrently growing shard files. 0 = --threads.")
     ("R", po::value<u32>(&config.R)->default_value(config.R), "Maximum out-degree.")
     ("beam-width", po::value<u32>(&config.beam_width)->default_value(config.beam_width),
      "Beam width for beam search during offline construction.")
@@ -49,6 +51,10 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "Shard placement strategy: balanced, bfs, or metis.")
     ("partition-max-degree", po::value<u32>(&config.partition_max_degree)->default_value(config.partition_max_degree),
      "Maximum neighbors per node used to build the METIS partition graph.")
+    ("partition-kmeans-samples", po::value<u64>(&config.partition_kmeans_samples)->default_value(config.partition_kmeans_samples),
+     "Sample size for kmeans vector-space partitioning.")
+    ("partition-kmeans-iters", po::value<u32>(&config.partition_kmeans_iters)->default_value(config.partition_kmeans_iters),
+     "Lloyd iterations for kmeans vector-space partitioning.")
     ("partition-imbalance", po::value<double>(&config.partition_imbalance)->default_value(config.partition_imbalance),
      "METIS ubvec balance tolerance, e.g. 1.03 allows about 3% imbalance.")
     ("skip-sanity-check", po::bool_switch(&config.skip_sanity_check),
@@ -56,8 +62,20 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     ("preflight-only", po::bool_switch(&config.preflight_only),
      "Validate binary capabilities and command-line parameters without reading vectors.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
+    ("consolidation-chunk-bytes", po::value<size_t>(&config.consolidation_chunk_bytes)->default_value(config.consolidation_chunk_bytes),
+     "Target bytes per reverse-edge consolidation chunk CSR; 0 = automatic (32 GiB).")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
+    ("checkpoint-prefix", po::value<filepath_t>(&config.checkpoint_prefix),
+     "Enable pause/resume checkpoints under this prefix. Send SIGUSR1 to pause: "
+     "the builder commits a checkpoint at the next segment boundary and exits 75; "
+     "relaunch with the same flags to resume. Requires a fixed --seed.")
+    ("checkpoint-segment-nodes", po::value<size_t>(&config.checkpoint_segment_nodes)
+         ->default_value(config.checkpoint_segment_nodes),
+     "Main-loop segment size (nodes processed between pause checks).")
+    ("checkpoint-interval-segments", po::value<size_t>(&config.checkpoint_interval_segments)
+         ->default_value(config.checkpoint_interval_segments),
+     "Automatically commit a checkpoint every N segments; 0 disables periodic commits.")
     ("query-path", po::value<filepath_t>(&config.query_path),
      "Path to query file (.fbin) for post-build recall test.")
     ("groundtruth-path", po::value<filepath_t>(&config.groundtruth_path),
@@ -98,8 +116,9 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
   }
   if (config.partition_strategy != "balanced" &&
       config.partition_strategy != "bfs" &&
-      config.partition_strategy != "metis")
-    lib_failure("--partition-strategy must be balanced, bfs, or metis");
+      config.partition_strategy != "metis" &&
+      config.partition_strategy != "kmeans")
+    lib_failure("--partition-strategy must be balanced, bfs, metis, or kmeans");
   if (config.partition_max_degree == 0)
     lib_failure("--partition-max-degree must be > 0");
   if (config.partition_max_degree > config.R)
@@ -107,6 +126,9 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
   if (!std::isfinite(config.partition_imbalance) ||
       config.partition_imbalance < 1.0)
     lib_failure("--partition-imbalance must be finite and >= 1.0");
+  if (!config.checkpoint_prefix.empty() &&
+      config.checkpoint_segment_nodes == 0)
+    lib_failure("--checkpoint-segment-nodes must be > 0");
   return config;
 }
 

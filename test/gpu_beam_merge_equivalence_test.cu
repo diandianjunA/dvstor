@@ -166,53 +166,85 @@ void run_case(
   upload(d_candidate_distances, candidate_distances);
   for (const BeamMergePolicy policy :
        {BeamMergePolicy::legacy, BeamMergePolicy::stable_run}) {
+#if !DVSTOR_PERSISTENT_LEGACY_MERGE
+    if (policy == BeamMergePolicy::legacy) continue;
+#endif
+    // The register top-k reduction supports beam_capacity <=
+    // kPersistentMaxBeam (the production traversal beam ceiling); wider
+    // stable-run beams exist only in the 256-thread wide build.
+    if (policy == BeamMergePolicy::stable_run &&
+        threads == kApproximateSortThreadsCompact &&
+        beam_capacity > gpu_search::kPersistentMaxBeam) {
+      continue;
+    }
     const std::string policy_name =
       policy == BeamMergePolicy::legacy ? "legacy" : "stable-run";
     const std::string label = case_name + "," + policy_name;
-    upload(d_beam, old_handles);
-    upload(d_ids, old_ids);
-    upload(d_distances, old_distances);
-    upload(d_expanded, old_expanded);
-    check_cuda(cudaMemset(d_cycle_breakdown.get(), 0,
-                          sizeof(BeamMergeCycleBreakdown)),
-               "cudaMemset cycle breakdown");
-    beam_merge_kernel<<<1, threads>>>(
-      d_candidates.get(), d_candidate_distances.get(),
-      static_cast<u32>(candidate_handles.size()), d_beam.get(), d_ids.get(),
-      d_distances.get(), d_expanded.get(),
-      old_count, beam_capacity,
-      d_compact_handles.get(), d_compact_flags.get(),
-      d_compact_distances.get(), policy,
-      d_cycle_breakdown.get(), d_count.get());
-    check_cuda(cudaGetLastError(), "beam_merge_kernel launch");
-    check_cuda(cudaDeviceSynchronize(), "beam_merge_kernel");
-    const auto output_count = download(d_count);
-    const auto output_handles = download(d_beam);
-    const auto output_distances = download(d_distances);
-    const auto output_expanded = download(d_expanded);
-    const auto output_ids = download(d_ids);
-    const auto cycle_breakdown = download(d_cycle_breakdown);
-    if (output_count[0] != expected.beam.size()) {
-      throw std::runtime_error(
-        label + ": Beam merge valid count mismatch: expected " +
-        std::to_string(expected.beam.size()) + ", got " +
-        std::to_string(output_count[0]));
-    }
-    for (u32 index = 0; index < output_count[0]; ++index) {
-      if (output_handles[index] != expected.beam[index].handle ||
-          output_distances[index] != expected.beam[index].distance ||
-          output_expanded[index] != expected.beam[index].expanded ||
-          output_ids[index] != UINT32_MAX) {
+    // The stable-run reduction is a collective over shared scratch: run it
+    // twice on identical inputs so a synchronization or ordering defect shows
+    // up as a nondeterministic Beam even when one run happens to match the
+    // CPU reference.
+    const u32 repetitions =
+      policy == BeamMergePolicy::stable_run ? 2u : 1u;
+    std::vector<u64> first_handles;
+    std::vector<f32> first_distances;
+    std::vector<u8> first_expanded;
+    for (u32 repetition = 0; repetition < repetitions; ++repetition) {
+      upload(d_beam, old_handles);
+      upload(d_ids, old_ids);
+      upload(d_distances, old_distances);
+      upload(d_expanded, old_expanded);
+      check_cuda(cudaMemset(d_cycle_breakdown.get(), 0,
+                            sizeof(BeamMergeCycleBreakdown)),
+                 "cudaMemset cycle breakdown");
+      beam_merge_kernel<<<1, threads>>>(
+        d_candidates.get(), d_candidate_distances.get(),
+        static_cast<u32>(candidate_handles.size()), d_beam.get(), d_ids.get(),
+        d_distances.get(), d_expanded.get(),
+        old_count, beam_capacity,
+        d_compact_handles.get(), d_compact_flags.get(),
+        d_compact_distances.get(), policy,
+        d_cycle_breakdown.get(), d_count.get());
+      check_cuda(cudaGetLastError(), "beam_merge_kernel launch");
+      check_cuda(cudaDeviceSynchronize(), "beam_merge_kernel");
+      const auto output_count = download(d_count);
+      const auto output_handles = download(d_beam);
+      const auto output_distances = download(d_distances);
+      const auto output_expanded = download(d_expanded);
+      const auto output_ids = download(d_ids);
+      const auto cycle_breakdown = download(d_cycle_breakdown);
+      if (output_count[0] != expected.beam.size()) {
         throw std::runtime_error(
-          label + ": Beam merge changed semantics at output " +
-          std::to_string(index));
+          label + ": Beam merge valid count mismatch: expected " +
+          std::to_string(expected.beam.size()) + ", got " +
+          std::to_string(output_count[0]));
       }
-    }
-    if (policy == BeamMergePolicy::stable_run &&
-        (cycle_breakdown[0].sort == 0 ||
-         cycle_breakdown[0].materialize == 0)) {
-      throw std::runtime_error(
-        label + ": stable-run cycle breakdown was not populated");
+      for (u32 index = 0; index < output_count[0]; ++index) {
+        if (output_handles[index] != expected.beam[index].handle ||
+            output_distances[index] != expected.beam[index].distance ||
+            output_expanded[index] != expected.beam[index].expanded ||
+            output_ids[index] != UINT32_MAX) {
+          throw std::runtime_error(
+            label + ": Beam merge changed semantics at output " +
+            std::to_string(index));
+        }
+      }
+      if (policy == BeamMergePolicy::stable_run &&
+          (cycle_breakdown[0].sort == 0 ||
+           cycle_breakdown[0].materialize == 0)) {
+        throw std::runtime_error(
+          label + ": stable-run cycle breakdown was not populated");
+      }
+      if (repetition == 0) {
+        first_handles = output_handles;
+        first_distances = output_distances;
+        first_expanded = output_expanded;
+      } else if (output_handles != first_handles ||
+                 output_distances != first_distances ||
+                 output_expanded != first_expanded) {
+        throw std::runtime_error(
+          label + ": stable-run merge is not deterministic across runs");
+      }
     }
   }
 }
@@ -353,10 +385,15 @@ int main() {
     }
     check_cuda(cudaSetDevice(0), "cudaSetDevice");
     run_matrix(128, 128);
+#if DVSTOR_PERSISTENT_WIDE_SORT
     run_matrix(256, 128);
-    // Exercise both compact-final-256 and wide Beam=256 paths.
+#endif
+    // Exercise the Beam=256 register top-k reduction (stable-run policy; the
+    // legacy compact-final-256 variant joins in legacy-enabled builds).
     run_matrix(128, 256);
+#if DVSTOR_PERSISTENT_WIDE_SORT
     run_matrix(256, 256);
+#endif
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

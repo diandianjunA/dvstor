@@ -7,6 +7,9 @@
 #include <iostream>
 #include <limits>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <library/utils.hh>
 
 #include "common/constants.hh"
@@ -111,18 +114,40 @@ Dataset read_dataset(const VamanaBuildConfig& config) {
             << "/" << dataset.total_vectors << ", dtype=" << vector_dtype_name(dataset.dtype)
             << ", vector_bytes=" << dataset.vector_bytes << ")\n";
 
-  dataset.raw_vectors.resize(dataset.vector_count * dataset.vector_bytes);
+  // mmap-reserve without touching the pages; the parallel pread workers below
+  // first-touch their own chunks, which spreads the buffer across NUMA nodes.
+  dataset.raw_vectors.reset(dataset.vector_count * dataset.vector_bytes);
+  input.close();
+  const int dataset_fd = ::open(dataset.source_file.c_str(), O_RDONLY);
+  lib_assert(dataset_fd >= 0,
+             "failed to open dataset file for reading: " + dataset.source_file.string());
   ProgressReporter progress{"Reading raw dataset", dataset.vector_count};
+  const size_t io_threads = effective_thread_count(config.threads);
   const size_t rows_per_chunk = std::max<size_t>(1, (64 * 1024 * 1024) / std::max<size_t>(1, dataset.vector_bytes));
-  for (size_t row = 0; row < dataset.vector_count; row += rows_per_chunk) {
+  const size_t num_chunks =
+    (dataset.vector_count + rows_per_chunk - 1) / rows_per_chunk;
+  const off_t payload_offset = static_cast<off_t>(2 * sizeof(u32));
+  parallel_for(static_cast<size_t>(0), num_chunks, io_threads,
+               [&](size_t chunk_index, size_t) {
+    const size_t row = chunk_index * rows_per_chunk;
     const size_t chunk_rows = std::min(rows_per_chunk, dataset.vector_count - row);
-    byte_t* raw_dst = dataset.raw_vectors.data() + row * dataset.vector_bytes;
-    const size_t chunk_bytes = chunk_rows * dataset.vector_bytes;
-    if (!input.read(reinterpret_cast<char*>(raw_dst), static_cast<std::streamsize>(chunk_bytes))) {
-      lib_failure("failed to read dataset payload");
+    byte_t* dst = dataset.raw_vectors.data() + row * dataset.vector_bytes;
+    size_t remaining = chunk_rows * dataset.vector_bytes;
+    off_t offset = payload_offset + static_cast<off_t>(row * dataset.vector_bytes);
+    while (remaining > 0) {
+      const ssize_t got =
+        ::pread(dataset_fd, dst, remaining, offset);
+      if (got <= 0) {
+        lib_failure("failed to read dataset payload");
+      }
+      dst += got;
+      remaining -= static_cast<size_t>(got);
+      offset += got;
     }
     progress.increment(chunk_rows);
-  }
+  });
+  const int close_result = ::close(dataset_fd);
+  lib_assert(close_result == 0, "failed to close dataset file");
   if (dataset.dtype == VectorDType::float32) {
     const size_t validation_threads = effective_thread_count(config.threads);
     parallel_for(static_cast<size_t>(0), dataset.vector_count, validation_threads,

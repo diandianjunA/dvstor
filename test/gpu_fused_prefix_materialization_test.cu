@@ -116,8 +116,7 @@ __global__ void stable_candidate_leaf_regression_kernel(
     const u64* candidate_handles, const f32* candidate_distances,
     const u32* candidate_counts, u64* output_handles,
     u8* output_flags, f32* output_distances) {
-  __shared__
-    ApproximateBlockSortCompactFinal256::TempStorage radix_storage;
+  __shared__ CandidateSortWorkspace sort_workspace;
 
   const u32 cta = blockIdx.x;
   for (u32 iteration = 0;
@@ -125,9 +124,8 @@ __global__ void stable_candidate_leaf_regression_kernel(
     const u32 leaf = cta * kLeafRegressionIterations + iteration;
     const u32 input_offset = leaf * kLeafRegressionInputSize;
     const u32 output_offset = leaf * kLeafRegressionOutputSize;
-    stable_sort_candidate_run<ApproximateBlockSortCompactFinal256,
-                              kApproximateSortItemsCompactFinal256>(
-      radix_storage, candidate_handles, candidate_distances,
+    stable_sort_candidate_run(
+      sort_workspace, candidate_handles, candidate_distances,
       input_offset + candidate_counts[leaf], input_offset,
       output_handles, output_flags, output_distances,
       output_offset, kLeafRegressionOutputSize, nullptr, nullptr);

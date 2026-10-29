@@ -9,27 +9,64 @@
 #include "gpu_search/device_ring.cuh"
 #include "gpu_search/types.hh"
 
+// The production persistent query kernel runs 128-thread CTAs with the
+// stable-run beam merge.  The 256-thread (wide) and legacy merge sort paths
+// exist for ablation builds only; leaving them compiled out keeps the CTA's
+// static shared-memory footprint small enough for three resident CTAs per SM
+// on GA102 (100-KiB shared/SM).  Override at configure time with
+// -DDVSTOR_PERSISTENT_WIDE_SORT=ON / -DDVSTOR_PERSISTENT_LEGACY_MERGE=ON.
+#ifndef DVSTOR_PERSISTENT_WIDE_SORT
+#define DVSTOR_PERSISTENT_WIDE_SORT 0
+#endif
+#ifndef DVSTOR_PERSISTENT_LEGACY_MERGE
+#define DVSTOR_PERSISTENT_LEGACY_MERGE 0
+#endif
+
 namespace gpu_search {
 
 inline constexpr u32 kPersistentMaxBeam = kMaxPersistentTraversalBeam;
-inline constexpr u32 kPersistentMaxExact = 256;
+inline constexpr u32 kPersistentMaxExact = 512;
 inline constexpr u32 kPersistentMaxSubquantizers = kMaxPersistentSubquantizers;
 // Zero selects the compatibility kernel whose PQ loop remains runtime-sized.
-// The production datasets use one of the three compile-time specializations
+// The production datasets use one of the compile-time specializations
 // below so their persistent query kernel contains only the active scorer.
 inline constexpr u32 kPersistentRuntimePqSubquantizers = 0;
 inline constexpr u32 kPersistentPq20Subquantizers = 20;
 inline constexpr u32 kPersistentPq25Subquantizers = 25;
 inline constexpr u32 kPersistentPq32Subquantizers = 32;
+inline constexpr u32 kPersistentPq64Subquantizers = 64;
+inline constexpr u32 kPersistentPq128Subquantizers = 128;
+inline constexpr u32 kPersistentPq256Subquantizers = 256;
 
 inline constexpr u32 persistent_pq_kernel_specialization(
   u32 pq_subquantizers) {
-  return pq_subquantizers == kPersistentPq20Subquantizers ||
-      pq_subquantizers == kPersistentPq25Subquantizers ||
-      pq_subquantizers == kPersistentPq32Subquantizers
-    ? pq_subquantizers
-    : kPersistentRuntimePqSubquantizers;
+  switch (pq_subquantizers) {
+    case kPersistentPq20Subquantizers:
+    case kPersistentPq25Subquantizers:
+    case kPersistentPq32Subquantizers:
+    case kPersistentPq64Subquantizers:
+    case kPersistentPq128Subquantizers:
+    case kPersistentPq256Subquantizers:
+      return pq_subquantizers;
+    default:
+      return kPersistentRuntimePqSubquantizers;
+  }
 }
+
+// Static-code PQ scoring stages the per-query distance LUT in dynamic shared
+// memory one subquantizer tile at a time: the whole CTA copies one contiguous
+// tile with fully coalesced float4 loads, then every candidate gathers only
+// from shared memory.  A tile of four subquantizers is one packed u32 code
+// load per candidate and costs 4 KiB of dynamic shared memory, which keeps
+// three 128-thread CTAs resident per SM on GA100-class parts (48,532 B static
+// + 4,096 B dynamic + reservation < 164 KiB / 3).  The persistent kernel is
+// always launched with kPersistentPqLutTileBytes of dynamic shared memory.
+inline constexpr u32 kPersistentPqLutTileSubquantizers = 4;
+inline constexpr u32 kPersistentPqLutTileBytes =
+  kPersistentPqLutTileSubquantizers * 256u * 4u;
+// Below this candidate count the tile staging cost dominates and the direct
+// per-candidate scoring loop (identical arithmetic) is cheaper.
+inline constexpr u32 kPersistentPqLutTileMinCandidates = 128;
 inline constexpr u32 kPersistentMaxGraphDegree = 128;
 // The authoritative commit frontier preserves the legacy maximum batch width.
 // The speculative ROB is independently bounded by the same compile-time
@@ -454,6 +491,7 @@ struct PersistentKernelParams {
   u32 final_rerank_width{};
   u32 exact_width{};
   u32 max_expansions{};
+  u32 centroid_route_fanout{1};
   u32 commit_width{};
   u32 issue_width{};
   u32 beam_merge_policy{};

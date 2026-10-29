@@ -367,55 +367,176 @@ GraphExtentIndexResult build_graph_extent_index(
   // former single-threaded pipeline.
   vec<vec<u8>> shard_classes(layout.shards);
   vec<u32> shard_maximum_class(layout.shards, 0);
-  for (u32 shard = 0; shard < layout.shards; ++shard) {
-    if (layout.entry_counts[shard] >
-        std::numeric_limits<size_t>::max()) {
-      fail("graph extent shard record count overflows size_t");
+  if (!options.merge_partials) {
+    const u32 first_shard = options.only_shard == 0 ? 0 : options.only_shard - 1;
+    const u32 last_shard =
+      options.only_shard == 0 ? layout.shards : options.only_shard;
+    if (first_shard >= layout.shards || last_shard > layout.shards) {
+      fail("--only-shard is outside the shard range");
     }
-    shard_classes[shard].resize(
-      static_cast<size_t>(layout.entry_counts[shard]));
-  }
-  const size_t validation_workers = std::min<size_t>(
-    effective_thread_count(options.threads), layout.shards);
-  parallel_for(static_cast<size_t>(0), layout.shards, validation_workers,
-               [&](size_t shard, size_t) {
-    const filepath_t shard_path = index_path::shard_file(
-      options.index_prefix, shard + 1, layout.shards);
-    std::ifstream input(shard_path, std::ios::binary);
-    if (!input.good()) {
-      fail("missing graph shard: " + shard_path.string());
-    }
-    validate_shard_envelope(input, shard_path, layout,
-                            static_cast<u32>(shard));
-    input.seekg(
-      static_cast<std::streamoff>(layout.entry_offsets[shard]));
-    vec<byte_t> records(
-      static_cast<size_t>(chunk_records) * layout.entry_bytes);
-    vec<u8> classes(chunk_records);
-    u32 maximum_class = 0;
-    for (u64 base = 0; base < layout.entry_counts[shard];
-         base += chunk_records) {
-      const u32 count = static_cast<u32>(std::min<u64>(
-        chunk_records, layout.entry_counts[shard] - base));
-      const size_t bytes =
-        static_cast<size_t>(count) * layout.entry_bytes;
-      read_exact(
-        input, records.data(), bytes,
-        "reading complete compact graph records");
-      for (u32 index = 0; index < count; ++index) {
-        classes[index] = validate_record_and_class(
-          records.data() + static_cast<size_t>(index) *
-            layout.entry_bytes,
-          layout, static_cast<u32>(shard), base + index);
-        maximum_class =
-          std::max(maximum_class, static_cast<u32>(classes[index]));
+    for (u32 shard = first_shard; shard < last_shard; ++shard) {
+      if (layout.entry_counts[shard] >
+          std::numeric_limits<size_t>::max()) {
+        fail("graph extent shard record count overflows size_t");
       }
-      std::memcpy(
-        shard_classes[shard].data() + static_cast<size_t>(base),
-        classes.data(), count);
+      shard_classes[shard].resize(
+        static_cast<size_t>(layout.entry_counts[shard]));
     }
-    shard_maximum_class[shard] = maximum_class;
-  });
+    const size_t validation_workers = std::min<size_t>(
+      effective_thread_count(options.threads), last_shard - first_shard);
+    parallel_for(static_cast<size_t>(first_shard), last_shard, validation_workers,
+                 [&](size_t shard, size_t) {
+      const filepath_t shard_path = index_path::shard_file(
+        options.index_prefix, shard + 1, layout.shards);
+      std::ifstream input(shard_path, std::ios::binary);
+      if (!input.good()) {
+        fail("missing graph shard: " + shard_path.string());
+      }
+      validate_shard_envelope(input, shard_path, layout,
+                              static_cast<u32>(shard));
+      input.seekg(
+        static_cast<std::streamoff>(layout.entry_offsets[shard]));
+      vec<byte_t> records(
+        static_cast<size_t>(chunk_records) * layout.entry_bytes);
+      vec<u8> classes(chunk_records);
+      u32 maximum_class = 0;
+      for (u64 base = 0; base < layout.entry_counts[shard];
+           base += chunk_records) {
+        const u32 count = static_cast<u32>(std::min<u64>(
+          chunk_records, layout.entry_counts[shard] - base));
+        const size_t bytes =
+          static_cast<size_t>(count) * layout.entry_bytes;
+        read_exact(
+          input, records.data(), bytes,
+          "reading complete compact graph records");
+        for (u32 index = 0; index < count; ++index) {
+          classes[index] = validate_record_and_class(
+            records.data() + static_cast<size_t>(index) *
+              layout.entry_bytes,
+            layout, static_cast<u32>(shard), base + index);
+          maximum_class =
+            std::max(maximum_class, static_cast<u32>(classes[index]));
+        }
+        std::memcpy(
+          shard_classes[shard].data() + static_cast<size_t>(base),
+          classes.data(), count);
+      }
+      shard_maximum_class[shard] = maximum_class;
+    });
+  
+  
+}
+
+  if (options.only_shard != 0) {
+    const u32 shard = options.only_shard - 1;
+    const filepath_t partial{
+      output.string() + ".shard" + std::to_string(options.only_shard)};
+    TemporaryFile partial_tmp{make_temporary_path(partial)};
+    std::ofstream partial_out(
+      partial_tmp.path, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!partial_out.good()) {
+      fail("failed to create graph extent partial: " + partial.string());
+    }
+    const vec<u8>& classes = shard_classes[shard];
+    partial_out.write(reinterpret_cast<const char*>(classes.data()),
+                      static_cast<std::streamsize>(classes.size()));
+    partial_out.close();
+    if (partial_out.fail()) {
+      fail("failed to write graph extent partial: " + partial.string());
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(partial_tmp.path, partial, rename_error);
+    if (rename_error) {
+      fail("failed to publish graph extent partial: " + rename_error.message());
+    }
+    partial_tmp.published = true;
+    return {
+      .output = partial,
+      .node_count = layout.entry_counts[shard],
+      .payload_bytes = layout.entry_counts[shard],
+      .payload_checksum = 0,
+      .graph_bytes_validated =
+        layout.entry_counts[shard] * layout.entry_bytes,
+      .maximum_class = shard_maximum_class[shard],
+    };
+  }
+
+  if (options.merge_partials) {
+    vec<vec<u8>>().swap(shard_classes);
+    u64 payload_checksum = gpu_search::format::checksum64_initial();
+    u64 nodes_written = 0;
+    vec<byte_t> buffer(static_cast<size_t>(options.chunk_records) *
+                       layout.entry_bytes);
+    for (u32 shard = 0; shard < layout.shards; ++shard) {
+      const filepath_t partial{
+        output.string() + ".shard" + std::to_string(shard + 1)};
+      std::ifstream input(partial, std::ios::binary);
+      if (!input.good()) {
+        fail("missing graph extent partial: " + partial.string());
+      }
+      u64 remaining = layout.entry_counts[shard];
+      while (remaining > 0) {
+        const size_t chunk =
+          static_cast<size_t>(std::min<u64>(remaining, buffer.size()));
+        read_exact(input, buffer.data(), chunk,
+                   "reading graph extent partial");
+        extent.write(reinterpret_cast<const char*>(buffer.data()),
+                     static_cast<std::streamsize>(chunk));
+        if (!extent.good()) {
+          fail("failed to write graph extent sidecar payload");
+        }
+        payload_checksum = gpu_search::format::checksum64_update(
+          payload_checksum, buffer.data(), chunk);
+        remaining -= chunk;
+      }
+      nodes_written += layout.entry_counts[shard];
+    }
+    if (nodes_written != layout.nodes) {
+      fail("graph extent merged cardinality mismatch");
+    }
+    gpu_search::format::GraphExtentHeader header{
+      .graph_entry_bytes = layout.entry_bytes,
+      .graph_entry_capacity = layout.capacity,
+      .num_shards = layout.shards,
+      .num_nodes = layout.nodes,
+      .payload_bytes = layout.nodes,
+      .build_fingerprint = layout.build_fingerprint,
+      .payload_checksum = payload_checksum,
+    };
+    std::string header_error;
+    if (!gpu_search::format::write_graph_extent_header(
+          extent, header, &header_error)) {
+      fail(header_error);
+    }
+    extent.flush();
+    if (!extent.good()) fail("failed to flush graph extent sidecar");
+    extent.close();
+    if (extent.fail()) fail("failed to close graph extent sidecar");
+    std::error_code size_error;
+    const u64 actual_bytes =
+      std::filesystem::file_size(temporary.path, size_error);
+    if (size_error || actual_bytes != sizeof(header) + layout.nodes) {
+      fail("merged graph extent sidecar has an incomplete payload");
+    }
+    if (!options.overwrite && std::filesystem::exists(output)) {
+      fail("graph extent sidecar appeared during merge; refusing to overwrite");
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(temporary.path, output, rename_error);
+    if (rename_error) {
+      fail("failed to publish merged graph extent sidecar: " +
+           rename_error.message());
+    }
+    temporary.published = true;
+    return {
+      .output = output,
+      .node_count = layout.nodes,
+      .payload_bytes = layout.nodes,
+      .payload_checksum = payload_checksum,
+      .graph_bytes_validated = 0,
+      .maximum_class = 0,
+    };
+  }
 
   u64 payload_checksum = gpu_search::format::checksum64_initial();
   u64 nodes_written = 0;

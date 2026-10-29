@@ -789,6 +789,137 @@ inline bool typed_l2_distance_alpha_leq_source(
     static_cast<f64>(source_distance);
 }
 
+enum class L2PruneEarlyDecision : u32 {
+  undecided = 0,
+  pruned = 1,
+  not_pruned = 2,
+};
+
+// Conservative early decision for the alpha RobustPrune predicate
+//   alpha * typed_l2_distance(lhs, rhs) <= source_distance
+// evaluated on equal-dtype dataset pairs.  Returning `pruned` or
+// `not_pruned` guarantees that the original float predicate evaluates the
+// same way; `undecided` means the caller must compute the exact distance
+// with typed_l2_distance() and evaluate the predicate itself.  The decision
+// bands below are wider than the worst-case float rounding gap between the
+// chunked accumulators used here and the established full-distance kernels,
+// so an early decision can never flip a prune verdict.
+inline L2PruneEarlyDecision typed_l2_prune_predicate_early(
+    const byte_t* lhs,
+    VectorDType lhs_dtype,
+    const byte_t* rhs,
+    VectorDType rhs_dtype,
+    u32 dim,
+    f64 alpha,
+    distance_t source_distance) {
+  if (lhs_dtype != rhs_dtype || !(alpha > 0.0) ||
+      !floating_value_is_finite(alpha)) {
+    return L2PruneEarlyDecision::undecided;
+  }
+  const f64 source = static_cast<f64>(source_distance);
+
+  if (lhs_dtype == VectorDType::uint8 || lhs_dtype == VectorDType::int8) {
+    // Component differences are integers, so the f64 partial sums are exact;
+    // the margin only covers the float rounding of the final predicate
+    // multiplication for non-power-of-two alpha values.
+    constexpr f64 kMargin = 1e-6;
+    constexpr u32 kChunk = 32;
+    f64 exact_sum = 0.0;
+    u32 offset = 0;
+    while (offset < dim) {
+      const u32 chunk = std::min<u32>(kChunk, dim - offset);
+#ifdef __AVX2__
+      exact_sum += lhs_dtype == VectorDType::uint8
+        ? static_cast<f64>(typed_l2_distance_uint8_simd_chunk(
+            lhs + offset, rhs + offset, chunk))
+        : static_cast<f64>(typed_l2_distance_int8_simd_chunk(
+            lhs + offset, rhs + offset, chunk));
+#else
+      if (lhs_dtype == VectorDType::uint8) {
+        const auto* a = reinterpret_cast<const u8*>(lhs + offset);
+        const auto* b = reinterpret_cast<const u8*>(rhs + offset);
+        for (u32 index = 0; index < chunk; ++index) {
+          const i32 diff =
+            static_cast<i32>(a[index]) - static_cast<i32>(b[index]);
+          exact_sum += static_cast<f64>(diff * diff);
+        }
+      } else {
+        const auto* a = reinterpret_cast<const i8*>(lhs + offset);
+        const auto* b = reinterpret_cast<const i8*>(rhs + offset);
+        for (u32 index = 0; index < chunk; ++index) {
+          const i32 diff =
+            static_cast<i32>(a[index]) - static_cast<i32>(b[index]);
+          exact_sum += static_cast<f64>(diff * diff);
+        }
+      }
+#endif
+      offset += chunk;
+      if (alpha * exact_sum > source * (1.0 + kMargin)) {
+        return L2PruneEarlyDecision::not_pruned;
+      }
+    }
+    if (alpha * exact_sum <= source * (1.0 - kMargin)) {
+      return L2PruneEarlyDecision::pruned;
+    }
+    if (alpha * exact_sum > source * (1.0 + kMargin)) {
+      return L2PruneEarlyDecision::not_pruned;
+    }
+    return L2PruneEarlyDecision::undecided;
+  }
+
+  if (lhs_dtype == VectorDType::float32) {
+    // Short float accumulators per chunk keep the partial-sum rounding error
+    // near float epsilon; chunk sums are combined in f64.  The 1e-5 band is
+    // an order of magnitude wider than the gap between this evaluation order
+    // and the established typed_l2_distance float32 kernels.
+    constexpr f64 kMargin = 1e-5;
+    constexpr u32 kChunk = 32;
+    const float* a = reinterpret_cast<const float*>(lhs);
+    const float* b = reinterpret_cast<const float*>(rhs);
+    f64 sum = 0.0;
+    u32 offset = 0;
+    while (offset < dim) {
+      const u32 chunk = std::min<u32>(kChunk, dim - offset);
+      f64 chunk_sum = 0.0;
+#ifdef __AVX2__
+      __m256 facc = _mm256_setzero_ps();
+      u32 j = 0;
+      for (; j + 8 <= chunk; j += 8) {
+        const __m256 diff = _mm256_sub_ps(
+          _mm256_loadu_ps(a + offset + j), _mm256_loadu_ps(b + offset + j));
+        facc = squared_l2_accumulate_ps(facc, diff);
+      }
+      chunk_sum = static_cast<f64>(horizontal_sum_ps(facc));
+      for (; j < chunk; ++j) {
+        const f64 diff = static_cast<f64>(a[offset + j]) -
+          static_cast<f64>(b[offset + j]);
+        chunk_sum += diff * diff;
+      }
+#else
+      for (u32 j = 0; j < chunk; ++j) {
+        const f64 diff = static_cast<f64>(a[offset + j]) -
+          static_cast<f64>(b[offset + j]);
+        chunk_sum += diff * diff;
+      }
+#endif
+      sum += chunk_sum;
+      offset += chunk;
+      if (alpha * sum > source * (1.0 + kMargin)) {
+        return L2PruneEarlyDecision::not_pruned;
+      }
+    }
+    if (alpha * sum <= source * (1.0 - kMargin)) {
+      return L2PruneEarlyDecision::pruned;
+    }
+    if (alpha * sum > source * (1.0 + kMargin)) {
+      return L2PruneEarlyDecision::not_pruned;
+    }
+    return L2PruneEarlyDecision::undecided;
+  }
+
+  return L2PruneEarlyDecision::undecided;
+}
+
 inline float typed_l2_distance_float_query(const span<const element_t> query,
                                            const byte_t* stored,
                                            VectorDType stored_dtype,

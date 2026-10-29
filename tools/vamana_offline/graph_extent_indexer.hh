@@ -10,6 +10,11 @@ struct GraphExtentIndexOptions {
   u32 chunk_records{65'536};
   u32 threads{};
   bool overwrite{};
+  // Per-shard mode for distributed builders: compute only this shard's
+  // classes (1-based) into "<output>.shard<N>" (raw bytes, no header).
+  u32 only_shard{0};
+  // Merge mode: concatenate "<output>.shard1..N" into the final sidecar.
+  bool merge_partials{};
 };
 
 struct GraphExtentIndexResult {

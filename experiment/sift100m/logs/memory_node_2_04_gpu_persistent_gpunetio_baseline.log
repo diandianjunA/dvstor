@@ -3,6 +3,7 @@
 ============================================================
 num clients:                  1
 TCP port:                     1235
+QP handshake timeout (ms):    10000
 IB device:                    <auto>
 IB port:                      1
 max outstanding CQEs:         64
@@ -18,17 +19,17 @@ registered memory GiB:            24
 ====================================================================
 1 device(s) found
 Selected device: ibp86s0
-Selected port state: 4, lid: 8
+Selected port state: 4, lid: 8, active_mtu: 5
 interleaved policy
 num_cores: 112
 physical cores per socket: 28
 hyperthreading enabled
 local process CPU partition: rank 1/5 logical_cpus=22
-pairing: 44048 -- 116967
+pairing: 6845 -- 61714
 [STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16 (layout=plain, vector_data_type=uint8)
 [STATUS]: storage-owner stage2 candidate width L=128 per shard
 allocation size: 25769803776
-allocated ALIGNED MEM (no hugepage) at 125372419014720 with buffer size 25769803776
+allocated ALIGNED MEM (no hugepage) at 136937692201024 with buffer size 25769803776
 [STATUS]: loading index (20436190144 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16_node2_of5.dat
 [STATUS]: loaded GPU PQ codes (659231936 Bytes) at remote offset 20436194240
 [STATUS]: storage-owner idmap loaded entries=20000000 format=owner_sharded_v2_bound immutable_base=true dynamic_shards=256 dynamic_reserved=65536
@@ -36,116 +37,116 @@ allocated ALIGNED MEM (no hugepage) at 125372419014720 with buffer size 25769803
 [STATUS]: register memory and distribute access token
 [STATUS]: connect QPs of compute threads
 [STATUS]: reserving 64 GPU/bootstrap QPs per compute node
-pairing: 44053 -- 117003
-pairing: 44089 -- 117004
-pairing: 44090 -- 117005
-pairing: 44091 -- 117006
-pairing: 44092 -- 117007
-pairing: 44093 -- 117008
-pairing: 44094 -- 117009
-pairing: 44095 -- 117010
-pairing: 44096 -- 117011
-pairing: 44097 -- 117012
-pairing: 44098 -- 117013
-pairing: 44099 -- 117014
-pairing: 44100 -- 117015
-pairing: 44101 -- 117016
-pairing: 44102 -- 117017
-pairing: 44103 -- 117018
-pairing: 44104 -- 117019
-pairing: 44105 -- 117020
-pairing: 44106 -- 117021
-pairing: 44107 -- 117022
-pairing: 44108 -- 117023
-pairing: 44109 -- 117024
-pairing: 44110 -- 117025
-pairing: 44111 -- 117026
-pairing: 44112 -- 117027
-pairing: 44113 -- 117028
-pairing: 44114 -- 117029
-pairing: 44115 -- 117030
-pairing: 44116 -- 117031
-pairing: 44117 -- 117032
-pairing: 44118 -- 117033
-pairing: 44119 -- 117034
-pairing: 44120 -- 117132
-pairing: 44218 -- 117137
-pairing: 44223 -- 117142
-pairing: 44228 -- 117147
-pairing: 44233 -- 117152
-pairing: 44238 -- 117157
-pairing: 44243 -- 117162
-pairing: 44248 -- 117167
-pairing: 44253 -- 117172
-pairing: 44258 -- 117177
-pairing: 44263 -- 117182
-pairing: 44268 -- 117187
-pairing: 44273 -- 117192
-pairing: 44278 -- 117197
-pairing: 44283 -- 117202
-pairing: 44288 -- 117207
-pairing: 44293 -- 117212
-pairing: 44298 -- 117217
-pairing: 44303 -- 117222
-pairing: 44308 -- 117227
-pairing: 44313 -- 117232
-pairing: 44318 -- 117237
-pairing: 44323 -- 117242
-pairing: 44328 -- 117247
-pairing: 44333 -- 117252
-pairing: 44338 -- 117257
-pairing: 44343 -- 117262
-pairing: 44348 -- 117267
-pairing: 44353 -- 117272
-pairing: 44358 -- 117277
-pairing: 44363 -- 117282
-pairing: 44368 -- 117287
+pairing: 6850 -- 61750
+pairing: 6886 -- 61751
+pairing: 6887 -- 61752
+pairing: 6888 -- 61753
+pairing: 6889 -- 61754
+pairing: 6890 -- 61755
+pairing: 6891 -- 61756
+pairing: 6892 -- 61757
+pairing: 6893 -- 61758
+pairing: 6894 -- 61759
+pairing: 6895 -- 61760
+pairing: 6896 -- 61761
+pairing: 6897 -- 61762
+pairing: 6898 -- 61763
+pairing: 6899 -- 61764
+pairing: 6900 -- 61765
+pairing: 6901 -- 61766
+pairing: 6902 -- 61767
+pairing: 6903 -- 61768
+pairing: 6904 -- 61769
+pairing: 6905 -- 61770
+pairing: 6906 -- 61771
+pairing: 6907 -- 61772
+pairing: 6908 -- 61773
+pairing: 6909 -- 61774
+pairing: 6910 -- 61775
+pairing: 6911 -- 61776
+pairing: 6912 -- 61777
+pairing: 6913 -- 61778
+pairing: 6914 -- 61779
+pairing: 6915 -- 61780
+pairing: 6916 -- 61781
+pairing: 6917 -- 61879
+pairing: 7015 -- 61884
+pairing: 7020 -- 61889
+pairing: 7025 -- 61894
+pairing: 7030 -- 61899
+pairing: 7035 -- 61904
+pairing: 7040 -- 61909
+pairing: 7045 -- 61914
+pairing: 7050 -- 61919
+pairing: 7055 -- 61924
+pairing: 7060 -- 61929
+pairing: 7065 -- 61934
+pairing: 7070 -- 61939
+pairing: 7075 -- 61944
+pairing: 7080 -- 61949
+pairing: 7085 -- 61954
+pairing: 7090 -- 61959
+pairing: 7095 -- 61964
+pairing: 7100 -- 61969
+pairing: 7105 -- 61974
+pairing: 7110 -- 61979
+pairing: 7115 -- 61984
+pairing: 7120 -- 61989
+pairing: 7125 -- 61994
+pairing: 7130 -- 61999
+pairing: 7135 -- 62004
+pairing: 7140 -- 62009
+pairing: 7145 -- 62014
+pairing: 7150 -- 62019
+pairing: 7155 -- 62024
+pairing: 7160 -- 62029
+pairing: 7165 -- 62034
 [STATUS]: waiting for compute-node startup barrier
 1 device(s) found
 Selected device: ibp86s0
-Selected port state: 4, lid: 8
-pairing: 44373 -- 44372
-pairing: 44375 -- 44376
-pairing: 44377 -- 44381
-pairing: 44383 -- 44389
-pairing: 44391 -- 44397
-pairing: 44400 -- 44405
-pairing: 44408 -- 44413
-pairing: 44416 -- 44421
-pairing: 44424 -- 44434
-pairing: 44437 -- 44438
-pairing: 44441 -- 44440
-pairing: 44444 -- 44442
-pairing: 44446 -- 44443
-pairing: 44448 -- 44445
-pairing: 44450 -- 44447
-pairing: 44453 -- 44449
-pairing: 44454 -- 44451
-pairing: 44456 -- 44452
-pairing: 44458 -- 44455
-pairing: 44460 -- 44457
-pairing: 44462 -- 44459
-pairing: 44465 -- 44461
-pairing: 44466 -- 44463
-pairing: 44468 -- 44464
-pairing: 44470 -- 44467
-pairing: 44472 -- 44469
-pairing: 44475 -- 44471
-pairing: 44476 -- 44473
-pairing: 44478 -- 44474
-pairing: 44481 -- 44479
-pairing: 44482 -- 44480
-pairing: 44484 -- 44483
+Selected port state: 4, lid: 8, active_mtu: 5
+pairing: 7170 -- 7169
+pairing: 7171 -- 7172
+pairing: 7175 -- 7177
+pairing: 7180 -- 7187
+pairing: 7189 -- 7193
+pairing: 7197 -- 7203
+pairing: 7205 -- 7210
+pairing: 7213 -- 7218
+pairing: 7221 -- 7231
+pairing: 7235 -- 7234
+pairing: 7238 -- 7237
+pairing: 7241 -- 7239
+pairing: 7244 -- 7240
+pairing: 7245 -- 7242
+pairing: 7247 -- 7243
+pairing: 7250 -- 7246
+pairing: 7251 -- 7248
+pairing: 7253 -- 7249
+pairing: 7255 -- 7252
+pairing: 7257 -- 7254
+pairing: 7259 -- 7256
+pairing: 7261 -- 7258
+pairing: 7263 -- 7260
+pairing: 7265 -- 7262
+pairing: 7267 -- 7264
+pairing: 7269 -- 7266
+pairing: 7271 -- 7268
+pairing: 7273 -- 7270
+pairing: 7275 -- 7272
+pairing: 7277 -- 7276
+pairing: 7279 -- 7278
+pairing: 7281 -- 7280
 [STATUS]: storage-owner peer RDMA QPs per peer: 8
 [STATUS]: storage-owner peer QP0 reserved for RPC; data RDMA uses QP1..7
-allocated ALIGNED MEM (no hugepage) at 125371351564352 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 108168649691136 with buffer size 25920
+allocated ALIGNED MEM (no hugepage) at 136936624750656 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 99948449393600 with buffer size 25920
 [STATUS]: storage-owner peer RPC receive slots per peer: 64 (requested=64)
 [STATUS]: storage-owner peer RPC concurrent sends per peer: 16
 [STATUS]: storage-owner peer RPC send credits: Stage1/graph are split at depth >= 2; responses use a dedicated sync buffer
 [STATUS]: storage-owner peer async response capacity: 32768
 [STATUS]: storage-owner peer update RPC payloads: disabled by append-only synchronous-exact mode
-allocated ALIGNED MEM (no hugepage) at 108168649794880 with buffer size 110592
+allocated ALIGNED MEM (no hugepage) at 99948449497280 with buffer size 110592
 [STATUS]: storage-owner peer reverse-update workers: 0
 [STATUS]: storage-owner peer Stage1 workers: 0; Stage2-home workers: 0 (disabled by synchronous-exact mode)
 [STATUS]: storage-owner physical control workers: cleanup=0 placement=0 (separate blocking domains)
@@ -159,20 +160,20 @@ allocated ALIGNED MEM (no hugepage) at 108168649794880 with buffer size 110592
 [STATUS]: storage-owner responses=foreground direct post; completion=repost by service poller
 [STATUS]: storage-owner foreground pipeline: coordinators=16 cpu_lanes=16 (assigned_cpus=22, rpc_parallelism=16)
 [STATUS]: storage-owner CPU plan: foreground_cpu=16 foreground_coordinators=16 maintenance=0 peer_stage1=0 (split into isolated Stage1/Stage2-home domains) peer_reverse=0 peer_cleanup=0 peer_placement=0 peer_progress=0 foreground_progress=1
-allocated ALIGNED MEM (no hugepage) at 125371591045184 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371586748480 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371584131136 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371583713344 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371583295552 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371582877760 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371582459968 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371579736128 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371579318336 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371578900544 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371578482752 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371575742528 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371575324736 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371574906944 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371574489152 with buffer size 213824
-allocated ALIGNED MEM (no hugepage) at 125371574071360 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936860573760 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936860155968 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936859738176 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936855539776 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936852922432 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936852504640 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936852086848 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936851669056 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936848928832 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936848511040 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936848093248 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936847675456 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936847257664 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936844533824 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936844116032 with buffer size 213824
+allocated ALIGNED MEM (no hugepage) at 136936843698240 with buffer size 213824
 [STATUS]: storage-owner insert runtime enabled on shard 1

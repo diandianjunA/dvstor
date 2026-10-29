@@ -18,7 +18,9 @@ using gpu_search::u8;
 using gpu_search::u32;
 using gpu_search::u64;
 using gpu_search::persistent_kernel_detail::CandidateWorkspace;
+#if DVSTOR_PERSISTENT_LEGACY_MERGE
 using gpu_search::persistent_kernel_detail::merge_approximate_compact;
+#endif
 
 void check_cuda(cudaError_t status, const char* operation) {
   if (status != cudaSuccess) {
@@ -81,12 +83,16 @@ __global__ void compact_merge_kernel(
   if (threadIdx.x == 0) beam_count = beam_capacity;
   __syncthreads();
   if (policy == BeamMergePolicy::legacy) {
+#if DVSTOR_PERSISTENT_LEGACY_MERGE
     merge_approximate_compact(
       candidate_handles, candidate_distances,
       beam_handles, beam_ids, beam_distances, beam_expanded,
       beam_count, beam_capacity, beam_capacity,
       beam_capacity + candidate_count,
       scratch_handles, scratch_expanded, scratch_distances, workspace);
+#else
+    __trap();
+#endif
   } else {
     merge_approximate_stable_runs(
       candidate_handles, candidate_distances, candidate_count,
@@ -147,6 +153,15 @@ void run_case(u32 beam_capacity) {
   copy_to_device(d_candidate_distances, candidate_distances);
   for (const BeamMergePolicy policy :
        {BeamMergePolicy::legacy, BeamMergePolicy::stable_run}) {
+#if !DVSTOR_PERSISTENT_LEGACY_MERGE
+    if (policy == BeamMergePolicy::legacy) continue;
+#endif
+    // The register top-k reduction supports beam_capacity <=
+    // kPersistentMaxBeam (the production traversal beam ceiling).
+    if (policy == BeamMergePolicy::stable_run &&
+        beam_capacity > gpu_search::kPersistentMaxBeam) {
+      continue;
+    }
     const std::string policy_name =
       policy == BeamMergePolicy::legacy ? "legacy" : "stable-run";
     copy_to_device(d_beam_handles, beam_handles);
@@ -202,6 +217,9 @@ int main() {
     }
     check_cuda(cudaSetDevice(0), "cudaSetDevice");
     run_case(128);
+    // Beam=256 exercises the register top-k reduction's wide reduction
+    // (stable-run policy; the legacy compact-final-256 variant joins in
+    // legacy-enabled builds).
     run_case(256);
     return 0;
   } catch (const std::exception& error) {

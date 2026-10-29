@@ -19,8 +19,8 @@ inline constexpr u32 kMaxSupportedGraphDegree = 128;
 // fixed compile-time Beam/PQ workspaces. Share these limits with builders and
 // configuration preflight so expensive incompatible indexes are never made.
 inline constexpr u64 kMaxGpuNavigationNodes = (u64{1} << 30) - 1;
-inline constexpr u32 kMaxPersistentTraversalBeam = 128;
-inline constexpr u32 kMaxPersistentSubquantizers = 32;
+inline constexpr u32 kMaxPersistentTraversalBeam = 256;
+inline constexpr u32 kMaxPersistentSubquantizers = 256;
 
 // RemotePtr wire layout reserves six shard bits and a 34-bit 16-byte
 // offset. Validate deployment topology and registered-memory sizing before

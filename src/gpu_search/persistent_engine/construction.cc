@@ -153,6 +153,13 @@ void PersistentSearchEngine::Impl::initialize(
     throw std::invalid_argument(
       "GPU navigation beam/exact/degree limit exceeded");
   }
+#if !DVSTOR_PERSISTENT_LEGACY_MERGE
+  if (config.gpu_query_beam_merge_policy != "stable-run") {
+    throw std::invalid_argument(
+      "GPU beam merge policy \"" + config.gpu_query_beam_merge_policy +
+      "\" requires a build with DVSTOR_PERSISTENT_LEGACY_MERGE=ON");
+  }
+#endif
 
   std::string load_error;
   if (!format::synthesize_distributed_view(config.resolved_index_prefix(),
@@ -416,7 +423,11 @@ void PersistentSearchEngine::Impl::initialize(
       "GPU navigation allocations exceed the configured "
       "memory budget; codes=" +
       std::to_string(budget.code_bytes) +
-      " fixed=" + std::to_string(budget.fixed_bytes));
+      " fixed=" + std::to_string(budget.fixed_bytes) +
+      " usable=" + std::to_string(usable_budget) +
+      " engine=" + std::to_string(engine_budget) +
+      " phys=" + std::to_string(physically_available) +
+      " free=" + std::to_string(free_gpu_bytes));
   }
   visited_capacity = budget.visited_capacity;
   const u64 dynamic_code_scratch_bytes = static_cast<u64>(query_slots) *
@@ -585,6 +596,8 @@ void PersistentSearchEngine::Impl::initialize(
   const size_t remote_buffer_bytes =
     control_region_offset + control_region_bytes;
 #ifdef DVSTOR_HAVE_GPUNETIO
+  // See the bootstrap_data_context declaration: create it before GPUNetIO.
+  bootstrap_data_context = std::make_unique<Context>(config);
   direct_transport = std::make_unique<gpu::GpuNetioPersistentTransport>(
     config, remote_buffer_bytes, channel_context, connection_manager,
     remote_regions);
@@ -616,7 +629,7 @@ void PersistentSearchEngine::Impl::initialize(
 
   control_bootstrapper = std::make_unique<NavigationBootstrapper>(
     config, channel_context, connection_manager, remote_regions,
-    d_remote_buffer, remote_buffer_bytes);
+    d_remote_buffer, remote_buffer_bytes, bootstrap_data_context.get());
   std::cerr << "[gpu-search] bootstrap=CPU-posted GPUDirect RDMA; "
                "queries=strict GPU-initiated GPUNetIO\n";
   initialize_storage_route_descriptors();
@@ -1020,6 +1033,7 @@ void PersistentSearchEngine::Impl::initialize(
       << ",\"issue_width_cap\":" << config.gpu_graph_issue_width
       << ",\"traversal_beam_width\":" << config.gpu_traversal_beam_width
       << ",\"max_expansions\":" << config.gpu_max_expansions
+      << ",\"centroid_route_fanout\":" << config.gpu_centroid_route_fanout
       << ",\"beam_merge_policy\":\"" << config.gpu_query_beam_merge_policy
       << "\",\"graph_read_policy\":\"" << config.gpu_query_graph_read_policy
       << "\",\"graph_extent_quantum\":" << format::kGraphExtentQuantum
@@ -1082,12 +1096,12 @@ void PersistentSearchEngine::Impl::initialize(
     .final_rerank_width = config.gpu_final_rerank_width,
     .exact_width = exact_width,
     .max_expansions = config.gpu_max_expansions,
+    .centroid_route_fanout = config.gpu_centroid_route_fanout,
     .commit_width = config.gpu_graph_commit_width,
     .issue_width = config.gpu_graph_issue_width,
     .beam_merge_policy = config.gpu_query_beam_merge_policy == "stable-run"
                            ? static_cast<u32>(BeamMergePolicy::stable_run)
-                           : static_cast<u32>(BeamMergePolicy::legacy),
-    .visited_capacity = visited_capacity,
+                           : static_cast<u32>(BeamMergePolicy::legacy),    .visited_capacity = visited_capacity,
     .query_slots = query_slots,
     .direct_region_count = direct_view.remote_region_count,
     .direct_qps_per_node = direct_view.qps_per_node,

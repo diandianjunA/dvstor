@@ -34,7 +34,8 @@ public:
     ClientConnectionManager& connection_manager,
     const MemoryRegionTokens& remote_regions,
     void* gpu_destination_base,
-    size_t gpu_destination_bytes);
+    size_t gpu_destination_bytes,
+    Context* data_context = nullptr);
   ~NavigationBootstrapper();
 
   NavigationBootstrapper(const NavigationBootstrapper&) = delete;

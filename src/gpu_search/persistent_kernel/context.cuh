@@ -1,10 +1,10 @@
 #pragma once
 
 #include "gpu_search/persistent_kernel.hh"
+#include "gpu_search/persistent_kernel/warp_bitonic_sort.cuh"
 
 #include <cuda_runtime.h>
 #include <cub/block/block_radix_sort.cuh>
-#include <cub/warp/warp_merge_sort.cuh>
 
 #include <algorithm>
 #include <cfloat>
@@ -13,7 +13,7 @@
 #include <cstdint>
 
 #ifdef DVSTOR_HAVE_GPUNETIO
-#ifndef IBV_WC_DRIVER1
+#if !defined(IBV_WC_DRIVER1) && !defined(DVSTOR_HAVE_IBV_WC_DRIVER1)
 #define IBV_WC_DRIVER1 135
 #define IBV_WC_DRIVER2 136
 #define IBV_WC_DRIVER3 137
@@ -36,10 +36,13 @@ inline constexpr u32 kApproximateSortCapacityWide =
 inline constexpr u32 kApproximateSortCapacityCompactPass =
   kApproximateSortThreadsCompact * kApproximateSortItemsCompactPass;
 
+#if DVSTOR_PERSISTENT_WIDE_SORT
 using ApproximateBlockSortWide = cub::BlockRadixSort<
   f32, kApproximateSortThreadsWide, kApproximateSortItemsWide, u64>;
 using ApproximateBlockSortWideRun = cub::BlockRadixSort<
   f32, kApproximateSortThreadsWide, kApproximateSortItemsWideRun, u64>;
+#endif
+#if DVSTOR_PERSISTENT_LEGACY_MERGE
 using ApproximateBlockSortCompactPass = cub::BlockRadixSort<
   f32, kApproximateSortThreadsCompact, kApproximateSortItemsCompactPass, u64>;
 using ApproximateBlockSortCompactFinal = cub::BlockRadixSort<
@@ -47,35 +50,20 @@ using ApproximateBlockSortCompactFinal = cub::BlockRadixSort<
 using ApproximateBlockSortCompactFinal256 = cub::BlockRadixSort<
   f32, kApproximateSortThreadsCompact,
   kApproximateSortItemsCompactFinal256, u64>;
+#endif
 // Four physical warps own the four immutable 512-item Stable-Run leaves.
 // Sorting an ordered (distance, raw ordinal) key and resolving the handle
-// afterwards avoids CUB's key/value merge path while retaining exact stable
-// input order, including equal-distance candidates.
+// afterwards reproduces the exact stable input order, including
+// equal-distance candidates.  The register bitonic network in
+// warp_bitonic_sort.cuh performs this sort entirely in registers, so the
+// leaves no longer carry a per-warp CUB TempStorage (4,104 B each) in the
+// CTA's shared-memory budget.
 inline constexpr u32 kWarpLeafSortWarps = 4;
 inline constexpr u32 kWarpLeafSortThreads = 32;
 inline constexpr u32 kWarpLeafSortItemsPerThread = 16;
 inline constexpr u32 kWarpLeafSortCapacity =
   kWarpLeafSortThreads * kWarpLeafSortItemsPerThread;
-using ApproximateWarpLeafSort = cub::WarpMergeSort<
-  u64, kWarpLeafSortItemsPerThread, kWarpLeafSortThreads>;
 
-struct ApproximateWarpLeafSortStorage {
-  ApproximateWarpLeafSort::TempStorage leaves[kWarpLeafSortWarps];
-};
-
-struct OrderedU64Less {
-  __device__ __forceinline__ bool operator()(u64 lhs, u64 rhs) const {
-    return lhs < rhs;
-  }
-};
-
-// The 1024-item pass remains the largest compact-sort temporary.  Supporting
-// the 512-item final merge therefore does not increase per-query shared memory
-// (and cannot reduce the resident beam-128 CTA count).
-static_assert(sizeof(ApproximateBlockSortCompactFinal256::TempStorage) <=
-              sizeof(ApproximateBlockSortCompactPass::TempStorage));
-static_assert(sizeof(ApproximateBlockSortWideRun::TempStorage) <=
-              sizeof(ApproximateBlockSortWide::TempStorage));
 static_assert(kApproximateSortThreadsWide *
                 kApproximateSortItemsWideRun ==
               kApproximateSortCapacityCompactPass);

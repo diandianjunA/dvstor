@@ -71,7 +71,7 @@ option(DVSTOR_BUILD_EXECUTABLES "Build standalone DVSTOR executables and tools" 
 option(DVSTOR_BUILD_TESTS "Build local DVSTOR smoke tests" ON)
 option(DVSTOR_BUILD_OFFLINE_TOOLS
     "Build CPU-only index construction, partitioning, and PQ tools" ON)
-option(DVSTOR_USE_NATIVE_ARCH "Compile C++ sources with -march=native" OFF)
+option(DVSTOR_USE_NATIVE_ARCH "Compile C++ sources with -march=native" ON)
 
 if (DVSTOR_STORAGE_NODE_ONLY)
     set(Boost_NO_BOOST_CMAKE ON CACHE BOOL
@@ -164,6 +164,7 @@ set(DVSTOR_MEMORY_NODE_SOURCES
 )
 
 set(DVSTOR_OFFLINE_BUILDER_SOURCES
+    tools/vamana_offline/checkpoint.cc
     tools/vamana_offline/config.cc
     tools/vamana_offline/dataset_io.cc
     tools/vamana_offline/graph.cc
@@ -292,14 +293,19 @@ else ()
         NOT DVSTOR_DOCA_COMMON_LIBRARY OR
         NOT DVSTOR_DOCA_RDMA_LIBRARY OR
         NOT DVSTOR_MLX5_LIBRARY)
-        message(FATAL_ERROR
-            "The compute-node runtime requires a complete DOCA GPUNetIO installation")
+        message(WARNING
+            "DOCA GPUNetIO installation not found; building the compute-node "
+            "runtime WITHOUT GPUNetIO. Only the coupled (host-orchestrated) "
+            "query mode will be available.")
+        set(DVSTOR_HAVE_GPUNETIO OFF)
+    else ()
+        set(DVSTOR_HAVE_GPUNETIO ON)
     endif ()
-    set(DVSTOR_HAVE_GPUNETIO ON)
-    # The persistent query path uses SM80 warp reductions and system-scope
-    # acquire/release operations. Reject an incompatible fatbin at configure
-    # time instead of producing a binary that fails after index/RDMA startup.
-    if (NOT CMAKE_CUDA_ARCHITECTURES)
+    if (DVSTOR_HAVE_GPUNETIO)
+        # The persistent query path uses SM80 warp reductions and system-scope
+        # acquire/release operations. Reject an incompatible fatbin at configure
+        # time instead of producing a binary that fails after index/RDMA startup.
+        if (NOT CMAKE_CUDA_ARCHITECTURES)
         message(FATAL_ERROR
             "DVSTOR persistent GPUNetIO requires an explicit SM80+ CUDA "
             "architecture; CMAKE_CUDA_ARCHITECTURES is empty or OFF")
@@ -320,15 +326,41 @@ else ()
         endif ()
     endforeach ()
 
+        # rdma-core >= v50 declares IBV_WC_DRIVER1 as an enum constant, which
+        # the source-level fallback "#define IBV_WC_DRIVER1 135" would clash
+        # with. Detect it at configure time and skip the fallback define.
+        include(CheckCXXSourceCompiles)
+        check_cxx_source_compiles("
+#include <infiniband/verbs.h>
+int main() { return static_cast<int>(IBV_WC_DRIVER1); }"
+            DVSTOR_HAVE_IBV_WC_DRIVER1)
+        if (DVSTOR_HAVE_IBV_WC_DRIVER1)
+            add_compile_definitions(DVSTOR_HAVE_IBV_WC_DRIVER1=1)
+        endif ()
+        # Newer MLNX_OFED headers provide mlx5dv_reg_dmabuf_mr; distro
+        # rdma-core headers may only have the generic ibv_reg_dmabuf_mr.
+        set(CMAKE_REQUIRED_LIBRARIES ${DVSTOR_MLX5_LIBRARY})
+        check_cxx_source_compiles("
+#include <infiniband/mlx5dv.h>
+int main() { return mlx5dv_reg_dmabuf_mr(nullptr, 0, 0, 0, 0, 0, 0) ==
+                     nullptr; }"
+            DVSTOR_HAVE_MLX5DV_REG_DMABUF_MR)
+        unset(CMAKE_REQUIRED_LIBRARIES)
+        if (DVSTOR_HAVE_MLX5DV_REG_DMABUF_MR)
+            add_compile_definitions(DVSTOR_HAVE_MLX5DV_REG_DMABUF_MR=1)
+        endif ()
+    endif ()
+
     # Query distance kernels. The persistent backend owns RDMA from its
     # long-lived kernel; the coupled baseline launches only bounded ordinary
     # scoring kernels from its host-orchestrated RDMA lanes.
     set(DVSTOR_GPU_SOURCES
         src/gpu_search/host_distance_kernel.cu
-        src/gpu_search/persistent_kernel.cu
     )
     if (DVSTOR_HAVE_GPUNETIO)
-        list(APPEND DVSTOR_GPU_SOURCES src/gpu/gpunetio_probe.cu)
+        list(APPEND DVSTOR_GPU_SOURCES
+            src/gpu_search/persistent_kernel.cu
+            src/gpu/gpunetio_probe.cu)
     endif ()
     if (DVSTOR_GPU_SOURCES)
         add_library(dvstor_gpu_kernels STATIC ${DVSTOR_GPU_SOURCES})
@@ -389,6 +421,8 @@ else ()
         list(APPEND DVSTOR_RUNTIME_SOURCES src/gpu/gpunetio_transport.cc)
         set_source_files_properties(src/gpu/gpunetio_transport.cc PROPERTIES
             COMPILE_OPTIONS "-Wno-deprecated-declarations;-Wno-pedantic")
+    else ()
+        list(APPEND DVSTOR_RUNTIME_SOURCES src/gpu_search/persistent_kernel_stub.cc)
     endif ()
 
     add_library(dvstor_runtime STATIC ${DVSTOR_RUNTIME_SOURCES})

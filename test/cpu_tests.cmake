@@ -56,3 +56,12 @@ if (TARGET FaissCPU::FaissCPU)
         TIMEOUT 180
         SKIP_RETURN_CODE 77)
 endif ()
+
+dvstor_add_test(kmeans_partition_test
+    ${DVSTOR_SOURCE_ROOT}/test/kmeans_partition_test.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/dataset_io.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/partitioning.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/progress.cc)
+dvstor_target_tool_includes(kmeans_partition_test)
+target_link_libraries(kmeans_partition_test PRIVATE rdma_library)
+set_tests_properties(kmeans_partition_test PROPERTIES TIMEOUT 60)

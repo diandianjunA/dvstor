@@ -48,6 +48,21 @@ ComputeService::ComputeService(const Configuration& config)
 
   receive_remote_access_tokens();
 
+  // Multi-compute-node startup serialization: each storage node performs its
+  // GPU/bootstrap QP handshakes in client-ID order, so the initiator must
+  // finish its search-engine construction (which carries those handshakes)
+  // before any other client begins its own. Without this barrier the
+  // concurrent control-channel handshakes race and startup fails.
+  if (!cm_.is_initiator && cm_.num_total_clients > 1) {
+    bool initiator_engine_ready{};
+    LocalMemoryRegion region{context_, &initiator_engine_ready,
+                             sizeof(initiator_engine_ready)};
+    cm_.initiator_qp->post_receive(region);
+    context_.receive();
+    lib_assert(initiator_engine_ready,
+               "initiator search-engine startup synchronization failed");
+  }
+
   if (config_.enable_updates) {
     print_status(
       "storage-owner authority: deterministic ID shard; "
@@ -74,6 +89,17 @@ ComputeService::ComputeService(const Configuration& config)
       config_, context_, cm_, remote_access_tokens_);
     print_status("query engine: persistent GPU + GPUNetIO slots=" +
                  std::to_string(config_.gpu_query_slots));
+  }
+
+  if (cm_.is_initiator && cm_.num_total_clients > 1) {
+    constexpr bool engine_ready = true;
+    for (const QP& qp : cm_.client_qps) {
+      qp->post_send_inlined(&engine_ready, sizeof(engine_ready), IBV_WR_SEND);
+    }
+    if (!cm_.client_qps.empty()) {
+      context_.poll_send_cq_until_completion(
+        static_cast<i32>(cm_.client_qps.size()));
+    }
   }
 
   cm_.synchronize();

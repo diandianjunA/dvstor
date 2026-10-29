@@ -25,7 +25,11 @@ int main(int argc, char** argv) {
      po::value<u32>(&options.threads)->default_value(options.threads),
      "Shard validation threads; 0 uses all hardware threads")
     ("overwrite", po::bool_switch(&options.overwrite),
-     "Atomically replace an existing graph extent sidecar");
+     "Atomically replace an existing graph extent sidecar")
+    ("only-shard", po::value<u32>(&options.only_shard)->default_value(0),
+     "Compute only this shard (1-based) into <output>.shard<N> (raw bytes)")
+    ("merge-partials", po::bool_switch(&options.merge_partials),
+     "Merge <output>.shard1..N partials into the final sidecar");
   try {
     po::variables_map variables;
     po::store(

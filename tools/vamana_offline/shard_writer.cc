@@ -269,6 +269,7 @@ double compute_cross_shard_ratio_graph(const VamanaGraph& graph, const vec<NodeP
 }
 
 PlacementResult place_nodes(const VamanaGraph& graph,
+                            const Dataset& dataset,
                             const VamanaBuildConfig& config,
                             size_t aligned_size) {
   PlacementResult result;
@@ -294,6 +295,31 @@ PlacementResult place_nodes(const VamanaGraph& graph,
     const u32 start_node = graph.medoid < graph.num_nodes ? static_cast<u32>(graph.medoid) : 0;
     vec<u32> parts = compute_bfs_partition_graph(graph, config.num_memory_nodes, start_node, &result.stats);
     result.placements = assign_nodes_to_shards_from_partition(parts, config.num_memory_nodes, aligned_size);
+  } else if (config.partition_strategy == "kmeans") {
+    vec<u32> parts = compute_kmeans_partition(dataset, graph.num_nodes,
+                                              config.num_memory_nodes,
+                                              config.partition_kmeans_samples,
+                                              config.partition_kmeans_iters,
+                                              &result.stats);
+    result.stats.input_edges = graph_input_edges(graph);
+    result.stats.unique_edges = result.stats.input_edges;
+    size_t cut_edges = 0;
+    vec<u32> nbrs;
+    for (size_t node = 0; node < graph.num_nodes; ++node) {
+      graph.copy_neighbors(node, nbrs);
+      for (u32 neighbor : nbrs) {
+        if (neighbor < graph.num_nodes && parts[node] != parts[neighbor]) {
+          ++cut_edges;
+        }
+      }
+    }
+    result.stats.edge_cut = cut_edges;
+    result.stats.partition_cross_shard_ratio =
+      result.stats.input_edges == 0
+        ? 0.0
+        : static_cast<double>(cut_edges) /
+            static_cast<double>(result.stats.input_edges);
+    result.placements = assign_nodes_to_shards_from_partition(parts, config.num_memory_nodes, aligned_size);
   } else {
     result.placements = assign_nodes_to_shards_balanced(graph.num_nodes, config.num_memory_nodes, aligned_size);
     result.stats.part_node_counts.assign(config.num_memory_nodes, 0);
@@ -314,6 +340,13 @@ void print_partition_stats(const VamanaBuildConfig& config, const PlacementResul
               << " partition_cut_ratio=" << result.stats.partition_cross_shard_ratio << "\n";
   } else if (config.partition_strategy == "bfs") {
     std::cerr << "BFS partition (multi-source) edges: input=" << result.stats.input_edges
+              << " edge_cut=" << result.stats.edge_cut
+              << " partition_cut_ratio=" << result.stats.partition_cross_shard_ratio << "\n";
+  } else if (config.partition_strategy == "kmeans") {
+    std::cerr << "kmeans partition: samples=" << result.stats.kmeans_sample_size
+              << " iters=" << result.stats.kmeans_iterations
+              << " final_inertia=" << result.stats.kmeans_inertia
+              << " edges=" << result.stats.input_edges
               << " edge_cut=" << result.stats.edge_cut
               << " partition_cut_ratio=" << result.stats.partition_cross_shard_ratio << "\n";
   }
@@ -672,7 +705,7 @@ void write_vamana_shards(const VamanaGraph& graph,
 
   ProgressReporter progress{"Exporting Vamana shards", n + config.num_memory_nodes};
 
-  PlacementResult placement_result = place_nodes(graph, config, aligned_size);
+  PlacementResult placement_result = place_nodes(graph, dataset, config, aligned_size);
   print_partition_stats(config, placement_result);
   const auto& placements = placement_result.placements;
 
@@ -799,7 +832,10 @@ void write_vamana_shards(const VamanaGraph& graph,
                              const RouteEntryCandidate& rhs) {
     return vamana::routing::centroid_seed_rank_less(lhs.rank, rhs.rank);
   };
-  const size_t export_threads = effective_thread_count(config.threads);
+  const size_t export_threads = std::min<u64>(
+    std::max<u32>(1u, config.export_threads == 0 ? config.threads
+                                                 : config.export_threads),
+    config.num_memory_nodes);
   parallel_for(static_cast<size_t>(0), config.num_memory_nodes, export_threads,
                [&](size_t shard, size_t) {
     vec<byte_t> node_buf(aligned_size, 0);
@@ -926,6 +962,20 @@ void write_vamana_shards(const VamanaGraph& graph,
       shard_entry_counts[shard] * hot_graph_entry_size,
       expected_graph_checksums[shard]);
     progress.increment();
+    // Optional per-shard ship-out hook: DVSTOR_SHARD_HOOK is invoked as
+    // "<hook> <tmp_path> <shard_1based> &" right after validation.  The hook
+    // may move the validated payload off this machine; the final publish step
+    // then skips shards whose temporary file is gone.
+    if (const char* hook = std::getenv("DVSTOR_SHARD_HOOK")) {
+      if (hook[0] != 0) {
+        const std::string command = std::string(hook) + " " +
+          shard_temporary_paths[shard].string() + " " +
+          std::to_string(shard + 1) + " &";
+        if (std::system(command.c_str()) != 0) {
+          throw std::runtime_error("shard hook failed to launch: " + command);
+        }
+      }
+    }
   }
 
   vec<filepath_t> centroid_paths(config.num_memory_nodes);
@@ -1157,7 +1207,9 @@ void write_vamana_shards(const VamanaGraph& graph,
              "committed metadata appeared before graph publication; refusing "
              "to replace any final output: " + metadata_file.string());
   for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
-    publish_file(shard_temporary_paths[shard], shard_paths[shard]);
+    if (path_exists_checked(shard_temporary_paths[shard])) {
+      publish_file(shard_temporary_paths[shard], shard_paths[shard]);
+    }
     publish_file(centroid_temporary_paths[shard], centroid_paths[shard]);
     publish_file(idmap_temporary_paths[shard], idmap_paths[shard]);
   }

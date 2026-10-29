@@ -74,6 +74,19 @@ Context::Context(Configuration& config,
              "Invalid RDMA queue, polling, port, or client-count limits");
   i32 num_devices = 0;
   IBDeviceList device_list = ibv_get_device_list(&num_devices);
+  if (num_devices <= 0 || device_list == nullptr) {
+    const int saved_errno = errno;
+    std::cerr << "[diag] ibv_get_device_list num=" << num_devices
+              << " errno=" << saved_errno << " (" << std::strerror(saved_errno)
+              << ")" << std::endl;
+    for (i32 attempt = 0; attempt < 5 && num_devices <= 0; ++attempt) {
+      usleep(200000);
+      errno = 0;
+      device_list = ibv_get_device_list(&num_devices);
+      std::cerr << "[diag] retry " << attempt << " num=" << num_devices
+                << " errno=" << errno << std::endl;
+    }
+  }
   try {
     lib_assert(num_devices > 0, "No InfiniBand devices found");
     lib_assert(device_list != nullptr, "Device list is null");

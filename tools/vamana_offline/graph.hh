@@ -1,11 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <utility>
 
 #include "tools/vamana_offline/dataset_io.hh"
+#include "tools/vamana_offline/large_buffer.hh"
 
 namespace tools::vamana_offline {
 
@@ -16,12 +18,13 @@ struct VamanaGraph {
   u32 dim{0};
   u32 R{0};
   size_t medoid{0};
-  vec<u32> neighbors;
-  vec<u8> degrees;
+  LargeBuffer<u32> neighbors;
+  LargeBuffer<u8> degrees;
   std::unique_ptr<std::atomic_flag[]> lock_stripes;
   size_t lock_stripe_count{0};
 
-  void init(size_t n, u32 d, u32 max_degree, size_t requested_lock_stripes = 1 << 20);
+  void init(size_t n, u32 d, u32 max_degree, size_t requested_lock_stripes = 1 << 24,
+            size_t num_threads = 0);
   size_t offset(size_t node) const { return node * static_cast<size_t>(R); }
   u8 degree(size_t node) const { return degrees[node]; }
   void copy_neighbors(size_t node, vec<u32>& out) const;
@@ -57,8 +60,17 @@ vec<u32> robust_prune(const Dataset& dataset,
                       const vec<std::pair<float, u32>>& sorted_candidates,
                       float alpha,
                       u32 R);
+void consolidate_reverse_edges(VamanaGraph& graph,
+                               const Dataset& dataset,
+                               size_t num_threads,
+                               float build_alpha,
+                               size_t chunk_target_bytes,
+                               size_t start_chunk = 0,
+                               const std::function<void(size_t next_chunk)>&
+                                   between_chunks = {});
 void build_vamana_graph(VamanaGraph& graph,
                         const Dataset& dataset,
-                        const VamanaBuildConfig& config);
+                        const VamanaBuildConfig& config,
+                        const filepath_t& checkpoint_prefix = {});
 
 }  // namespace tools::vamana_offline

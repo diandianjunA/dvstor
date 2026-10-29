@@ -430,7 +430,10 @@ __device__ void direct_read_owner_loop(const PersistentKernelParams& params,
                                        u32 queue_count, u32 owner_block) {
 #ifdef DVSTOR_HAVE_GPUNETIO
   constexpr u32 warp_width = 32;
-  constexpr u32 max_warps_per_block = 8;
+  // The unified kernel launches 128-thread CTAs, so four warps per block is
+  // the exact requirement.  Sizing the descriptor matrix for eight warps
+  // would double this shared allocation without any reachable use.
+  constexpr u32 max_warps_per_block = 4;
   // At most eight same-priority descriptors are collected per service
   // boundary. Split tails reuse the original descriptor plus compact
   // count/offset arrays; keeping a second full descriptor matrix here would

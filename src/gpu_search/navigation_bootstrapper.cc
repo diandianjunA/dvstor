@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <iostream>
 #include <memory>
 #include <limits>
 #include <mutex>
@@ -33,6 +34,7 @@ struct BootstrapContext {
   const MemoryRegionTokens& remote_regions;
   void* gpu_destination_base{};
   size_t gpu_destination_bytes{};
+  Context* data_context{};
 };
 
 }  // namespace
@@ -41,7 +43,11 @@ struct NavigationBootstrapper::Impl {
   explicit Impl(const BootstrapContext& context)
       : config_(context.config), channel_context_(context.channel_context),
         connection_manager_(context.connection_manager), remote_regions_(context.remote_regions),
-        data_context_(config_),
+        owned_data_context_(context.data_context
+                                ? nullptr
+                                : std::make_unique<Context>(context.config)),
+        data_context_(context.data_context ? *context.data_context
+                                           : *owned_data_context_),
         gpu_base_(reinterpret_cast<u64>(context.gpu_destination_base)),
         gpu_bytes_(context.gpu_destination_bytes), next_qp_(remote_regions_.size(), 0) {
     if (gpu_base_ == 0 || gpu_bytes_ == 0 ||
@@ -102,9 +108,34 @@ struct NavigationBootstrapper::Impl {
         "host flush capability");
     }
 
-    gpu_region_ = std::make_unique<LocalMemoryRegion>(
-      data_context_, context.gpu_destination_base,
-      context.gpu_destination_bytes);
+    // GPUDirect RDMA memory registration requires nv_peer_mem or an
+    // equivalent kernel path. Probe it with a small registration first:
+    // lib_assert inside LocalMemoryRegion exits the process on failure, so a
+    // try/catch around it cannot detect the unsupported case. On stock
+    // kernels without GPUDirect, fall back to a pinned host bounce buffer:
+    // RDMA into host memory, then cudaMemcpy to/from the GPU destination.
+    // This path is startup-only, so the extra copy cost does not affect
+    // query performance.
+    ibv_mr* gdr_probe = ibv_reg_mr(data_context_.get_protection_domain(),
+                                   context.gpu_destination_base, 4096,
+                                   IBV_ACCESS_LOCAL_WRITE);
+    if (gdr_probe != nullptr) {
+      (void)ibv_dereg_mr(gdr_probe);
+      gpu_region_ = std::make_unique<LocalMemoryRegion>(
+        data_context_, context.gpu_destination_base,
+        context.gpu_destination_bytes);
+    } else {
+      std::cerr << "[STATUS]: PQ bootstrap GPUDirect MR registration probe "
+                   "failed; falling back to host bounce buffer of "
+                << gpu_bytes_ << " bytes" << std::endl;
+      check_cuda(cudaHostAlloc(&bounce_buffer_, gpu_bytes_,
+                               cudaHostAllocDefault),
+                 "cudaHostAlloc(PQ bootstrap bounce buffer)");
+      bounce_base_ = reinterpret_cast<u64>(bounce_buffer_);
+      gpu_region_ = std::make_unique<LocalMemoryRegion>(
+        data_context_, bounce_buffer_, gpu_bytes_);
+      bounce_ = true;
+    }
 
     const u32 qps_per_node = std::max<u32>(1, config_.gpu_rdma_qps);
     qps_.resize(remote_regions_.size());
@@ -157,8 +188,11 @@ struct NavigationBootstrapper::Impl {
     for (QpBatch& batch : batches) {
       for (size_t request_index : batch.request_indices) {
         const NavigationRead& request = requests[request_index];
+        const u64 local_address = bounce_
+          ? bounce_base_ + (request.destination_address - gpu_base_)
+          : request.destination_address;
         batch.qp->qp->post_send(
-          request.destination_address, request.bytes, gpu_region_->get_lkey(),
+          local_address, request.bytes, gpu_region_->get_lkey(),
           IBV_WR_RDMA_READ, true, false, remote_regions_[request.memory_node].get(),
           request.remote_offset, 0, request_index + 1);
       }
@@ -166,7 +200,7 @@ struct NavigationBootstrapper::Impl {
     std::vector<ibv_wc> completions(64);
     for (QpBatch& batch : batches) {
       size_t remaining = batch.request_indices.size();
-      const u32 timeout_ms = std::min<u32>(config_.storage_owner_rpc_timeout_ms, 1000);
+      const u32 timeout_ms = std::min<u32>(config_.storage_owner_rpc_timeout_ms, 60000);
       const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(timeout_ms);
       while (remaining > 0) {
@@ -195,7 +229,16 @@ struct NavigationBootstrapper::Impl {
     }
     check_cuda(cudaSetDevice(static_cast<int>(config_.gpu_device)),
                "cudaSetDevice(PQ bootstrap fetch)");
-    if (flush_required_) {
+    if (bounce_) {
+      for (size_t i = 0; i < requests.size(); ++i) {
+        if (statuses[i] != 1) continue;
+        const u64 offset = requests[i].destination_address - gpu_base_;
+        check_cuda(cudaMemcpy(reinterpret_cast<void*>(gpu_base_ + offset),
+                              reinterpret_cast<const void*>(bounce_base_ + offset),
+                              requests[i].bytes, cudaMemcpyHostToDevice),
+                   "cudaMemcpy(PQ bootstrap bounce H2D)");
+      }
+    } else if (flush_required_) {
       check_cuda(cudaDeviceFlushGPUDirectRDMAWrites(
                    cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
                    cudaFlushGPUDirectRDMAWritesToOwner),
@@ -238,11 +281,28 @@ struct NavigationBootstrapper::Impl {
       batches[iterator->second].request_indices.push_back(i);
     }
 
+    if (bounce_) {
+      check_cuda(cudaSetDevice(static_cast<int>(config_.gpu_device)),
+                 "cudaSetDevice(navigation bounce D2H)");
+      for (size_t i = 0; i < requests.size(); ++i) {
+        const u64 offset = requests[i].source_address - gpu_base_;
+        if (offset >= gpu_bytes_ || requests[i].bytes > gpu_bytes_ - offset) {
+          continue;
+        }
+        check_cuda(cudaMemcpy(reinterpret_cast<void*>(bounce_base_ + offset),
+                              reinterpret_cast<const void*>(gpu_base_ + offset),
+                              requests[i].bytes, cudaMemcpyDeviceToHost),
+                   "cudaMemcpy(navigation bounce D2H)");
+      }
+    }
     for (QpBatch& batch : batches) {
       for (size_t request_index : batch.request_indices) {
         const NavigationWrite& request = requests[request_index];
+        const u64 local_address = bounce_
+          ? bounce_base_ + (request.source_address - gpu_base_)
+          : request.source_address;
         batch.qp->qp->post_send(
-          request.source_address, request.bytes, gpu_region_->get_lkey(),
+          local_address, request.bytes, gpu_region_->get_lkey(),
           IBV_WR_RDMA_WRITE, true, false, remote_regions_[request.memory_node].get(),
           request.remote_offset, 0, request_index + 1);
       }
@@ -250,7 +310,7 @@ struct NavigationBootstrapper::Impl {
     std::vector<ibv_wc> completions(64);
     for (QpBatch& batch : batches) {
       size_t remaining = batch.request_indices.size();
-      const u32 timeout_ms = std::min<u32>(config_.storage_owner_rpc_timeout_ms, 1000);
+      const u32 timeout_ms = std::min<u32>(config_.storage_owner_rpc_timeout_ms, 60000);
       const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(timeout_ms);
       while (remaining > 0) {
@@ -279,14 +339,25 @@ struct NavigationBootstrapper::Impl {
     }
   }
 
+  ~Impl() {
+    if (bounce_buffer_ != nullptr) {
+      (void)cudaSetDevice(static_cast<int>(config_.gpu_device));
+      (void)cudaFreeHost(bounce_buffer_);
+    }
+  }
+
   configuration::IndexConfiguration& config_;
   Context& channel_context_;
   ClientConnectionManager& connection_manager_;
   const MemoryRegionTokens& remote_regions_;
-  Context data_context_;
+  std::unique_ptr<Context> owned_data_context_;
+  Context& data_context_;
   std::unique_ptr<LocalMemoryRegion> gpu_region_;
   u64 gpu_base_{};
   size_t gpu_bytes_{};
+  bool bounce_{};
+  void* bounce_buffer_{};
+  u64 bounce_base_{};
   std::vector<std::vector<std::unique_ptr<DetachedQP>>> qps_;
   std::vector<u32> next_qp_;
   std::mutex io_mutex_;
@@ -300,7 +371,8 @@ NavigationBootstrapper::NavigationBootstrapper(
     ClientConnectionManager& connection_manager,
     const MemoryRegionTokens& remote_regions,
     void* gpu_destination_base,
-    const size_t gpu_destination_bytes)
+    const size_t gpu_destination_bytes,
+    Context* data_context)
     : impl_(std::make_unique<Impl>(BootstrapContext{
         .config = config,
         .channel_context = channel_context,
@@ -308,6 +380,7 @@ NavigationBootstrapper::NavigationBootstrapper(
         .remote_regions = remote_regions,
         .gpu_destination_base = gpu_destination_base,
         .gpu_destination_bytes = gpu_destination_bytes,
+        .data_context = data_context,
       })) {}
 
 NavigationBootstrapper::~NavigationBootstrapper() = default;
