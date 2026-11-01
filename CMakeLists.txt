@@ -201,6 +201,7 @@ set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
 
 set(DVSTOR_METIS_REPARTITIONER_SOURCES
     ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/metis_repartitioner.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/checkpoint.cc
     ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/dataset_io.cc
     ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/graph.cc
     ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/partitioning.cc

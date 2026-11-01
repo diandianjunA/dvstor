@@ -973,9 +973,9 @@ void write_vamana_shards(const VamanaGraph& graph,
       shard_entry_counts[shard] * hot_graph_entry_size,
       expected_graph_checksums[shard]);
     progress.increment();
-    // Validate and ship each shard before another shard can be produced.
-    // Synchronous hooks bound local disk usage and the final publish step
-    // skips shards whose temporary file was moved away.
+    // Ship each shard synchronously after validation so completed shards do
+    // not accumulate locally; export_threads bounds concurrent shipments.
+    // The final publish step skips shards whose temporary file was moved away.
     if (const char* hook = std::getenv("DVSTOR_SHARD_HOOK")) {
       if (hook[0] != 0) {
         const std::string command = std::string(hook) + " " +

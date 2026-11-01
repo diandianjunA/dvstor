@@ -156,9 +156,10 @@ void run_case(u32 beam_capacity) {
 #if !DVSTOR_PERSISTENT_LEGACY_MERGE
     if (policy == BeamMergePolicy::legacy) continue;
 #endif
-    // The register top-k reduction supports beam_capacity <= 128 (= the
-    // production kPersistentMaxBeam).
-    if (policy == BeamMergePolicy::stable_run && beam_capacity > 128) {
+    // The register top-k reduction supports beam_capacity <=
+    // kPersistentMaxBeam (the production traversal beam ceiling).
+    if (policy == BeamMergePolicy::stable_run &&
+        beam_capacity > gpu_search::kPersistentMaxBeam) {
       continue;
     }
     const std::string policy_name =
@@ -216,9 +217,10 @@ int main() {
     }
     check_cuda(cudaSetDevice(0), "cudaSetDevice");
     run_case(128);
-#if DVSTOR_PERSISTENT_LEGACY_MERGE
+    // Beam=256 exercises the register top-k reduction's wide reduction
+    // (stable-run policy; the legacy compact-final-256 variant joins in
+    // legacy-enabled builds).
     run_case(256);
-#endif
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

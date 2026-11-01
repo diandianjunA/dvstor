@@ -35,8 +35,7 @@ public:
 public:
   QPs client_qps;
   QueuePair* initiator_qp;
-  QP pending_reconnected_qp;
-  u32 pending_reconnected_client_id{0};
+  QPs pending_reconnected_qps;
 };
 
 class ClientConnectionManager : public ConnectionManager {

@@ -2409,20 +2409,21 @@ __device__ __forceinline__ void process_query(
               ++ranked_route_count;
             }
           }
-          // Query and Stage1 share one locality decision: begin only at the
-          // nearest routable centroid shard. Cross-shard work is introduced by
-          // graph edges, never by an eager multi-shard seed fanout.
           if (route_snapshot_conflicted == 0 && route_seed_failed == 0 &&
               ranked_route_count != 0) {
-            const u32 shard = ranked_routes[0].shard;
-            for (u32 local = 0;
-                 local < route_snapshot_entry_counts[shard];
-                 ++local) {
-              const u64 remote_node = route_snapshot_remote_nodes[
-                static_cast<size_t>(shard) * kCentroidRouteMaxLiveEntries + local];
-              const u64 handle = handle_from_raw(params, remote_node);
-              if (handle != kInvalidDeviceHandle) {
-                navigation_handles[route_entry_count++] = handle;
+            const u32 route_count = min(
+              ranked_route_count, params.centroid_route_fanout);
+            for (u32 route = 0; route < route_count; ++route) {
+              const u32 shard = ranked_routes[route].shard;
+              for (u32 local = 0;
+                   local < route_snapshot_entry_counts[shard];
+                   ++local) {
+                const u64 remote_node = route_snapshot_remote_nodes[
+                  static_cast<size_t>(shard) * kCentroidRouteMaxLiveEntries + local];
+                const u64 handle = handle_from_raw(params, remote_node);
+                if (handle != kInvalidDeviceHandle) {
+                  navigation_handles[route_entry_count++] = handle;
+                }
               }
             }
           }

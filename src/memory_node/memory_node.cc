@@ -274,6 +274,7 @@ MemoryNode::MemoryNode(Configuration& config)
   if (reconnection_thread_.joinable()) reconnection_thread_.join();
   print_status("memory node session complete; accepting next client group");
   cm_.reset_for_reconnect();
+  reset_storage_session_runtime();
   storage_insert_shutdown_.store(false, std::memory_order_release);
   } while (true);
 

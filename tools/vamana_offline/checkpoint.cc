@@ -2,11 +2,14 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -30,6 +33,104 @@ filepath_t neighbors_path(const filepath_t& prefix) {
 }
 filepath_t degrees_path(const filepath_t& prefix) {
   return filepath_t{prefix.string() + ".ckpt.degrees"};
+}
+
+struct RemoteCheckpoint {
+  str host;
+  str directory;
+};
+
+std::optional<RemoteCheckpoint> remote_checkpoint() {
+  const char* target = std::getenv("DVSTOR_CHECKPOINT_SSH_TARGET");
+  if (target == nullptr || target[0] == 0) return std::nullopt;
+  const str value{target};
+  const size_t colon = value.find(':');
+  lib_assert(colon != str::npos && colon != 0 && colon + 1 < value.size(),
+             "DVSTOR_CHECKPOINT_SSH_TARGET must be host:/absolute/directory");
+  return RemoteCheckpoint{value.substr(0, colon), value.substr(colon + 1)};
+}
+
+str shell_quote(const str& value) {
+  str quoted{"'"};
+  for (char c : value) {
+    if (c == '\'') {
+      quoted += "'\\''";
+    } else {
+      quoted += c;
+    }
+  }
+  quoted += "'";
+  return quoted;
+}
+
+str remote_path(const RemoteCheckpoint& remote, const filepath_t& path) {
+  return remote.directory + "/" + path.filename().string();
+}
+
+void run_remote(const str& host, const str& command, const str& what) {
+  const str full = "ssh -o BatchMode=yes " + shell_quote(host) + " " +
+    shell_quote(command);
+  const int rc = std::system(full.c_str());
+  if (rc != 0) lib_failure("remote checkpoint command failed for " + what);
+}
+
+void write_remote_array(const RemoteCheckpoint& remote, const filepath_t& path,
+                        const void* data, size_t bytes, const str& what) {
+  const str destination = remote_path(remote, path);
+  const str temporary = destination + ".tmp";
+  run_remote(remote.host, "mkdir -p " + shell_quote(remote.directory), what);
+  const str command = "ssh -o BatchMode=yes " + shell_quote(remote.host) + " " +
+    shell_quote("cat > " + shell_quote(temporary));
+  FILE* output = ::popen(command.c_str(), "w");
+  lib_assert(output != nullptr, "cannot open remote checkpoint writer for " + what);
+  const auto started = std::chrono::steady_clock::now();
+  const char* cursor = static_cast<const char*>(data);
+  size_t remaining = bytes;
+  while (remaining != 0) {
+    const size_t written = std::fwrite(cursor, 1, remaining, output);
+    if (written == 0) {
+      ::pclose(output);
+      lib_failure("remote checkpoint write failed for " + what);
+    }
+    cursor += written;
+    remaining -= written;
+  }
+  lib_assert(::pclose(output) == 0, "remote checkpoint writer failed for " + what);
+  run_remote(remote.host, "mv -f " + shell_quote(temporary) + " " +
+             shell_quote(destination), what);
+  const double seconds = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - started).count();
+  std::cerr << "checkpoint: remote " << what << " written in " << seconds
+            << " seconds (" << (static_cast<double>(bytes >> 20) / seconds)
+            << " MiB/s)\n";
+}
+
+void read_remote_array(const RemoteCheckpoint& remote, const filepath_t& path,
+                       void* data, size_t bytes, const str& what) {
+  const str source = remote_path(remote, path);
+  const str command = "ssh -o BatchMode=yes " + shell_quote(remote.host) + " " +
+    shell_quote("cat " + shell_quote(source));
+  FILE* input = ::popen(command.c_str(), "r");
+  lib_assert(input != nullptr, "cannot open remote checkpoint reader for " + what);
+  char* cursor = static_cast<char*>(data);
+  size_t remaining = bytes;
+  while (remaining != 0) {
+    const size_t got = std::fread(cursor, 1, remaining, input);
+    if (got == 0) {
+      ::pclose(input);
+      lib_failure("remote checkpoint is truncated for " + what);
+    }
+    cursor += got;
+    remaining -= got;
+  }
+  lib_assert(std::fgetc(input) == EOF, "remote checkpoint is oversized for " + what);
+  lib_assert(::pclose(input) == 0, "remote checkpoint reader failed for " + what);
+}
+
+void remove_remote_array(const RemoteCheckpoint& remote, const filepath_t& path) {
+  const str destination = remote_path(remote, path);
+  run_remote(remote.host, "rm -f " + shell_quote(destination) + " " +
+             shell_quote(destination + ".tmp"), "checkpoint cleanup");
 }
 
 void write_full(int fd, const void* data, size_t bytes, off_t offset,
@@ -104,6 +205,10 @@ void parse_meta_line(GraphCheckpointMeta& meta, const str& line) {
 
 void write_array_file(const filepath_t& path, const void* data, size_t bytes,
                       size_t num_threads, const str& what) {
+  if (const auto remote = remote_checkpoint()) {
+    write_remote_array(*remote, path, data, bytes, what);
+    return;
+  }
   const int fd = open_checked(path, O_WRONLY | O_CREAT | O_TRUNC, what);
   const size_t workers =
       std::max<size_t>(1, effective_thread_count(static_cast<u32>(num_threads)));
@@ -133,6 +238,10 @@ void write_array_file(const filepath_t& path, const void* data, size_t bytes,
 
 void read_array_file(const filepath_t& path, void* data, size_t bytes,
                      size_t num_threads, const str& what) {
+  if (const auto remote = remote_checkpoint()) {
+    read_remote_array(*remote, path, data, bytes, what);
+    return;
+  }
   const int fd = open_checked(path, O_RDONLY, what);
   struct stat st {};
   if (::fstat(fd, &st) != 0 || static_cast<size_t>(st.st_size) != bytes)
@@ -263,6 +372,10 @@ void save_graph_checkpoint(const filepath_t& prefix, const VamanaGraph& graph,
 }
 
 void remove_graph_checkpoint(const filepath_t& prefix) {
+  if (const auto remote = remote_checkpoint()) {
+    remove_remote_array(*remote, neighbors_path(prefix));
+    remove_remote_array(*remote, degrees_path(prefix));
+  }
   std::error_code ec;
   std::filesystem::remove(neighbors_path(prefix), ec);
   std::filesystem::remove(degrees_path(prefix), ec);

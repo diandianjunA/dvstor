@@ -214,3 +214,26 @@ void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {
     process_storage_owner_insert_task(task);
   }
 }
+
+void MemoryNode::reset_storage_session_runtime() {
+  storage_insert_workers_.clear();
+  storage_owner_threads_.clear();
+  context_.drain_completion_queues();
+
+  insert_runtime_.region.reset();
+  insert_runtime_.buffer.deallocate();
+
+  peer_async_responses_.reset();
+  stage2_home_rpc_outbox_.reset();
+  peer_request_deduplicator_.reset();
+  peer_rpc_runtime_.region.reset();
+  peer_rpc_runtime_.buffer.deallocate();
+  peer_scratch_region_.reset();
+  peer_scratch_buffer_.deallocate();
+  peer_index_region_.reset();
+  peer_qps_.clear();
+  peer_qp_send_mutexes_.clear();
+  peer_remote_tokens_.clear();
+  peer_context_.reset();
+  peer_config_.reset();
+}

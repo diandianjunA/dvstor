@@ -423,7 +423,11 @@ void PersistentSearchEngine::Impl::initialize(
       "GPU navigation allocations exceed the configured "
       "memory budget; codes=" +
       std::to_string(budget.code_bytes) +
-      " fixed=" + std::to_string(budget.fixed_bytes));
+      " fixed=" + std::to_string(budget.fixed_bytes) +
+      " usable=" + std::to_string(usable_budget) +
+      " engine=" + std::to_string(engine_budget) +
+      " phys=" + std::to_string(physically_available) +
+      " free=" + std::to_string(free_gpu_bytes));
   }
   visited_capacity = budget.visited_capacity;
   const u64 dynamic_code_scratch_bytes = static_cast<u64>(query_slots) *
@@ -1029,6 +1033,7 @@ void PersistentSearchEngine::Impl::initialize(
       << ",\"issue_width_cap\":" << config.gpu_graph_issue_width
       << ",\"traversal_beam_width\":" << config.gpu_traversal_beam_width
       << ",\"max_expansions\":" << config.gpu_max_expansions
+      << ",\"centroid_route_fanout\":" << config.gpu_centroid_route_fanout
       << ",\"beam_merge_policy\":\"" << config.gpu_query_beam_merge_policy
       << "\",\"graph_read_policy\":\"" << config.gpu_query_graph_read_policy
       << "\",\"graph_extent_quantum\":" << format::kGraphExtentQuantum
@@ -1091,6 +1096,7 @@ void PersistentSearchEngine::Impl::initialize(
     .final_rerank_width = config.gpu_final_rerank_width,
     .exact_width = exact_width,
     .max_expansions = config.gpu_max_expansions,
+    .centroid_route_fanout = config.gpu_centroid_route_fanout,
     .commit_width = config.gpu_graph_commit_width,
     .issue_width = config.gpu_graph_issue_width,
     .beam_merge_policy = config.gpu_query_beam_merge_policy == "stable-run"

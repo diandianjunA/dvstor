@@ -330,7 +330,7 @@ query_suffix() {
 }
 
 base_bin() { echo "${BASE_BIN:-$DATASET_DIR/base.1B.u8bin}"; }
-query_bin() { echo "$CONVERTED_DIR/query.1K.u8bin"; }
+query_bin() { echo "${RECALL_QUERY_FILE_OVERRIDE:-$CONVERTED_DIR/query.1K.u8bin}"; }
 groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
 insert_bin() { echo "$INSERT_FILE"; }
 performance_query_bin() { echo "$PERFORMANCE_QUERY_FILE"; }
@@ -709,6 +709,7 @@ write_service_config() {
     echo "gpu-traversal-beam-width = ${GPU_TRAVERSAL_BEAM_WIDTH:-128}"
     echo "gpu-final-rerank-width = ${GPU_FINAL_RERANK_WIDTH:-128}"
     echo "gpu-max-expansions = ${GPU_MAX_EXPANSIONS:-384}"
+    echo "gpu-centroid-route-fanout = ${GPU_CENTROID_ROUTE_FANOUT:-1}"
     echo "gpu-rdma-qps = ${GPU_RDMA_QPS:-32}"
     echo "gpu-direct-timeout-ms = ${GPU_DIRECT_TIMEOUT_MS:-250}"
     echo "gpu-persistent-blocks-per-sm = ${GPU_PERSISTENT_BLOCKS_PER_SM:-4}"

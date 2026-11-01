@@ -491,6 +491,7 @@ struct PersistentKernelParams {
   u32 final_rerank_width{};
   u32 exact_width{};
   u32 max_expansions{};
+  u32 centroid_route_fanout{1};
   u32 commit_width{};
   u32 issue_width{};
   u32 beam_merge_policy{};

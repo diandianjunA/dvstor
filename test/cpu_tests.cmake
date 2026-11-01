@@ -18,6 +18,13 @@ dvstor_target_common_includes(rdma_contract_test)
 target_link_libraries(rdma_contract_test PRIVATE rdma_library)
 set_tests_properties(rdma_contract_test PROPERTIES TIMEOUT 10)
 
+dvstor_add_test(server_connection_reconnect_test)
+dvstor_target_common_includes(server_connection_reconnect_test)
+target_link_libraries(server_connection_reconnect_test PRIVATE rdma_library)
+set_tests_properties(server_connection_reconnect_test PROPERTIES
+    TIMEOUT 30
+    SKIP_REGULAR_EXPRESSION "^SKIP:")
+
 dvstor_add_test(configuration_update_protocol_test)
 dvstor_target_common_includes(configuration_update_protocol_test)
 target_link_libraries(configuration_update_protocol_test PRIVATE rdma_library)
@@ -63,3 +70,12 @@ if (TARGET FaissCPU::FaissCPU)
         TIMEOUT 180
         SKIP_RETURN_CODE 77)
 endif ()
+
+dvstor_add_test(kmeans_partition_test
+    ${DVSTOR_SOURCE_ROOT}/test/kmeans_partition_test.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/dataset_io.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/partitioning.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/progress.cc)
+dvstor_target_tool_includes(kmeans_partition_test)
+target_link_libraries(kmeans_partition_test PRIVATE rdma_library)
+set_tests_properties(kmeans_partition_test PROPERTIES TIMEOUT 60)

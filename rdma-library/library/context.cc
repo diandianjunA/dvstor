@@ -216,6 +216,20 @@ void Context::close_server_socket() {
   }
 }
 
+void Context::drain_completion_queues() {
+  vec<ibv_wc> completions(static_cast<size_t>(config_.max_poll_cqes));
+  const auto drain = [&](ibv_cq* cq) {
+    for (;;) {
+      const i32 count = ibv_poll_cq(
+        cq, static_cast<i32>(completions.size()), completions.data());
+      lib_assert(count >= 0, "Cannot drain completion queue");
+      if (count == 0) return;
+    }
+  };
+  drain(receive_cq_);
+  drain(send_cq_);
+}
+
 std::pair<QP, u32> Context::wait_for_connection() {
   QP queue_pair = std::make_unique<QueuePair>(this);
 

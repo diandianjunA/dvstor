@@ -12,7 +12,8 @@ ServerConnectionManager::ServerConnectionManager(Context& context,
                                                  const Configuration& config)
     : ConnectionManager(context, config),
       client_qps(config.num_clients),
-      initiator_qp(client_qps.front().get()) {}
+      initiator_qp(nullptr),
+      pending_reconnected_qps(config.num_clients) {}
 
 ClientConnectionManager::ClientConnectionManager(Context& context,
                                                  const Configuration& config)
@@ -23,14 +24,11 @@ ClientConnectionManager::ClientConnectionManager(Context& context,
 }
 
 void ServerConnectionManager::connect_to_clients() {
-  if (pending_reconnected_qp) {
-    lib_assert(pending_reconnected_client_id < client_qps.size(),
-               "reconnecting client ID exceeds --num-clients");
-    lib_assert(client_qps[pending_reconnected_client_id] == nullptr,
+  for (u32 i = 0; i < config_.num_clients; ++i) {
+    if (!pending_reconnected_qps[i]) continue;
+    lib_assert(client_qps[i] == nullptr,
                "duplicate reconnecting client ID");
-    client_qps[pending_reconnected_client_id] =
-        std::move(pending_reconnected_qp);
-    pending_reconnected_client_id = 0;
+    client_qps[i] = std::move(pending_reconnected_qps[i]);
   }
   context_.bind_to_port(config_.port);
 
@@ -51,11 +49,15 @@ void ServerConnectionManager::connect_to_clients() {
 
 void ServerConnectionManager::accept_reconnection(std::atomic<bool>& shutdown) {
   context_.bind_to_port(config_.port);
-  auto [qp, client_id] = context_.wait_for_connection();
-  lib_assert(client_id < client_qps.size(),
-             "reconnecting client ID exceeds --num-clients");
-  pending_reconnected_client_id = client_id;
-  pending_reconnected_qp = std::move(qp);
+  for (u32 i = 0; i < config_.num_clients; ++i) {
+    auto [qp, client_id] = context_.wait_for_connection();
+    lib_assert(client_id < pending_reconnected_qps.size(),
+               "reconnecting client ID exceeds --num-clients");
+    lib_assert(pending_reconnected_qps[client_id] == nullptr,
+               "duplicate reconnecting client ID");
+    pending_reconnected_qps[client_id] = std::move(qp);
+  }
+  context_.close_server_socket();
   shutdown.store(true, std::memory_order_release);
 }
 
