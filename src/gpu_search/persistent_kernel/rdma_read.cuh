@@ -904,6 +904,12 @@ __device__ bool approximate_handles_batch(
   u32* max_lookup_probes) {
   const u32 pq_code_bytes =
     resolved_pq_subquantizers<PqSubquantizers>(params);
+  // Wide static-code waves are scored against LUT tiles staged in dynamic
+  // shared memory (score_static_candidates_lut_tiled); narrow calls keep the
+  // direct per-candidate loop, which performs the identical arithmetic.
+  const bool tiled_static_scoring =
+    count >= kPersistentPqLutTileMinCandidates;
+  extern __shared__ f32 persistent_pq_lut_tile[];
   __shared__ i32 shard_status[kPersistentMaxShards];
   __shared__ u32 failed;
   __shared__ u32 call_dynamic_candidates;
@@ -953,7 +959,7 @@ __device__ bool approximate_handles_batch(
     if (handle == kInvalidDeviceHandle) continue;
     u32 static_ordinal = 0;
     if (static_ordinal_from_raw(params, handle, static_ordinal)) {
-      if (static_ordinal < params.num_nodes) {
+      if (static_ordinal < params.num_nodes && !tiled_static_scoring) {
         distances[index] = approximate_entry<PqSubquantizers>(
           params, query_lut,
           params.pq_codes +
@@ -1049,6 +1055,13 @@ __device__ bool approximate_handles_batch(
   // CQ polling, publication, or duplicate-scatter machinery when there is no
   // authoritative read to issue.
   if (call_dynamic_reads == 0) {
+    // No RDMA wave will overlap this scoring, so run the tiled static pass
+    // here before the telemetry snapshot and fast return.
+    if (tiled_static_scoring) {
+      score_static_candidates_lut_tiled<PqSubquantizers>(
+        params, query_lut, handles, count, distances,
+        persistent_pq_lut_tile);
+    }
     if (threadIdx.x == 0) {
       if (total_dynamic_candidates != nullptr) {
         *total_dynamic_candidates += call_dynamic_candidates;
@@ -1090,6 +1103,13 @@ __device__ bool approximate_handles_batch(
       request_local_iova_offsets, owner_completion, true);
   }
   __syncthreads();
+  // Score the static wave while the dynamic reads are in flight.  The tile
+  // pass touches only the dynamic shared LUT tile and the distances[] slots
+  // of static candidates, both disjoint from the RDMA destinations.
+  if (tiled_static_scoring) {
+    score_static_candidates_lut_tiled<PqSubquantizers>(
+      params, query_lut, handles, count, distances, persistent_pq_lut_tile);
+  }
   for (u32 shard = threadIdx.x; shard < params.num_shards;
        shard += blockDim.x) {
     if (shard_status[shard] != -EINPROGRESS) continue;
@@ -1260,7 +1280,7 @@ __device__ bool exactify_into_beam(
   u32* exact_reads, u32* exact_snapshot_train_batches,
   u32* exact_snapshot_train_fallbacks, u32 beam_capacity, bool reset_beam,
   u64* merge_handles, u32* merge_ids, f32* merge_distances,
-  u8* merge_expanded) {
+  u16* merge_expanded) {
   constexpr i32 kFencedSnapshotComplete = 1;
   constexpr i32 kNoSnapshotRequests = 2;
   __shared__ i32 shard_status[kPersistentMaxShards];
@@ -1585,8 +1605,8 @@ __device__ bool exactify_into_beam_with_terminal_cache(
   u32* beam_ids, f32* beam_distances, u8* beam_expanded, u32& beam_count,
   u32* exact_reads, u32* exact_snapshot_train_batches,
   u32* exact_snapshot_train_fallbacks, u32 beam_capacity, bool reset_beam,
-  u64* merge_handles, u32* merge_ids, f32* merge_distances, u8* merge_expanded,
-  TerminalExactCacheState& cache) {
+  u64* merge_handles, u32* merge_ids, f32* merge_distances,
+  u16* merge_expanded, TerminalExactCacheState& cache) {
   // The production terminal call resets Beam. Keep compatibility callers on
   // the original implementation rather than creating a second append policy.
   if (cache.attempted == 0 || cache.issued_records == 0 ||
@@ -1740,7 +1760,7 @@ __device__ bool exactify_into_beam_with_terminal_cache(
     // the terminal-horizon wave and require no second query-side round trip.
     u32 miss_index = 0;
     for (u32 index = 0; index < candidate_count; ++index) {
-      const u8 origin = merge_expanded[index];
+      const u16 origin = merge_expanded[index];
       if (origin > 1) continue;
       const u32 shard = request_shards[kTerminalCandidateMetadataBase + index];
       const u64 remote_offset =
@@ -1803,7 +1823,7 @@ __device__ bool exactify_into_beam_with_terminal_cache(
   __syncthreads();
 
   for (u32 index = threadIdx.x; index < candidate_count; index += blockDim.x) {
-    const u8 origin = merge_expanded[index];
+    const u16 origin = merge_expanded[index];
     if (origin > 1) continue;
     const u32 cache_slot = candidate_ids[index] & kTerminalSlotMask;
     const u32 shard = request_shards[kTerminalCandidateMetadataBase + index];

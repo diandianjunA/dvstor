@@ -1,5 +1,8 @@
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 
 #include <boost/program_options.hpp>
 
@@ -28,7 +31,15 @@ int main(int argc, char** argv) {
     ("threads", po::value<u32>(&options.threads)->default_value(0),
      "CPU threads; 0 uses all hardware threads")
     ("seed", po::value<u64>(&options.seed)->default_value(options.seed), "Training seed")
-    ("overwrite", po::bool_switch(&options.overwrite), "Replace existing PQ outputs");
+    ("train-data-path", po::value<filepath_t>(&options.train_data_path),
+     "Sample training vectors from this raw bin file instead of index shards")
+    ("only-shards", po::value<std::string>(),
+     "Comma-separated 1-based shard ordinals to encode locally (default: all)")
+    ("skip-encode", po::bool_switch(&options.skip_encode),
+     "Train and publish only the PQ model; encode no shard codes")
+    ("overwrite", po::bool_switch(&options.overwrite), "Replace existing PQ outputs")
+    ("no-opq", po::bool_switch(&options.no_opq),
+     "Skip OPQ rotation training (plain PQ, for very high dimensions)");
   try {
     po::variables_map variables;
     po::store(po::parse_command_line(argc, argv, description), variables);
@@ -37,6 +48,18 @@ int main(int argc, char** argv) {
       return EXIT_SUCCESS;
     }
     po::notify(variables);
+    if (variables.count("only-shards")) {
+      std::istringstream list(variables["only-shards"].as<std::string>());
+      std::string token;
+      while (std::getline(list, token, ',')) {
+        if (token.empty()) continue;
+        const unsigned long ordinal = std::stoul(token);
+        if (ordinal == 0) {
+          throw std::invalid_argument("--only-shards ordinals are 1-based");
+        }
+        options.only_shards.push_back(static_cast<u32>(ordinal - 1));
+      }
+    }
     (void)tools::vamana_offline::build_pq_index(options);
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {

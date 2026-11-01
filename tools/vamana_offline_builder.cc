@@ -4,6 +4,7 @@
 
 #include <library/utils.hh>
 
+#include "tools/vamana_offline/checkpoint.hh"
 #include "tools/vamana_offline/config.hh"
 #include "tools/vamana_offline/dataset_io.hh"
 #include "tools/vamana_offline/graph.hh"
@@ -15,6 +16,10 @@
 
 using namespace tools::vamana_offline;
 
+// Exit code used when a pause checkpoint was committed and the build should
+// be relaunched later with identical flags to resume.
+constexpr int kExitPaused = 75;
+
 int main(int argc, char** argv) {
   const VamanaBuildConfig config = parse_configuration(argc, argv);
   if (config.partition_strategy == "metis") {
@@ -22,6 +27,7 @@ int main(int argc, char** argv) {
     lib_assert(metis_index_bits() >= 64,
                "METIS partitioning for large indexes requires a 64-bit idx_t build");
   }
+  install_checkpoint_signal_handler();
   std::cerr << "offline builder preflight: metis="
             << (metis_partitioning_available() ? "enabled" : "disabled")
             << " metis_idx_bits=" << metis_index_bits() << "\n";
@@ -42,6 +48,11 @@ int main(int argc, char** argv) {
             << " partition_max_degree=" << config.partition_max_degree
             << " partition_imbalance=" << config.partition_imbalance << "\n";
   std::cerr << "skip_sanity_check=" << (config.skip_sanity_check ? "true" : "false") << "\n";
+  std::cerr << "checkpoint_prefix="
+            << (config.checkpoint_prefix.empty() ? str{"<disabled>"}
+                                                 : config.checkpoint_prefix.string())
+            << " checkpoint_segment_nodes=" << config.checkpoint_segment_nodes
+            << " (SIGUSR1 pauses at the next segment boundary)\n";
 
   const auto build_start = std::chrono::steady_clock::now();
 
@@ -54,12 +65,22 @@ int main(int argc, char** argv) {
 
   // Step 1: Build Vamana graph
   VamanaGraph graph;
-  build_vamana_graph(graph, dataset, config);
+  try {
+    build_vamana_graph(graph, dataset, config, config.checkpoint_prefix);
+  } catch (const CheckpointPauseException&) {
+    std::cerr << "checkpoint: paused by signal; state committed under "
+              << config.checkpoint_prefix
+              << ". Relaunch with identical flags to resume.\n";
+    return kExitPaused;
+  }
 
   run_optional_recall_check(graph, dataset, config);
 
   // Step 2: Serialize to shard files
   write_vamana_shards(graph, dataset, config, output_prefix);
+
+  if (!config.checkpoint_prefix.empty())
+    remove_graph_checkpoint(config.checkpoint_prefix);
 
   const auto build_end = std::chrono::steady_clock::now();
   const auto seconds = std::chrono::duration_cast<std::chrono::duration<double>>(build_end - build_start).count();

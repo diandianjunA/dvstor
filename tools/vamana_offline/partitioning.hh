@@ -7,6 +7,8 @@
 
 namespace tools::vamana_offline {
 
+struct Dataset;
+
 struct NodePlacement {
   u32 memory_node{0};
   u64 offset{0};
@@ -24,6 +26,10 @@ struct PartitionStats {
   size_t edge_cut{0};
   double partition_cross_shard_ratio{0.0};
   vec<size_t> part_node_counts;
+  // Telemetry populated by the kmeans strategy.
+  u64 kmeans_sample_size{0};
+  u32 kmeans_iterations{0};
+  double kmeans_inertia{0.0};
 };
 
 bool metis_partitioning_available();
@@ -43,6 +49,17 @@ vec<u32> compute_bfs_partition(const vec<vec<u32>>& neighbors,
                                u32 num_parts,
                                u32 start_node,
                                PartitionStats* stats = nullptr);
+// Sample-based Lloyd kmeans over the raw vectors followed by an exact
+// balancing pass. Every returned shard holds either floor(n/num_parts) or
+// ceil(n/num_parts) nodes. Edge-cut fields of stats are left untouched (the
+// caller owns the graph); part_node_counts and the kmeans telemetry fields
+// are filled when stats is non-null.
+vec<u32> compute_kmeans_partition(const Dataset& dataset,
+                                  u64 num_nodes,
+                                  u32 num_parts,
+                                  u64 sample_size,
+                                  u32 iters,
+                                  PartitionStats* stats = nullptr);
 vec<NodePlacement> assign_nodes_to_shards_from_partition(const vec<u32>& parts,
                                                          u32 num_memory_nodes,
                                                          size_t aligned_node_size);

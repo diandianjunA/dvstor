@@ -2,7 +2,7 @@
 
 #include <cuda_runtime.h>
 
-#ifndef IBV_WC_DRIVER1
+#if !defined(IBV_WC_DRIVER1) && !defined(DVSTOR_HAVE_IBV_WC_DRIVER1)
 #define IBV_WC_DRIVER1 135
 #define IBV_WC_DRIVER2 136
 #define IBV_WC_DRIVER3 137
@@ -539,8 +539,13 @@ struct GpuNetioPersistentTransport::Impl {
       check_doca("doca_gpu_dmabuf_fd",
                  doca_gpu_dmabuf_fd(
                    gpu, registered_base, registered_bytes, &dmabuf_fd));
+#if defined(DVSTOR_HAVE_MLX5DV_REG_DMABUF_MR)
       registered_mr = mlx5dv_reg_dmabuf_mr(
         ibv_pd, 0, registered_bytes, 0, dmabuf_fd, mr_access, 0);
+#else
+      registered_mr = ibv_reg_dmabuf_mr(
+        ibv_pd, 0, registered_bytes, 0, dmabuf_fd, mr_access);
+#endif
       local_iova_base = reinterpret_cast<uint64_t>(registered_base);
     }
     if (registered_mr == nullptr) {

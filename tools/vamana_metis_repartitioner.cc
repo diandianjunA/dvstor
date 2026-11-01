@@ -9,13 +9,29 @@ int main(int argc, char **argv) {
   namespace po = boost::program_options;
   tools::vamana_offline::MetisRepartitionOptions options;
   po::options_description description{
-      "Repartition a complete schema-16 balanced index with 64-bit METIS"};
+      "Repartition a complete schema-16 index (balanced/bfs/kmeans input) into "
+      "a fresh METIS or kmeans placement"};
   description.add_options()("help,h", "Show help")(
       "input-prefix", po::value<filepath_t>(&options.input_prefix)->required(),
-      "Existing complete schema-16 balanced index prefix")(
+      "Existing complete schema-16 index prefix")(
       "output-prefix",
       po::value<filepath_t>(&options.output_prefix)->required(),
-      "New METIS index prefix (in-place conversion is forbidden)")(
+      "New repartitioned index prefix (in-place conversion is forbidden)")(
+      "input-strategy",
+      po::value<str>(&options.input_strategy)->default_value("balanced"),
+      "Source partition_strategy: balanced, bfs, or kmeans")(
+      "output-strategy",
+      po::value<str>(&options.output_strategy)->default_value("metis"),
+      "Target partition strategy: metis or kmeans")(
+      "kmeans-samples",
+      po::value<u64>(&options.kmeans_samples)->default_value(1000000),
+      "Lloyd sample size for --output-strategy=kmeans")(
+      "kmeans-iters",
+      po::value<u32>(&options.kmeans_iters)->default_value(10),
+      "Lloyd iterations for --output-strategy=kmeans")(
+      "pause-after-load", po::value<filepath_t>(&options.pause_after_load),
+      "Pause after the source index is fully loaded into memory and poll "
+      "every 5s until this flag file exists, before writing output shards")(
       "data-path", po::value<filepath_t>(&options.data_path),
       "Base vector file; defaults to source metadata data_file")(
       "reuse-model", po::value<filepath_t>(&options.reuse_model),
@@ -47,7 +63,7 @@ int main(int argc, char **argv) {
     const auto result =
         tools::vamana_offline::repartition_schema16_index(options);
     std::cout << (options.validate_only ? "Source validation passed"
-                                        : "METIS repartition passed")
+                                        : "Repartition passed")
               << ": nodes=" << result.node_count
               << " edges=" << result.edge_count << " shards=" << result.shards
               << " graph_written=" << (result.graph_written ? "yes" : "no")

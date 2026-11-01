@@ -163,6 +163,7 @@ struct PersistentSearchEngine::Impl {
     void* remote_regions{};
     u32 remote_region_count{};
     u32 qps_per_node{};
+    int* qp_locks{};
     u32 local_mkey{};
     u64 local_iova_base{};
     byte_t* data{};
@@ -170,6 +171,10 @@ struct PersistentSearchEngine::Impl {
     byte_t* dump{};
   } direct_view;
 #endif
+  // Created before the GPUNetIO transport: once DOCA claims the RDMA device
+  // a fresh ibv_get_device_list can fail on this stack, so the bootstrapper's
+  // data context must outlive the engine and exist before transport init.
+  std::unique_ptr<Context> bootstrap_data_context;
   std::unique_ptr<NavigationBootstrapper> control_bootstrapper;
   MappedRing<QueryDescriptor> submissions;
   MappedRing<CompletionDescriptor> completions;

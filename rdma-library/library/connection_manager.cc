@@ -12,7 +12,7 @@ ServerConnectionManager::ServerConnectionManager(Context& context,
                                                  const Configuration& config)
     : ConnectionManager(context, config),
       client_qps(config.num_clients),
-      initiator_qp(client_qps.front()) {}
+      initiator_qp(client_qps.front().get()) {}
 
 ClientConnectionManager::ClientConnectionManager(Context& context,
                                                  const Configuration& config)
@@ -23,10 +23,20 @@ ClientConnectionManager::ClientConnectionManager(Context& context,
 }
 
 void ServerConnectionManager::connect_to_clients() {
+  if (pending_reconnected_qp) {
+    lib_assert(pending_reconnected_client_id < client_qps.size(),
+               "reconnecting client ID exceeds --num-clients");
+    lib_assert(client_qps[pending_reconnected_client_id] == nullptr,
+               "duplicate reconnecting client ID");
+    client_qps[pending_reconnected_client_id] =
+        std::move(pending_reconnected_qp);
+    pending_reconnected_client_id = 0;
+  }
   context_.bind_to_port(config_.port);
 
   // connect queue pairs and order them by client ids
   for (u32 i = 0; i < config_.num_clients; ++i) {
+    if (client_qps[i] != nullptr) continue;
     auto [qp, client_id] = context_.wait_for_connection();
     lib_assert(client_id < client_qps.size(),
                "connecting client ID exceeds --num-clients");
@@ -36,6 +46,24 @@ void ServerConnectionManager::connect_to_clients() {
   }
 
   context_.close_server_socket();
+  initiator_qp = client_qps.front().get();
+}
+
+void ServerConnectionManager::accept_reconnection(std::atomic<bool>& shutdown) {
+  context_.bind_to_port(config_.port);
+  auto [qp, client_id] = context_.wait_for_connection();
+  lib_assert(client_id < client_qps.size(),
+             "reconnecting client ID exceeds --num-clients");
+  pending_reconnected_client_id = client_id;
+  pending_reconnected_qp = std::move(qp);
+  shutdown.store(true, std::memory_order_release);
+}
+
+void ServerConnectionManager::reset_for_reconnect() {
+  context_.close_server_socket();
+  client_qps.clear();
+  client_qps.resize(config_.num_clients);
+  initiator_qp = nullptr;
 }
 
 void ClientConnectionManager::connect() {

@@ -210,6 +210,7 @@ void Context::bind_to_port(u32 tcp_port) {
 
 void Context::close_server_socket() {
   if (server_socket_ >= 0) {
+    shutdown(server_socket_, SHUT_RDWR);
     close(server_socket_);
     server_socket_ = -1;
   }

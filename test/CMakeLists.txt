@@ -73,6 +73,7 @@ if (TARGET FaissCPU::FaissCPU)
         legacy_index_converter_test.cc
         ${CMAKE_SOURCE_DIR}/tools/vamana_offline/legacy_index_converter.cc
         ${CMAKE_SOURCE_DIR}/tools/vamana_offline/pq_indexer.cc
+        ${CMAKE_SOURCE_DIR}/tools/vamana_offline/progress.cc
         ${CMAKE_SOURCE_DIR}/src/gpu_search/index_format.cc
         ${CMAKE_SOURCE_DIR}/src/gpu_search/pq_index.cc)
     dvstor_target_tool_includes(legacy_index_converter_test)
@@ -191,7 +192,8 @@ target_link_libraries(gpu_pq_index_test PRIVATE dvstor_runtime)
 
 dvstor_add_test(graph_extent_indexer_test
     graph_extent_indexer_test.cc
-    ${CMAKE_SOURCE_DIR}/tools/vamana_offline/graph_extent_indexer.cc)
+    ${CMAKE_SOURCE_DIR}/tools/vamana_offline/graph_extent_indexer.cc
+    ${CMAKE_SOURCE_DIR}/tools/vamana_offline/progress.cc)
 dvstor_target_tool_includes(graph_extent_indexer_test)
 target_link_libraries(graph_extent_indexer_test PRIVATE dvstor_runtime)
 

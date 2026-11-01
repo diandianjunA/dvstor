@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -47,7 +48,7 @@ constexpr size_t kReadChunkRecords = 4096;
 constexpr size_t kChecksumChunkBytes = 8ull << 20;
 
 [[noreturn]] void fail(const str &message) {
-  throw std::runtime_error("schema-16 METIS repartition: " + message);
+  throw std::runtime_error("schema-16 repartition: " + message);
 }
 
 u64 checked_add(u64 lhs, u64 rhs, const char *description) {
@@ -310,8 +311,10 @@ SourceContract load_source_contract(const MetisRepartitionOptions &options) {
     fail("input must be a complete schema-16 index");
   }
   source.document = read_json_document(metadata_path(options.input_prefix));
-  if (required<str>(source.document, "partition_strategy") != "balanced") {
-    fail("input partition_strategy must be balanced");
+  if (required<str>(source.document, "partition_strategy") !=
+      options.input_strategy) {
+    fail("input partition_strategy does not match --input-strategy=" +
+         options.input_strategy);
   }
   if (normalized_prefix(
           required<filepath_t>(source.document, "output_prefix")) !=
@@ -731,7 +734,10 @@ json make_plan(const MetisRepartitionOptions &options,
       {"R", source.metadata.R},
       {"vector_data_type", vector_dtype_name(source.metadata.vector_dtype)},
       {"pq_subquantizers", source.metadata.pq_subquantizers},
-      {"partition_strategy", "metis"},
+      {"partition_strategy", options.output_strategy},
+      {"partition_input_strategy", options.input_strategy},
+      {"partition_kmeans_samples", options.kmeans_samples},
+      {"partition_kmeans_iters", options.kmeans_iters},
       {"partition_max_degree", source.partition_max_degree},
       {"partition_imbalance", source.partition_imbalance},
   };
@@ -895,7 +901,7 @@ u64 estimate_target_bytes(const MetisRepartitionOptions &options,
   return checked_add(bytes, bytes / 20, "target disk safety margin overflows");
 }
 
-u64 estimate_peak_memory_bytes(const SourceContract &source) {
+u64 estimate_peak_memory_bytes(const SourceContract &source, bool include_metis) {
   const u64 nodes = source.metadata.num_vectors;
   const u64 partition_edges =
       checked_multiply(nodes, source.partition_max_degree,
@@ -912,6 +918,7 @@ u64 estimate_peak_memory_bytes(const SourceContract &source) {
                       checked_multiply(nodes, sizeof(node_t) + sizeof(u8),
                                        "idmap memory estimate overflows"),
                       "memory estimate overflows");
+  if (!include_metis) return bytes;
   const u64 metis_vectors = checked_add(
       checked_multiply(partition_edges, 3 * sizeof(u64),
                        "METIS edge memory estimate overflows"),
@@ -953,10 +960,14 @@ void preflight_target_resources(const MetisRepartitionOptions &options,
             << " available_gib="
             << static_cast<long double>(space.available) / (1ull << 30) << '\n';
   if (space.available < target_bytes) {
-    fail("insufficient free disk for an independently committed METIS index");
+    if (options.pause_after_load.empty()) {
+      fail("insufficient free disk for an independently committed METIS index");
+    }
+    std::cerr << "[repartition][preflight] WARNING: disk check deferred to the "
+                 "pause-after-load gate (operator frees source shards during the pause)\n";
   }
 
-  const u64 memory_bytes = estimate_peak_memory_bytes(source);
+  const u64 memory_bytes = estimate_peak_memory_bytes(source, options.output_strategy == "metis");
   const u64 memory_available = available_memory_bytes();
   std::cerr << "[repartition][preflight] peak_memory_estimate_gib="
             << static_cast<long double>(memory_bytes) / (1ull << 30);
@@ -975,8 +986,10 @@ void preflight_target_resources(const MetisRepartitionOptions &options,
 void bind_graph_metadata(const filepath_t &output_prefix, const json &plan) {
   json metadata = read_json_document(metadata_path(output_prefix));
   if (metadata.value("schema_version", 0u) != 15u ||
-      metadata.value("partition_strategy", str{}) != "metis") {
-    fail("repartition graph stage is not schema-15 METIS");
+      metadata.value("partition_strategy", str{}) !=
+          plan.at("partition_strategy").get<str>()) {
+    fail("repartition graph stage metadata does not match the planned output "
+         "schema and partition strategy");
   }
   metadata["repartitioner_version"] = kRepartitionerVersion;
   metadata["repartition_source_prefix"] = plan.at("source_prefix");
@@ -993,7 +1006,8 @@ void bind_graph_metadata(const filepath_t &output_prefix, const json &plan) {
 void validate_output_provenance(const json &metadata, const json &plan,
                                 u32 expected_schema) {
   if (metadata.value("schema_version", 0u) != expected_schema ||
-      metadata.value("partition_strategy", str{}) != "metis" ||
+      metadata.value("partition_strategy", str{}) !=
+          plan.at("partition_strategy").get<str>() ||
       normalized_prefix(metadata.value("output_prefix", filepath_t{})) !=
           plan.at("output_prefix").get<str>() ||
       metadata.value("num_vectors", u64{0}) !=
@@ -1123,17 +1137,62 @@ validate_complete_output(const filepath_t &output_prefix, const json &plan) {
 
 } // namespace
 
+namespace {
+
+void validate_strategy_options(const MetisRepartitionOptions &options) {
+  if (options.input_strategy != "balanced" && options.input_strategy != "bfs" &&
+      options.input_strategy != "kmeans") {
+    fail("--input-strategy must be one of balanced, bfs, kmeans");
+  }
+  if (options.output_strategy != "metis" &&
+      options.output_strategy != "kmeans") {
+    fail("--output-strategy must be one of metis, kmeans");
+  }
+  if (options.output_strategy == "kmeans" &&
+      (options.kmeans_samples == 0 || options.kmeans_iters == 0)) {
+    fail("--kmeans-samples and --kmeans-iters must be > 0");
+  }
+}
+
+// The source dataset is pread in full into anonymous pages by read_dataset,
+// and load_source_index materializes the whole graph via buffered reads, so
+// at this point nothing is lazily backed by the source index or data files;
+// it is safe for the operator to delete the old shards while we wait.
+void pause_after_load_gate(const MetisRepartitionOptions &options) {
+  if (options.pause_after_load.empty())
+    return;
+  std::cerr << "PAUSED_AFTER_LOAD, waiting for " << options.pause_after_load
+            << '\n';
+  while (true) {
+    std::error_code error;
+    const bool present = fs::exists(options.pause_after_load, error);
+    if (error) {
+      fail("cannot inspect --pause-after-load flag file " +
+           options.pause_after_load.string() + ": " + error.message());
+    }
+    if (present)
+      break;
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+  }
+  std::cerr << "PAUSED_AFTER_LOAD resumed, flag file present: "
+            << options.pause_after_load << '\n';
+}
+
+} // namespace
+
 MetisRepartitionResult
 repartition_schema16_index(const MetisRepartitionOptions &options) {
   if (options.input_prefix.empty() || options.output_prefix.empty()) {
     throw std::invalid_argument(
-        "METIS repartition requires input and output prefixes");
+        "index repartition requires input and output prefixes");
   }
+  validate_strategy_options(options);
   if (normalized_prefix(options.input_prefix) ==
       normalized_prefix(options.output_prefix)) {
     fail("in-place repartition is forbidden");
   }
-  if (!metis_partitioning_available() || metis_index_bits() < 64) {
+  if (options.output_strategy == "metis" &&
+      (!metis_partitioning_available() || metis_index_bits() < 64)) {
     fail(metis_partitioning_available()
              ? "large-index repartition requires METIS with 64-bit idx_t"
              : metis_unavailable_reason());
@@ -1202,6 +1261,7 @@ repartition_schema16_index(const MetisRepartitionOptions &options) {
     preflight_target_resources(options, source);
     LoadedIndex loaded = load_source_index(options, source);
     result.edge_count = loaded.edge_count;
+    pause_after_load_gate(options);
     VamanaBuildConfig target;
     target.data_path = loaded.dataset.source_file;
     target.output_prefix = options.output_prefix;
@@ -1211,9 +1271,11 @@ repartition_schema16_index(const MetisRepartitionOptions &options) {
     target.beam_width = source.beam_width;
     target.alpha = source.alpha;
     target.vector_data_type = vector_dtype_name(source.metadata.vector_dtype);
-    target.partition_strategy = "metis";
+    target.partition_strategy = options.output_strategy;
     target.partition_max_degree = source.partition_max_degree;
     target.partition_imbalance = source.partition_imbalance;
+    target.partition_kmeans_samples = options.kmeans_samples;
+    target.partition_kmeans_iters = options.kmeans_iters;
     target.skip_sanity_check = true;
     target.max_vectors = static_cast<size_t>(source.metadata.num_vectors);
     validate_vamana_shard_capacity(loaded.dataset.size(), target);

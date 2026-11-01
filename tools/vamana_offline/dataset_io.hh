@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tools/vamana_offline/config.hh"
+#include "tools/vamana_offline/large_buffer.hh"
 
 namespace tools::vamana_offline {
 
@@ -10,7 +11,7 @@ struct Dataset {
   size_t total_vectors{0};
   VectorDType dtype{VectorDType::float32};
   size_t vector_bytes{0};
-  vec<byte_t> raw_vectors;
+  LargeBuffer<byte_t> raw_vectors;
 
   size_t size() const { return vector_count; }
   const byte_t* raw_vector(size_t i) const { return raw_vectors.data() + i * vector_bytes; }

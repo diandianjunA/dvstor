@@ -1,6 +1,6 @@
 #include <cuda_runtime.h>
 
-#ifndef IBV_WC_DRIVER1
+#if !defined(IBV_WC_DRIVER1) && !defined(DVSTOR_HAVE_IBV_WC_DRIVER1)
 #define IBV_WC_DRIVER1 135
 #define IBV_WC_DRIVER2 136
 #define IBV_WC_DRIVER3 137
@@ -167,8 +167,13 @@ int main(int argc, char** argv) {
       const int access = IBV_ACCESS_LOCAL_WRITE |
         IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
       ibv_mr* memory_region = registration_mode == "dmabuf"
+#if defined(DVSTOR_HAVE_MLX5DV_REG_DMABUF_MR)
         ? mlx5dv_reg_dmabuf_mr(
             verbs_pd, offset, bytes, offset, resources.dmabuf_fd, access, 0)
+#else
+        ? ibv_reg_dmabuf_mr(
+            verbs_pd, offset, bytes, offset, resources.dmabuf_fd, access)
+#endif
         : ibv_reg_mr(
             verbs_pd, static_cast<unsigned char*>(resources.gpu_memory) + offset,
             bytes, access);

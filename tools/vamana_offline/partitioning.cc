@@ -3,8 +3,15 @@
 #include <algorithm>
 #include <deque>
 #include <limits>
+#include <numeric>
+#include <random>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
+
+#include "common/vector_dtype.hh"
+#include "tools/vamana_offline/dataset_io.hh"
+#include "tools/vamana_offline/progress.hh"
 
 #ifndef DVSTOR_HAVE_METIS
 #define DVSTOR_HAVE_METIS 0
@@ -380,6 +387,315 @@ vec<u32> compute_bfs_partition(const vec<vec<u32>>& neighbors,
         total_edges == 0 ? 0.0 : static_cast<double>(cut_edges) / static_cast<double>(total_edges);
   }
 
+  return parts;
+}
+
+vec<u32> compute_kmeans_partition(const Dataset& dataset,
+                                  u64 num_nodes,
+                                  u32 num_parts,
+                                  u64 sample_size,
+                                  u32 iters,
+                                  PartitionStats* stats) {
+  if (num_parts == 0) {
+    throw std::runtime_error("kmeans partition part count must be > 0");
+  }
+  if (num_nodes != dataset.size()) {
+    throw std::runtime_error("kmeans partition node count does not match dataset");
+  }
+  if (num_parts > 256) {
+    throw std::runtime_error("kmeans partition supports at most 256 parts");
+  }
+  const u32 dim = dataset.dim;
+  if (dim == 0) {
+    throw std::runtime_error("kmeans partition requires a non-empty dataset dimension");
+  }
+
+  const size_t n = static_cast<size_t>(num_nodes);
+  const size_t k = num_parts;
+  vec<u32> parts(n, 0);
+  if (stats != nullptr) {
+    stats->part_node_counts.assign(k, 0);
+    stats->kmeans_sample_size = 0;
+    stats->kmeans_iterations = 0;
+    stats->kmeans_inertia = 0.0;
+  }
+  if (n == 0) return parts;
+  if (k == 1) {
+    if (stats != nullptr) stats->part_node_counts[0] = n;
+    return parts;
+  }
+  if (k >= n) {
+    for (size_t i = 0; i < n; ++i) parts[i] = static_cast<u32>(i);
+    if (stats != nullptr) {
+      for (size_t c = 0; c < k; ++c) {
+        stats->part_node_counts[c] = c < n ? 1 : 0;
+      }
+    }
+    return parts;
+  }
+
+  std::mt19937_64 rng(1234);
+  const size_t threads = effective_thread_count(0);
+
+  // ── Step 1: Uniform random sample decoded to float32 ──
+  size_t num_samples = static_cast<size_t>(std::min<u64>(sample_size, n));
+  num_samples = std::max(num_samples, k);
+  vec<size_t> sample_rows(num_samples);
+  if (num_samples == n) {
+    std::iota(sample_rows.begin(), sample_rows.end(), size_t{0});
+  } else {
+    std::unordered_set<size_t> chosen;
+    chosen.reserve(num_samples * 2);
+    for (size_t s = 0; s < num_samples; ++s) {
+      size_t row = 0;
+      do {
+        row = static_cast<size_t>(rng() % n);
+      } while (!chosen.insert(row).second);
+      sample_rows[s] = row;
+    }
+  }
+  vec<float> samples(num_samples * dim);
+  parallel_for(static_cast<size_t>(0), num_samples, threads,
+               [&](size_t s, size_t) {
+    decode_storage_vector_to_float(dataset.raw_vector(sample_rows[s]),
+                                   dataset.dtype, dim,
+                                   samples.data() + s * dim);
+  });
+
+  const float kInf = std::numeric_limits<float>::infinity();
+  vec<float> centroids(k * dim, 0.0f);
+  auto copy_sample_to_centroid = [&](size_t s, size_t c) {
+    std::copy_n(samples.data() + s * dim, dim, centroids.data() + c * dim);
+  };
+
+  // ── Step 2: kmeans++ seeding over the sample ──
+  vec<float> min_d2(num_samples, kInf);
+  copy_sample_to_centroid(static_cast<size_t>(rng() % num_samples), 0);
+  for (size_t c = 1; c < k; ++c) {
+    const float* prev = centroids.data() + (c - 1) * dim;
+    parallel_for(static_cast<size_t>(0), num_samples, threads,
+                 [&](size_t s, size_t) {
+      const float d = l2_distance_float32_simd(samples.data() + s * dim, prev, dim);
+      if (d < min_d2[s]) min_d2[s] = d;
+    });
+    double total = 0.0;
+    for (size_t s = 0; s < num_samples; ++s) total += static_cast<double>(min_d2[s]);
+    size_t picked = num_samples - 1;
+    if (total > 0.0) {
+      const double target =
+        std::uniform_real_distribution<double>(0.0, total)(rng);
+      double acc = 0.0;
+      for (size_t s = 0; s < num_samples; ++s) {
+        acc += static_cast<double>(min_d2[s]);
+        if (acc >= target) {
+          picked = s;
+          break;
+        }
+      }
+    } else {
+      picked = static_cast<size_t>(rng() % num_samples);
+    }
+    copy_sample_to_centroid(picked, c);
+  }
+
+  // ── Step 3: Lloyd iterations over the sample ──
+  vec<u32> sample_assign(num_samples, 0);
+  vec<float> sample_best_d2(num_samples, kInf);
+  vec<f64> partial_sums(threads * k * dim);
+  vec<u64> partial_counts(threads * k);
+  u32 iters_run = 0;
+  for (u32 iter = 0; iter < iters; ++iter) {
+    std::fill(partial_sums.begin(), partial_sums.end(), 0.0);
+    std::fill(partial_counts.begin(), partial_counts.end(), 0);
+    std::atomic<u64> changes{0};
+    parallel_for(static_cast<size_t>(0), num_samples, threads,
+                 [&](size_t s, size_t tid) {
+      const float* v = samples.data() + s * dim;
+      float best = kInf;
+      u32 best_id = 0;
+      for (size_t c = 0; c < k; ++c) {
+        const float d = l2_distance_float32_simd(v, centroids.data() + c * dim, dim);
+        if (d < best) {
+          best = d;
+          best_id = static_cast<u32>(c);
+        }
+      }
+      if (sample_assign[s] != best_id) {
+        sample_assign[s] = best_id;
+        changes.fetch_add(1, std::memory_order_relaxed);
+      }
+      sample_best_d2[s] = best;
+      f64* sums = partial_sums.data() + (tid * k + best_id) * dim;
+      for (u32 d = 0; d < dim; ++d) sums[d] += static_cast<f64>(v[d]);
+      ++partial_counts[tid * k + best_id];
+    });
+    vec<u64> counts(k, 0);
+    vec<f64> sums(k * dim, 0.0);
+    for (size_t tid = 0; tid < threads; ++tid) {
+      for (size_t c = 0; c < k; ++c) {
+        counts[c] += partial_counts[tid * k + c];
+        const f64* src = partial_sums.data() + (tid * k + c) * dim;
+        f64* dst = sums.data() + c * dim;
+        for (u32 d = 0; d < dim; ++d) dst[d] += src[d];
+      }
+    }
+    for (size_t c = 0; c < k; ++c) {
+      if (counts[c] == 0) {
+        // Re-seed an empty cluster at the currently worst-served sample.
+        const size_t farthest = static_cast<size_t>(
+          std::max_element(sample_best_d2.begin(), sample_best_d2.end()) -
+          sample_best_d2.begin());
+        copy_sample_to_centroid(farthest, c);
+        continue;
+      }
+      const f64 inv = 1.0 / static_cast<f64>(counts[c]);
+      float* centroid = centroids.data() + c * dim;
+      for (u32 d = 0; d < dim; ++d) {
+        centroid[d] = static_cast<float>(sums[c * dim + d] * inv);
+      }
+    }
+    iters_run = iter + 1;
+    if (iter > 0 && changes.load(std::memory_order_relaxed) == 0) break;
+  }
+
+  // Final assignment pass so the reported inertia matches the final centroids.
+  vec<f64> inertia_parts(threads, 0.0);
+  parallel_for(static_cast<size_t>(0), num_samples, threads,
+               [&](size_t s, size_t tid) {
+    const float* v = samples.data() + s * dim;
+    float best = kInf;
+    for (size_t c = 0; c < k; ++c) {
+      const float d = l2_distance_float32_simd(v, centroids.data() + c * dim, dim);
+      if (d < best) best = d;
+    }
+    inertia_parts[tid] += static_cast<f64>(best);
+  });
+  double inertia = 0.0;
+  for (f64 part : inertia_parts) inertia += part;
+
+  // ── Step 4: Full nearest-centroid assignment over every vector ──
+  vec<u8> second(n, 0);
+  vec<vec<float>> decode_bufs(threads, vec<float>(dim));
+  const bool direct_float = dataset.dtype == VectorDType::float32;
+  parallel_for(static_cast<size_t>(0), n, threads, [&](size_t i, size_t tid) {
+    const byte_t* raw = dataset.raw_vector(i);
+    const float* v = nullptr;
+    if (direct_float) {
+      v = reinterpret_cast<const float*>(raw);
+    } else {
+      decode_storage_vector_to_float(raw, dataset.dtype, dim,
+                                     decode_bufs[tid].data());
+      v = decode_bufs[tid].data();
+    }
+    float best = kInf;
+    float runner_up = kInf;
+    u32 best_id = 0;
+    u32 second_id = 0;
+    for (size_t c = 0; c < k; ++c) {
+      const float d = l2_distance_float32_simd(v, centroids.data() + c * dim, dim);
+      if (d < best) {
+        runner_up = best;
+        second_id = best_id;
+        best = d;
+        best_id = static_cast<u32>(c);
+      } else if (d < runner_up) {
+        runner_up = d;
+        second_id = static_cast<u32>(c);
+      }
+    }
+    parts[i] = best_id;
+    second[i] = static_cast<u8>(second_id);
+  });
+
+  // ── Step 5: Exact balancing ──
+  vec<size_t> counts(k, 0);
+  for (u32 p : parts) ++counts[p];
+  const size_t base = n / k;
+  const size_t rem = n % k;
+  auto target_size = [&](size_t c) { return base + (c < rem ? 1 : 0); };
+  vec<size_t> deficit(k, 0);
+  bool imbalanced = false;
+  for (size_t c = 0; c < k; ++c) {
+    const size_t target = target_size(c);
+    if (counts[c] < target) deficit[c] = target - counts[c];
+    if (counts[c] > target) imbalanced = true;
+  }
+  if (imbalanced) {
+    vec<size_t> offsets(k + 1, 0);
+    for (size_t c = 0; c < k; ++c) offsets[c + 1] = offsets[c] + counts[c];
+    vec<u32> members(n);
+    {
+      vec<size_t> cursor(offsets.begin(), offsets.end() - 1);
+      for (size_t i = 0; i < n; ++i) {
+        members[cursor[parts[i]]++] = static_cast<u32>(i);
+      }
+    }
+    vec<float> decode_buf(dim);
+    auto point_centroid_dist = [&](size_t i, size_t c) {
+      const byte_t* raw = dataset.raw_vector(i);
+      const float* v = nullptr;
+      if (direct_float) {
+        v = reinterpret_cast<const float*>(raw);
+      } else {
+        decode_storage_vector_to_float(raw, dataset.dtype, dim,
+                                       decode_buf.data());
+        v = decode_buf.data();
+      }
+      return l2_distance_float32_simd(v, centroids.data() + c * dim, dim);
+    };
+    for (size_t c = 0; c < k; ++c) {
+      const size_t target = target_size(c);
+      if (counts[c] <= target) continue;
+      size_t need = counts[c] - target;
+      const size_t seg_begin = offsets[c];
+      const size_t seg_end = offsets[c] + counts[c];
+      // Evict members whose reassignment to their second-nearest centroid
+      // costs the least inertia.
+      vec<std::pair<float, u32>> order;
+      order.reserve(seg_end - seg_begin);
+      for (size_t e = seg_begin; e < seg_end; ++e) {
+        const u32 m = members[e];
+        const float own = point_centroid_dist(m, c);
+        const float alt = point_centroid_dist(m, second[m]);
+        order.emplace_back(alt - own, m);
+      }
+      std::sort(order.begin(), order.end(),
+                [](const auto& lhs, const auto& rhs) {
+                  return lhs.first < rhs.first;
+                });
+      for (const auto& [delta, m] : order) {
+        if (need == 0) break;
+        (void)delta;
+        u32 dest = second[m];
+        if (dest == c || deficit[dest] == 0) {
+          float best = kInf;
+          u32 best_id = static_cast<u32>(k);
+          for (size_t c2 = 0; c2 < k; ++c2) {
+            if (c2 == c || deficit[c2] == 0) continue;
+            const float d = point_centroid_dist(m, c2);
+            if (d < best) {
+              best = d;
+              best_id = static_cast<u32>(c2);
+            }
+          }
+          if (best_id == k) break;  // no deficit left anywhere
+          dest = best_id;
+        }
+        parts[m] = dest;
+        --deficit[dest];
+        ++counts[dest];
+        --counts[c];
+        --need;
+      }
+    }
+  }
+
+  if (stats != nullptr) {
+    for (size_t c = 0; c < k; ++c) stats->part_node_counts[c] = counts[c];
+    stats->kmeans_sample_size = num_samples;
+    stats->kmeans_iterations = iters_run;
+    stats->kmeans_inertia = inertia;
+  }
   return parts;
 }
 

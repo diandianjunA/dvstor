@@ -12,8 +12,25 @@ namespace {
 
 template <u32 Threads, bool EnableAsfe, u32 PqSubquantizers>
 const void* persistent_search_kernel_address() {
-  return reinterpret_cast<const void*>(
+  const void* kernel = reinterpret_cast<const void*>(
     persistent_search_kernel<Threads, EnableAsfe, PqSubquantizers>);
+  // The LUT tile scorer rides on dynamic shared memory.  Static shared
+  // (48,544 B) plus the tile exceeds the default 48-KiB per-block shared
+  // limit, so every instantiation opts into the extended limit once before
+  // its first occupancy query or launch.
+  static const bool configured = [kernel] {
+    const cudaError_t status = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(kPersistentPqLutTileBytes));
+    if (status != cudaSuccess) {
+      throw std::runtime_error(
+        std::string("cudaFuncSetAttribute(persistent search LUT tile): ") +
+        cudaGetErrorString(status));
+    }
+    return true;
+  }();
+  (void)configured;
+  return kernel;
 }
 
 template <u32 Threads, bool EnableAsfe>
@@ -28,6 +45,15 @@ const void* select_persistent_search_kernel(u32 pq_subquantizers) {
     case kPersistentPq32Subquantizers:
       return persistent_search_kernel_address<
         Threads, EnableAsfe, kPersistentPq32Subquantizers>();
+    case kPersistentPq64Subquantizers:
+      return persistent_search_kernel_address<
+        Threads, EnableAsfe, kPersistentPq64Subquantizers>();
+    case kPersistentPq128Subquantizers:
+      return persistent_search_kernel_address<
+        Threads, EnableAsfe, kPersistentPq128Subquantizers>();
+    case kPersistentPq256Subquantizers:
+      return persistent_search_kernel_address<
+        Threads, EnableAsfe, kPersistentPq256Subquantizers>();
     default:
       return persistent_search_kernel_address<
         Threads, EnableAsfe, kPersistentRuntimePqSubquantizers>();
@@ -38,28 +64,15 @@ template <u32 Threads, bool EnableAsfe>
 void launch_persistent_search_kernel(cudaStream_t stream,
                                      const PersistentKernelParams& params,
                                      u32 blocks) {
-  switch (persistent_pq_kernel_specialization(params.pq_subquantizers)) {
-    case kPersistentPq20Subquantizers:
-      persistent_search_kernel<Threads, EnableAsfe,
-                               kPersistentPq20Subquantizers>
-        <<<blocks, Threads, 0, stream>>>(params);
-      return;
-    case kPersistentPq25Subquantizers:
-      persistent_search_kernel<Threads, EnableAsfe,
-                               kPersistentPq25Subquantizers>
-        <<<blocks, Threads, 0, stream>>>(params);
-      return;
-    case kPersistentPq32Subquantizers:
-      persistent_search_kernel<Threads, EnableAsfe,
-                               kPersistentPq32Subquantizers>
-        <<<blocks, Threads, 0, stream>>>(params);
-      return;
-    default:
-      persistent_search_kernel<Threads, EnableAsfe,
-                               kPersistentRuntimePqSubquantizers>
-        <<<blocks, Threads, 0, stream>>>(params);
-      return;
-  }
+  // The static-code PQ scorer stages its LUT tiles in dynamic shared memory
+  // (score_static_candidates_lut_tiled); every specialization carries the
+  // same tile capacity.  Launching through the selected pointer reuses the
+  // one-time shared-memory attribute configuration above.
+  using KernelEntry = void (*)(PersistentKernelParams);
+  const auto kernel = reinterpret_cast<KernelEntry>(const_cast<void*>(
+    select_persistent_search_kernel<Threads, EnableAsfe>(
+      params.pq_subquantizers)));
+  kernel<<<blocks, Threads, kPersistentPqLutTileBytes, stream>>>(params);
 }
 
 }  // namespace
@@ -79,10 +92,16 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads,
         ? select_persistent_search_kernel<128, true>(pq_subquantizers)
         : select_persistent_search_kernel<128, false>(pq_subquantizers);
   } else {
+#if DVSTOR_PERSISTENT_WIDE_SORT
     kernel =
       enable_asfe
         ? select_persistent_search_kernel<256, true>(pq_subquantizers)
         : select_persistent_search_kernel<256, false>(pq_subquantizers);
+#else
+    // Slim builds compile out the 256-thread sort paths; report the
+    // configuration as non-viable so the grid planner always picks 128.
+    return PersistentKernelOccupancy{};
+#endif
   }
   cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
   if (status != cudaSuccess) {
@@ -92,7 +111,8 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads,
   }
   int active_blocks = 0;
   status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-    &active_blocks, kernel, static_cast<int>(threads), 0);
+    &active_blocks, kernel, static_cast<int>(threads),
+    kPersistentPqLutTileBytes);
   if (status != cudaSuccess) {
     throw std::runtime_error(
       std::string(
@@ -125,11 +145,17 @@ void launch_persistent_search(cudaStream_t stream,
       launch_persistent_search_kernel<128, false>(stream, params, blocks);
     }
   } else if (threads == 256) {
+#if DVSTOR_PERSISTENT_WIDE_SORT
     if (decoupled_search_progression) {
       launch_persistent_search_kernel<256, true>(stream, params, blocks);
     } else {
       launch_persistent_search_kernel<256, false>(stream, params, blocks);
     }
+#else
+    throw std::invalid_argument(
+      "persistent search kernel was built without 256-thread support "
+      "(DVSTOR_PERSISTENT_WIDE_SORT=OFF)");
+#endif
   } else {
     throw std::invalid_argument(
       "persistent search kernel supports only 128 or 256 threads");

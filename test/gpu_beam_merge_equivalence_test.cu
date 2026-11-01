@@ -166,6 +166,17 @@ void run_case(
   upload(d_candidate_distances, candidate_distances);
   for (const BeamMergePolicy policy :
        {BeamMergePolicy::legacy, BeamMergePolicy::stable_run}) {
+#if !DVSTOR_PERSISTENT_LEGACY_MERGE
+    if (policy == BeamMergePolicy::legacy) continue;
+#endif
+    // The register top-k reduction supports beam_capacity <= 128 (= the
+    // production kPersistentMaxBeam); wider stable-run beams exist only in
+    // the 256-thread wide build.
+    if (policy == BeamMergePolicy::stable_run &&
+        threads == kApproximateSortThreadsCompact &&
+        beam_capacity > gpu_search::kPersistentMaxBeam) {
+      continue;
+    }
     const std::string policy_name =
       policy == BeamMergePolicy::legacy ? "legacy" : "stable-run";
     const std::string label = case_name + "," + policy_name;
@@ -353,10 +364,16 @@ int main() {
     }
     check_cuda(cudaSetDevice(0), "cudaSetDevice");
     run_matrix(128, 128);
+#if DVSTOR_PERSISTENT_WIDE_SORT
     run_matrix(256, 128);
-    // Exercise both compact-final-256 and wide Beam=256 paths.
+#endif
+#if DVSTOR_PERSISTENT_LEGACY_MERGE
+    // Exercise the compact-final-256 Beam=256 legacy path.
     run_matrix(128, 256);
+#endif
+#if DVSTOR_PERSISTENT_WIDE_SORT
     run_matrix(256, 256);
+#endif
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

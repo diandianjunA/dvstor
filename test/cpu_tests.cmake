@@ -1,6 +1,11 @@
 dvstor_add_test(vector_dtype_test)
 dvstor_target_common_includes(vector_dtype_test)
 
+dvstor_add_test(early_prune_equivalence_test
+    ${DVSTOR_SOURCE_ROOT}/test/early_prune_equivalence.cc)
+dvstor_target_common_includes(early_prune_equivalence_test)
+set_tests_properties(early_prune_equivalence_test PROPERTIES TIMEOUT 60)
+
 dvstor_add_test(index_metadata_test
     ${DVSTOR_SOURCE_ROOT}/test/index_metadata_test.cc
     ${DVSTOR_SOURCE_ROOT}/src/service/index_metadata.cc
@@ -26,6 +31,7 @@ set_tests_properties(offline_local_id_set_test PROPERTIES TIMEOUT 10)
 
 dvstor_add_test(shard_publication_test
     ${DVSTOR_SOURCE_ROOT}/test/shard_publication_test.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/checkpoint.cc
     ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/dataset_io.cc
     ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/graph.cc
     ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/partitioning.cc
@@ -37,6 +43,7 @@ set_tests_properties(shard_publication_test PROPERTIES TIMEOUT 20)
 
 dvstor_add_test(vamana_offline_graph_test
     ${DVSTOR_SOURCE_ROOT}/test/vamana_offline_graph_test.cc
+    ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/checkpoint.cc
     ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/dataset_io.cc
     ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/graph.cc
     ${DVSTOR_SOURCE_ROOT}/tools/vamana_offline/progress.cc)

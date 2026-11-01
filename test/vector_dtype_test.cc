@@ -233,6 +233,37 @@ void test_integral_alpha_threshold_exits_early_and_fallbacks_are_unchanged() {
   assert(evaluated == dim);
 }
 
+void test_early_prune_strict_boundary_matches_scalar() {
+  for (const VectorDType dtype :
+       {VectorDType::float32, VectorDType::int8, VectorDType::uint8}) {
+    const u32 dim = 4;
+    const size_t bytes = dim * vector_dtype_component_size(dtype);
+    vec<byte_t> lhs(bytes, 0);
+    vec<byte_t> rhs(bytes, 0);
+    for (u32 i = 0; i < dim; ++i) {
+      if (dtype == VectorDType::float32) {
+        const float value = 1.0F;
+        std::memcpy(rhs.data() + i * sizeof(float), &value, sizeof(value));
+      } else {
+        rhs[i] = 1;
+      }
+    }
+    const float exact = typed_l2_distance(lhs.data(), dtype, rhs.data(), dtype, dim);
+    assert(exact == 4.0F);
+    for (const float source : {0.0F, 3.999F, 4.0F, 4.001F}) {
+      const bool expected = 1.0 * static_cast<f64>(exact) <
+                            static_cast<f64>(source);
+      const auto decision = typed_l2_prune_predicate_early(
+          lhs.data(), dtype, rhs.data(), dtype, dim, 1.0, source);
+      assert(decision != L2PruneEarlyDecision::pruned || expected);
+      assert(decision != L2PruneEarlyDecision::not_pruned || !expected);
+      if (decision == L2PruneEarlyDecision::undecided) {
+        assert((1.0F * exact < source) == expected);
+      }
+    }
+  }
+}
+
 }  // namespace
 
 void test_unaligned_float_component_load() {
@@ -305,5 +336,6 @@ int main() {
   test_float_simd_matches_canonical_distance_for_arbitrary_dimensions();
   test_integral_alpha_threshold_matches_complete_distance();
   test_integral_alpha_threshold_exits_early_and_fallbacks_are_unchanged();
+  test_early_prune_strict_boundary_matches_scalar();
   return 0;
 }

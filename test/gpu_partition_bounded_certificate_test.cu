@@ -34,7 +34,6 @@ constexpr u32 kCycleMeasuredIterations = 256;
 
 union CycleAlgorithmWorkspace {
   CandidateWorkspace stable_run;
-  ApproximateWarpLeafSortStorage leaf_sorts;
 };
 
 struct CaseSpec {
@@ -215,7 +214,6 @@ __global__ void partition_bounded_certificate_equivalence_kernel(
     case_beam_handles, case_beam_distances, case_beam_expanded,
     beam_count, spec.beam_capacity,
     case_scratch_handles, case_scratch_flags, case_scratch_distances,
-    algorithm_workspace.leaf_sorts,
     workspace.arrays, spec.issue_capacity,
     warp_merge_handles, warp_merge_ranks, warp_merge_count,
     state, &phases);
@@ -489,7 +487,6 @@ __global__ void partition_bounded_certificate_cycle_kernel(
       beam_handles, beam_distances, beam_expanded,
       beam_count, kBeamCapacity,
       scratch_handles, scratch_flags, scratch_distances,
-      algorithm_workspace.leaf_sorts,
       workspace.arrays, issue_capacity,
       warp_merge_handles, warp_merge_ranks, warp_merge_count,
       state);
@@ -907,16 +904,9 @@ int main(int argc, char** argv) {
       cudaGetDeviceProperties(&properties, 0),
       "cudaGetDeviceProperties");
     constexpr size_t stable_workspace_bytes = sizeof(CandidateWorkspace);
-    constexpr size_t pfec_sort_storage_bytes =
-      sizeof(ApproximateWarpLeafSortStorage);
-    constexpr size_t overlay_workspace_bytes =
-      std::max(stable_workspace_bytes, pfec_sort_storage_bytes);
     std::cout
       << "pfec_workspace stable_bytes=" << stable_workspace_bytes
-      << " sort_storage_bytes=" << pfec_sort_storage_bytes
-      << " overlay_bytes=" << overlay_workspace_bytes
-      << " delta_bytes="
-      << overlay_workspace_bytes - stable_workspace_bytes
+      << " sort_storage_bytes=0 (register bitonic leaf sort)"
       << '\n';
     if (!cycle_only) run_equivalence_cases();
     run_cycle_microbenchmark(

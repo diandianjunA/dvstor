@@ -1,5 +1,6 @@
 #include "tools/vamana_offline/recall_check.hh"
 
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -155,22 +156,23 @@ GroundTruth read_groundtruth(const filepath_t& path, u32 expected_queries,
   return groundtruth;
 }
 
-size_t count_hits(VamanaGraph& graph,
-                  const Dataset& dataset,
-                  const QuerySet& queries,
-                  const GroundTruth& groundtruth,
-                  u32 eval_k,
-                  u32 search_beam) {
-  size_t total_hits = 0;
+std::array<size_t, 3> count_hits(VamanaGraph& graph,
+                                 const Dataset& dataset,
+                                 const QuerySet& queries,
+                                 const GroundTruth& groundtruth,
+                                 u32 search_beam) {
+  constexpr std::array<u32, 3> eval_ks{1, 5, 10};
+  std::array<size_t, 3> total_hits{0, 0, 0};
   for (u32 qi = 0; qi < queries.count; ++qi) {
     const float* qvec = queries.vectors.data() + static_cast<size_t>(qi) * queries.dim;
     const auto results = beam_search_float_query(graph, dataset, qvec, search_beam);
     const u32* gt_row = groundtruth.ids.data() + static_cast<size_t>(qi) * groundtruth.topk;
-    const std::unordered_set<u32> gt_set(gt_row, gt_row + eval_k);
-
-    for (size_t i = 0; i < eval_k && i < results.size(); ++i) {
-      if (gt_set.count(results[i].second)) {
-        ++total_hits;
+    for (size_t k_index = 0; k_index < eval_ks.size(); ++k_index) {
+      const u32 eval_k = eval_ks[k_index];
+      if (eval_k > groundtruth.topk) continue;
+      const std::unordered_set<u32> gt_set(gt_row, gt_row + eval_k);
+      for (size_t i = 0; i < eval_k && i < results.size(); ++i) {
+        if (gt_set.count(results[i].second)) ++total_hits[k_index];
       }
     }
   }
@@ -209,18 +211,28 @@ void run_optional_recall_check(VamanaGraph& graph,
     config.groundtruth_path, queries.count, dataset.size());
   std::cerr << "ground truth: " << groundtruth.query_count << " queries x top-" << groundtruth.topk << "\n";
 
-  for (u32 eval_k : {1u, 5u, 10u}) {
-    if (eval_k > groundtruth.topk) {
-      continue;
-    }
-
-    const size_t total_hits =
-        count_hits(graph, dataset, queries, groundtruth, eval_k, config.beam_width);
-    const double recall = static_cast<double>(total_hits) / (static_cast<double>(queries.count) * eval_k);
+  if (config.min_recall_at_10 > 0.0 && groundtruth.topk < 10) {
+    lib_failure("--min-recall-at-10 requires ground truth with at least top-10");
+  }
+  constexpr std::array<u32, 3> eval_ks{1, 5, 10};
+  const auto total_hits = count_hits(
+      graph, dataset, queries, groundtruth, config.beam_width);
+  double recall_at_10 = 0.0;
+  for (size_t k_index = 0; k_index < eval_ks.size(); ++k_index) {
+    const u32 eval_k = eval_ks[k_index];
+    if (eval_k > groundtruth.topk) continue;
+    const double recall = static_cast<double>(total_hits[k_index]) /
+        (static_cast<double>(queries.count) * eval_k);
+    if (eval_k == 10) recall_at_10 = recall;
     std::cerr << "recall@" << eval_k << " = " << std::fixed << std::setprecision(4) << recall
-              << " (" << total_hits << "/" << (queries.count * eval_k) << ")\n";
+              << " (" << total_hits[k_index] << "/" << (queries.count * eval_k) << ")\n";
   }
   std::cerr << "=== End Recall Test ===\n\n";
+  if (recall_at_10 < config.min_recall_at_10) {
+    lib_failure("post-build recall@10 " + std::to_string(recall_at_10) +
+                " is below required " + std::to_string(config.min_recall_at_10) +
+                "; refusing shard export");
+  }
 }
 
 }  // namespace tools::vamana_offline

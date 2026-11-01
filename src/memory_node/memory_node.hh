@@ -1163,6 +1163,7 @@ private:
 private:
   Context context_;
   ServerConnectionManager cm_;
+  std::thread reconnection_thread_;
   Assignment core_assignment_;
 
   const u32 num_clients_;

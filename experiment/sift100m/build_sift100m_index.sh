@@ -84,6 +84,7 @@ pq=("$BUILD_DIR/vamana_pq_indexer"
   --pq-iterations "$PQ_ITERATIONS" --chunk-vectors "$PQ_ENCODE_CHUNK_VECTORS"
   --threads "$PQ_THREADS" --seed "${SEED:-1234}" --overwrite)
 [[ -z "${PQ_REUSE_MODEL:-}" ]] || pq+=(--reuse-model "$PQ_REUSE_MODEL")
+[[ "${PQ_NO_OPQ:-0}" != "1" ]] || pq+=(--no-opq)
 extent=("$BUILD_DIR/vamana_graph_extent_indexer"
   --index-prefix "$INDEX_PREFIX" --overwrite)
 

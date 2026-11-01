@@ -59,7 +59,9 @@ struct PersistentLayout {
 
 Layout parse_layout(const nlohmann::json& metadata) {
   const u32 schema_version = metadata.value("schema_version", 0u);
-  if (schema_version != 15 ||
+  // Schema 16 is schema 15 plus finalized navigation fields; re-encoding an
+  // already-finalized index (e.g. a second PQ width) is supported.
+  if ((schema_version != 15 && schema_version != 16) ||
       metadata.value("node_layout", str{}) != "plain" ||
       metadata.value("storage_format", str{}) != "vamana_tagged_v2" ||
       metadata.value("remote_ptr_format", str{}) !=
@@ -69,7 +71,7 @@ Layout parse_layout(const nlohmann::json& metadata) {
       metadata.value("index_build_fingerprint", 0ull) == 0 ||
       metadata.value("distance", str{"l2"}) != "l2") {
     throw std::runtime_error(
-      "PQ indexer requires a schema-15 tagged L2 index");
+      "PQ indexer requires a schema-15/16 tagged L2 index");
   }
   Layout layout;
   layout.dim = metadata.at("dim").get<u32>();
@@ -137,8 +139,9 @@ void validate_shard_fingerprint(std::ifstream& input,
   }
 }
 
-void preflight_shard_files(const filepath_t& prefix, const Layout& layout) {
-  for (u32 shard = 0; shard < layout.shards; ++shard) {
+void preflight_shard_files(const filepath_t& prefix, const Layout& layout,
+                           const vec<u32>& encode_shards) {
+  for (u32 shard : encode_shards) {
     const filepath_t path = index_path::shard_file(
       prefix, shard + 1, layout.shards);
     std::error_code size_error;
@@ -465,33 +468,96 @@ vec<f32> sample_training_vectors(const filepath_t& prefix, const Layout& layout,
   return samples;
 }
 
+// Samples from a raw bin file ([u32 rows][u32 dim][row-major data]) with the
+// same deterministic stride pattern as the shard-based sampler, so both
+// paths draw comparable samples of the first layout.node_count rows.
+vec<f32> sample_training_vectors_from_data(const filepath_t& data_path,
+                                           const Layout& layout,
+                                           u32 requested, u64 seed) {
+  std::ifstream input(data_path, std::ios::binary);
+  if (!input.good()) {
+    throw std::runtime_error("missing training data file: " + data_path.string());
+  }
+  u32 rows = 0, dim = 0;
+  input.read(reinterpret_cast<char*>(&rows), sizeof(rows));
+  input.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+  if (!input.good() || dim != layout.dim ||
+      static_cast<u64>(rows) < layout.node_count) {
+    throw std::runtime_error(
+      "training data file header does not cover the index layout: " +
+      data_path.string());
+  }
+  const u64 sample_count = std::min<u64>(requested, layout.node_count);
+  vec<f32> samples(static_cast<size_t>(sample_count) * layout.dim);
+  vec<byte_t> raw(layout.vector_bytes);
+  const u64 phase = mix64(seed) % layout.node_count;
+  for (u64 sample = 0; sample < sample_count; ++sample) {
+    const u64 ordinal = (phase + sample * layout.node_count / sample_count) %
+      layout.node_count;
+    input.seekg(static_cast<std::streamoff>(
+      2 * sizeof(u32) + ordinal * layout.vector_bytes));
+    input.read(reinterpret_cast<char*>(raw.data()), raw.size());
+    if (static_cast<size_t>(input.gcount()) != raw.size()) {
+      throw std::runtime_error("short read while sampling training data file");
+    }
+    decode_storage_vector_to_float(
+      raw.data(), layout.dtype, layout.dim,
+      samples.data() + static_cast<size_t>(sample) * layout.dim);
+  }
+  return samples;
+}
+
+vec<u32> effective_encode_shards(const Layout& layout,
+                                 const vec<u32>& only_shards) {
+  if (only_shards.empty()) {
+    vec<u32> all(layout.shards);
+    for (u32 shard = 0; shard < layout.shards; ++shard) all[shard] = shard;
+    return all;
+  }
+  vec<u32> sorted = only_shards;
+  std::sort(sorted.begin(), sorted.end());
+  if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end() ||
+      sorted.back() >= layout.shards) {
+    throw std::invalid_argument(
+      "--only-shards must list distinct shard ordinals within the layout");
+  }
+  return sorted;
+}
+
 gpu_search::pq::Model train_model(const vec<f32>& samples, const Layout& layout,
                                   const PqIndexOptions& options) {
   if (layout.dim % options.subquantizers != 0) {
     throw std::runtime_error("dimension must be divisible by the PQ subquantizer count");
   }
   const size_t count = samples.size() / layout.dim;
-  faiss::OPQMatrix opq(layout.dim, options.subquantizers);
-  opq.niter = static_cast<int>(options.opq_iterations);
-  opq.niter_pq = std::max<int>(1, static_cast<int>(options.pq_iterations / 4));
-  opq.niter_pq_0 = static_cast<int>(options.pq_iterations);
-  opq.max_train_points = count;
-  opq.verbose = true;
-  opq.train(static_cast<faiss::idx_t>(count), samples.data());
+  vec<f32> transformed;
+  vec<f32> rotation;
+  const f32* train_data = samples.data();
+  if (!options.no_opq) {
+    faiss::OPQMatrix opq(layout.dim, options.subquantizers);
+    opq.niter = static_cast<int>(options.opq_iterations);
+    opq.niter_pq = std::max<int>(1, static_cast<int>(options.pq_iterations / 4));
+    opq.niter_pq_0 = static_cast<int>(options.pq_iterations);
+    opq.max_train_points = count;
+    opq.verbose = true;
+    opq.train(static_cast<faiss::idx_t>(count), samples.data());
 
-  vec<f32> transformed(samples.size());
-  opq.apply_noalloc(static_cast<faiss::idx_t>(count), samples.data(),
-                    transformed.data());
+    transformed.resize(samples.size());
+    opq.apply_noalloc(static_cast<faiss::idx_t>(count), samples.data(),
+                      transformed.data());
+    train_data = transformed.data();
+    rotation = opq.A;
+  }
   faiss::ProductQuantizer product(layout.dim, options.subquantizers, 8);
   product.cp.niter = static_cast<int>(options.pq_iterations);
   product.cp.seed = static_cast<int>(options.seed);
   product.verbose = true;
-  product.train(count, transformed.data());
+  product.train(count, train_data);
 
   gpu_search::pq::Model model;
   model.dim = layout.dim;
   model.subquantizers = options.subquantizers;
-  model.rotation = opq.A;
+  model.rotation = std::move(rotation);
   model.centroids = product.centroids;
   std::string error;
   if (!gpu_search::pq::validate(model, &error)) throw std::runtime_error(error);
@@ -728,7 +794,23 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   }
   const PersistentLayout persistent = make_persistent_layout(
     metadata, layout, options.subquantizers);
-  preflight_shard_files(options.index_prefix, layout);
+  vec<u32> encode_shards =
+    effective_encode_shards(layout, options.only_shards);
+  if (options.skip_encode) {
+    encode_shards.clear();
+    if (options.reuse_model.empty() && options.train_data_path.empty()) {
+      throw std::invalid_argument(
+        "--skip-encode requires --train-data-path (or --reuse-model), "
+        "because the shard files are not needed on this machine");
+    }
+  }
+  if (!options.only_shards.empty() && options.reuse_model.empty() &&
+      options.train_data_path.empty()) {
+    throw std::invalid_argument(
+      "--only-shards training requires --train-data-path (or --reuse-model), "
+      "because the other shards are not available locally");
+  }
+  preflight_shard_files(options.index_prefix, layout, encode_shards);
   const u32 training_threads = options.threads == 0
     ? hardware_threads : std::min(options.threads, hardware_threads);
   if (training_threads == 0) {
@@ -751,8 +833,10 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   }
   if (!options.overwrite) {
     if (std::filesystem::exists(result.model_file) ||
-        std::any_of(result.code_files.begin(), result.code_files.end(),
-                    [](const filepath_t& path) { return std::filesystem::exists(path); })) {
+        std::any_of(encode_shards.begin(), encode_shards.end(),
+                    [&](u32 shard) {
+                      return std::filesystem::exists(result.code_files[shard]);
+                    })) {
       throw std::runtime_error("PQ index output already exists; pass --overwrite to replace it");
     }
   }
@@ -762,7 +846,7 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
     temporary_output_path(result.model_file);
   vec<filepath_t> temporary_code_files(layout.shards);
   temporary_outputs.prepare(temporary_model_file);
-  for (u32 shard = 0; shard < layout.shards; ++shard) {
+  for (u32 shard : encode_shards) {
     temporary_code_files[shard] =
       temporary_output_path(result.code_files[shard]);
     temporary_outputs.prepare(temporary_code_files[shard]);
@@ -778,8 +862,13 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
       throw std::runtime_error("reused PQ model does not match the index layout");
     }
   } else {
-    const vec<f32> samples = sample_training_vectors(
-      options.index_prefix, layout, options.train_samples, options.seed);
+    const vec<f32> samples =
+      options.train_data_path.empty()
+        ? sample_training_vectors(
+            options.index_prefix, layout, options.train_samples, options.seed)
+        : sample_training_vectors_from_data(
+            options.train_data_path, layout, options.train_samples,
+            options.seed);
     model = train_model(samples, layout, options);
   }
   if (model.code_bytes() != options.subquantizers ||
@@ -795,23 +884,33 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   validate_temporary_model(temporary_model_file, model);
   sync_file(temporary_model_file);
 
+  if (options.skip_encode) {
+    publish_temporary_output(temporary_model_file, result.model_file);
+    sync_directory(metadata_path.parent_path());
+    temporary_outputs.release();
+    std::cerr << "PQ model ready (encode skipped): nodes=" << result.node_count
+              << " model_checksum=" << result.model_checksum << '\n';
+    return result;
+  }
+
   const u32 encode_workers = static_cast<u32>(std::min<u64>(
-    layout.shards, training_threads));
+    encode_shards.size(), training_threads));
   const u32 encode_inner_threads =
     std::max(1u, training_threads / encode_workers);
-  parallel_for(static_cast<size_t>(0), layout.shards, encode_workers,
-               [&](size_t shard, size_t) {
+  parallel_for(static_cast<size_t>(0), encode_shards.size(), encode_workers,
+               [&](size_t slot, size_t) {
+    const u32 shard = encode_shards[slot];
     encode_shard(options.index_prefix, layout, model, options,
-                 static_cast<u32>(shard),
+                 shard,
                  temporary_code_files[shard],
                  persistent.code_offsets[shard],
                  encode_inner_threads);
     validate_temporary_sidecar(
       temporary_code_files[shard], layout, model,
-      static_cast<u32>(shard), persistent);
+      shard, persistent);
     sync_file(temporary_code_files[shard]);
   });
-  for (u32 shard = 0; shard < layout.shards; ++shard) {
+  for (u32 shard : encode_shards) {
     if (persistent.code_region_bytes[shard] >
         std::numeric_limits<u64>::max() - result.code_bytes) {
       throw std::runtime_error("total PQ code byte count overflows");
@@ -820,7 +919,7 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   }
 
   publish_temporary_output(temporary_model_file, result.model_file);
-  for (u32 shard = 0; shard < layout.shards; ++shard) {
+  for (u32 shard : encode_shards) {
     publish_temporary_output(
       temporary_code_files[shard], result.code_files[shard]);
   }

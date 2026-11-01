@@ -713,10 +713,10 @@ private:
         gpu_graph_issue_width >
           gpu_search::adaptive_frontier::kFrontierCapacity ||
         gpu_traversal_beam_width < k || gpu_traversal_beam_width > 256 ||
-        gpu_final_rerank_width < k || gpu_final_rerank_width > 256 ||
+        gpu_final_rerank_width < k || gpu_final_rerank_width > 512 ||
         gpu_max_expansions < gpu_traversal_beam_width ||
         gpu_max_expansions > 4096 ||
-        gpu_rdma_qps == 0 || gpu_rdma_qps > 32 ||
+        gpu_rdma_qps == 0 || gpu_rdma_qps > 128 ||
         gpu_direct_timeout_ms < 20 || gpu_direct_timeout_ms > 5'000 ||
         gpu_persistent_blocks_per_sm == 0 ||
         gpu_persistent_blocks_per_sm > 16 ||
