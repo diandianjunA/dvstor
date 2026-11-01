@@ -330,7 +330,7 @@ query_suffix() {
 }
 
 base_bin() { echo "${BASE_BIN:-$DATASET_DIR/base.1B.u8bin}"; }
-query_bin() { echo "$CONVERTED_DIR/query.1K.u8bin"; }
+query_bin() { echo "${RECALL_QUERY_FILE_OVERRIDE:-$CONVERTED_DIR/query.1K.u8bin}"; }
 groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
 insert_bin() { echo "$INSERT_FILE"; }
 performance_query_bin() { echo "$PERFORMANCE_QUERY_FILE"; }

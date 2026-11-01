@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -36,7 +37,9 @@ MemoryNode::MemoryNode(Configuration& config)
   for (auto& credit : peer_rdma_read_outstanding_) {
     credit.store(0, std::memory_order_relaxed);
   }
-  cm_.connect_to_clients();
+  bool index_initialized = false;
+  do {
+    cm_.connect_to_clients();
 
   // Keep the lifecycle thread unpinned. Storage workers are created later and
   // must not inherit a one-CPU affinity mask.
@@ -50,6 +53,7 @@ MemoryNode::MemoryNode(Configuration& config)
 
   num_compute_threads_ = p.num_threads;
   const u32 gpu_rdma_qps = p.gpu_rdma_qps;
+  if (!index_initialized) {
   const filepath_t index_prefix = config.resolved_index_prefix();
   index_prefix_ = index_prefix;
   VectorDType startup_dtype = config.resolved_vector_dtype();
@@ -196,6 +200,8 @@ MemoryNode::MemoryNode(Configuration& config)
 
   print_status("register memory and distribute access token");
   index_region_.register_memory(index_buffer_.get_full_buffer(), index_buffer_.buffer_size, true);
+  index_initialized = true;
+  }
   MemoryRegionToken token = index_region_.createToken();
 
   // send access token to all compute nodes
@@ -236,6 +242,12 @@ MemoryNode::MemoryNode(Configuration& config)
   if (!config.disable_thread_pinning) {
     pin_main_thread(core_assignment_.get_available_core());
   }
+  const char* reuse_connections = std::getenv("DVSTOR_MN_REUSE_CONNECTIONS");
+  if (reuse_connections != nullptr && reuse_connections[0] == '1') {
+    reconnection_thread_ = std::thread([this] {
+      cm_.accept_reconnection(storage_insert_shutdown_);
+    });
+  }
   service_storage_runtime(config);
 
   storage_insert_shutdown_.store(true, std::memory_order_release);
@@ -256,6 +268,15 @@ MemoryNode::MemoryNode(Configuration& config)
   }
   stop_storage_owner_maintenance_runtime();
   stop_peer_reverse_update_runtime();
+
+  if (reuse_connections == nullptr || reuse_connections[0] != '1') break;
+  cm_.get_context().close_server_socket();
+  if (reconnection_thread_.joinable()) reconnection_thread_.join();
+  print_status("memory node session complete; accepting next client group");
+  cm_.reset_for_reconnect();
+  reset_storage_session_runtime();
+  storage_insert_shutdown_.store(false, std::memory_order_release);
+  } while (true);
 
   print_status("memory node shutting down");
   std::cout << timing_ << std::endl;

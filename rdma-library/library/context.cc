@@ -74,19 +74,6 @@ Context::Context(Configuration& config,
              "Invalid RDMA queue, polling, port, or client-count limits");
   i32 num_devices = 0;
   IBDeviceList device_list = ibv_get_device_list(&num_devices);
-  if (num_devices <= 0 || device_list == nullptr) {
-    const int saved_errno = errno;
-    std::cerr << "[diag] ibv_get_device_list num=" << num_devices
-              << " errno=" << saved_errno << " (" << std::strerror(saved_errno)
-              << ")" << std::endl;
-    for (i32 attempt = 0; attempt < 5 && num_devices <= 0; ++attempt) {
-      usleep(200000);
-      errno = 0;
-      device_list = ibv_get_device_list(&num_devices);
-      std::cerr << "[diag] retry " << attempt << " num=" << num_devices
-                << " errno=" << errno << std::endl;
-    }
-  }
   try {
     lib_assert(num_devices > 0, "No InfiniBand devices found");
     lib_assert(device_list != nullptr, "Device list is null");
@@ -223,9 +210,24 @@ void Context::bind_to_port(u32 tcp_port) {
 
 void Context::close_server_socket() {
   if (server_socket_ >= 0) {
+    shutdown(server_socket_, SHUT_RDWR);
     close(server_socket_);
     server_socket_ = -1;
   }
+}
+
+void Context::drain_completion_queues() {
+  vec<ibv_wc> completions(static_cast<size_t>(config_.max_poll_cqes));
+  const auto drain = [&](ibv_cq* cq) {
+    for (;;) {
+      const i32 count = ibv_poll_cq(
+        cq, static_cast<i32>(completions.size()), completions.data());
+      lib_assert(count >= 0, "Cannot drain completion queue");
+      if (count == 0) return;
+    }
+  };
+  drain(receive_cq_);
+  drain(send_cq_);
 }
 
 std::pair<QP, u32> Context::wait_for_connection() {

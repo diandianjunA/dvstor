@@ -578,6 +578,7 @@ private:
   void setup_peer_rpc_runtime(const Configuration& config);
   void start_peer_reverse_update_runtime(const Configuration& config);
   void stop_peer_reverse_update_runtime();
+  void reset_storage_session_runtime();
   size_t peer_rpc_sync_send_offset(u32 peer_id) const;
   size_t peer_rpc_async_send_offset(u32 peer_id, u32 slot_id) const;
   size_t peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const;
@@ -1163,6 +1164,7 @@ private:
 private:
   Context context_;
   ServerConnectionManager cm_;
+  std::thread reconnection_thread_;
   Assignment core_assignment_;
 
   const u32 num_clients_;

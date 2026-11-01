@@ -14,8 +14,8 @@ mapfile -t profile_files < <(
   find "$PROFILE_DIR" -maxdepth 1 -name '*.env' -printf '%f\n' | sort
 )
 expected_profiles=(
-  04_gpu_persistent_gpunetio.env
   04_gpu_persistent_gpunetio_baseline.env
+  04_gpu_persistent_gpunetio.env
 )
 [[ "${profile_files[*]}" == "${expected_profiles[*]}" ]]
 

@@ -58,6 +58,7 @@ public:
 
   void bind_to_port(u32 tcp_port);
   void close_server_socket();
+  void drain_completion_queues();
   std::pair<u_ptr<QueuePair>, u32> wait_for_connection();
   u_ptr<QueuePair> connect_to_server(const str& address,
                                      u32 tcp_port,

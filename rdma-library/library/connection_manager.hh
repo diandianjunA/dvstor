@@ -2,6 +2,8 @@
 #ifndef RDMA_LIBRARY_CONNECTION_MANAGER_HH
 #define RDMA_LIBRARY_CONNECTION_MANAGER_HH
 
+#include <atomic>
+
 #include "configuration.hh"
 #include "context.hh"
 #include "memory_region.hh"
@@ -26,11 +28,14 @@ class ServerConnectionManager : public ConnectionManager {
 public:
   ServerConnectionManager(Context& context, const Configuration& config);
   void connect_to_clients();
+  void accept_reconnection(std::atomic<bool>& shutdown);
+  void reset_for_reconnect();
   void synchronize() const;
 
 public:
   QPs client_qps;
-  QP& initiator_qp;
+  QueuePair* initiator_qp;
+  QPs pending_reconnected_qps;
 };
 
 class ClientConnectionManager : public ConnectionManager {

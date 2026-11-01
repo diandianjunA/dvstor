@@ -21,7 +21,7 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
     }
   }
 
-  for (;;) {
+  while (!storage_insert_shutdown_.load(std::memory_order_acquire)) {
     bool progressed = false;
     const i32 num_sent = context_.poll_send_cq(
       send_wcs.data(), static_cast<i32>(send_wcs.size()));

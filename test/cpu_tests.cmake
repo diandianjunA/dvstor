@@ -13,6 +13,13 @@ dvstor_target_common_includes(rdma_contract_test)
 target_link_libraries(rdma_contract_test PRIVATE rdma_library)
 set_tests_properties(rdma_contract_test PROPERTIES TIMEOUT 10)
 
+dvstor_add_test(server_connection_reconnect_test)
+dvstor_target_common_includes(server_connection_reconnect_test)
+target_link_libraries(server_connection_reconnect_test PRIVATE rdma_library)
+set_tests_properties(server_connection_reconnect_test PROPERTIES
+    TIMEOUT 30
+    SKIP_REGULAR_EXPRESSION "^SKIP:")
+
 dvstor_add_test(configuration_update_protocol_test)
 dvstor_target_common_includes(configuration_update_protocol_test)
 target_link_libraries(configuration_update_protocol_test PRIVATE rdma_library)
