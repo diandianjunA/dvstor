@@ -26,6 +26,7 @@
 #include "service/breakdown.hh"
 #include "service/index_metadata.hh"
 #include "tools/breakdown_benchmark/dataset.hh"
+#include "tools/breakdown_benchmark/dynamic_id_pool.hh"
 #include "tools/breakdown_benchmark/maintenance_log.hh"
 #include "tools/breakdown_benchmark/progress.hh"
 #include "tools/breakdown_benchmark/report.hh"
@@ -137,6 +138,13 @@ void preflight_workload_inputs(
       : args.insert_start_id;
     const u32 checked_start =
       checked_insert_id(start, config.vector_id_namespace_size);
+    if (args.mixed_delete_mode == "inserted" && checked_start < config.max_vectors) {
+      throw std::runtime_error("steady-state inserts must not reuse base IDs");
+    }
+    if (args.seed_insert_count != 0) {
+      (void)checked_advance_insert_id(
+        checked_start, args.seed_insert_count, config.vector_id_namespace_size);
+    }
     if (args.warmup_seconds == 0 && args.measure_seconds == 0) {
       const u64 fixed_ops = checked_query_row_sum(
         static_cast<u64>(args.warmup_ops),
@@ -260,6 +268,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   using service::breakdown::report_to_json;
 
   const bool use_insert_file = !args.insert_file.empty();
+  const bool delete_inserted_ids = args.mixed_delete_mode == "inserted";
+  DynamicIdPool dynamic_ids(args.dynamic_state_file);
+  size_t loaded_dynamic_id_count = 0;
+  size_t seed_completed_inserts = 0;
   const bool shared_rate_limited = args.mixed_mode == "rate_limited";
   const bool write_rate_limited =
     args.mixed_mode == "write_rate_limited";
@@ -340,6 +352,12 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"write_insert_ratio", args.write_insert_ratio},
     {"write_upsert_ratio", args.write_upsert_ratio},
     {"write_delete_ratio", args.write_delete_ratio},
+    {"mixed_delete_mode", args.mixed_delete_mode},
+    {"dynamic_state_file", args.dynamic_state_file},
+    {"requested_seed_insert_count", args.seed_insert_count},
+    {"maintenance_timeout_ms", args.maintenance_timeout_ms == 0
+      ? service.config().storage_owner_rpc_timeout_ms : args.maintenance_timeout_ms},
+    {"maintenance_drain_skipped", args.skip_maintenance_drain},
     {"recall_mode", args.recall_mode},
     {"recall_base_id_limit", args.recall_base_id_limit},
     {"insert_start_id", args.insert_start_id},
@@ -406,6 +424,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   };
   size_t fixed_read_threads = 0;
   size_t fixed_write_threads = 0;
+  size_t fixed_insert_threads = 0;
   if (args.workload == "mixed" &&
       (args.mixed_mode == "fixed_threads" || write_rate_limited)) {
     if (write_rate_limited) {
@@ -430,6 +449,18 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       {"read_threads", fixed_read_threads},
       {"write_threads", fixed_write_threads},
     };
+    if (delete_inserted_ids) {
+      fixed_insert_threads = static_cast<size_t>(std::llround(
+        static_cast<double>(fixed_write_threads) * normalized_insert_ratio));
+      fixed_insert_threads = std::clamp<size_t>(
+        fixed_insert_threads, 1, fixed_write_threads - 1);
+      root["meta"]["mixed_fixed_threads"]["insert_threads"] = fixed_insert_threads;
+      root["meta"]["mixed_fixed_threads"]["delete_threads"] =
+        fixed_write_threads - fixed_insert_threads;
+      std::cerr << "[breakdown] steady-state write split: inserts="
+                << fixed_insert_threads << ", deletes="
+                << fixed_write_threads - fixed_insert_threads << std::endl;
+    }
     std::cerr << "[breakdown] mixed "
               << (write_rate_limited ? "write-rate-limited" : "fixed")
               << " thread split: reads=" << fixed_read_threads
@@ -912,6 +943,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   };
 
   auto issue_mixed_write = [&](std::mt19937_64& rng,
+                               WriteKind kind,
                                std::atomic<uint32_t>& next_insert_id,
                                std::atomic<uint32_t>& next_update_version,
                                std::atomic<size_t>& issued_inserts,
@@ -919,8 +951,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                                std::atomic<size_t>& issued_deletes,
                                std::atomic<size_t>& completed_inserts,
                                std::atomic<size_t>& completed_upserts,
-                               std::atomic<size_t>& completed_deletes) -> bool {
-    switch (choose_write_kind(rng)) {
+                               std::atomic<size_t>& completed_deletes,
+                               std::chrono::steady_clock::time_point deadline,
+                               bool& operation_issued) -> bool {
+    switch (kind) {
       case WriteKind::insert: {
         issued_inserts.fetch_add(1, std::memory_order_relaxed);
         const uint32_t id = claim_insert_id(
@@ -929,7 +963,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
         vec<ComputeService::InsertItem> items;
         items.push_back({id, std::move(values)});
         const bool succeeded = service.insert(items) == 1;
-        if (succeeded) completed_inserts.fetch_add(1, std::memory_order_relaxed);
+        if (succeeded) {
+          if (delete_inserted_ids) dynamic_ids.push(id);
+          completed_inserts.fetch_add(1, std::memory_order_relaxed);
+        }
         return succeeded;
       }
       case WriteKind::upsert: {
@@ -944,8 +981,28 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
         return succeeded;
       }
       case WriteKind::erase: {
+        uint32_t id = 0;
+        if (delete_inserted_ids) {
+          const auto claimed = dynamic_ids.pop(deadline);
+          if (!claimed.has_value()) {
+            issued_inserts.fetch_add(1, std::memory_order_relaxed);
+            const uint32_t insert_id = claim_insert_id(
+              next_insert_id, service.config().vector_id_namespace_size);
+            vec<element_t> values = get_insert_vector(insert_id);
+            vec<ComputeService::InsertItem> items;
+            items.push_back({insert_id, std::move(values)});
+            const bool succeeded = service.insert(items) == 1;
+            if (succeeded) {
+              dynamic_ids.push(insert_id);
+              completed_inserts.fetch_add(1, std::memory_order_relaxed);
+            }
+            return succeeded;
+          }
+          id = *claimed;
+        } else {
+          id = sample_existing_id(rng);
+        }
         issued_deletes.fetch_add(1, std::memory_order_relaxed);
-        const uint32_t id = sample_existing_id(rng);
         vec<node_t> ids;
         ids.push_back(id);
         const bool succeeded = service.erase(ids) == 1;
@@ -1004,10 +1061,12 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
               completed_reads.fetch_add(1, std::memory_order_relaxed);
             } else {
               issued_writes.fetch_add(1, std::memory_order_relaxed);
+              bool operation_issued = true;
               if (!issue_mixed_write(
-                    rng, next_insert_id, next_update_version,
+                    rng, choose_write_kind(rng), next_insert_id, next_update_version,
                     issued_inserts, issued_upserts, issued_deletes,
-                    completed_inserts, completed_upserts, completed_deletes)) {
+                    completed_inserts, completed_upserts, completed_deletes,
+                    std::chrono::steady_clock::time_point{}, operation_issued)) {
                 throw std::runtime_error(
                   "mixed mutation was rejected or timed out");
               }
@@ -1120,10 +1179,21 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
               completed_reads.fetch_add(1, std::memory_order_relaxed);
             } else {
               issued_writes.fetch_add(1, std::memory_order_relaxed);
+              WriteKind write_kind = choose_write_kind(rng);
+              if (delete_inserted_ids) {
+                write_kind = tid - fixed_read_threads < fixed_insert_threads
+                  ? WriteKind::insert : WriteKind::erase;
+              }
+              bool operation_issued = true;
               succeeded = issue_mixed_write(
-                rng, next_insert_id, next_update_version,
+                rng, write_kind, next_insert_id, next_update_version,
                 issued_inserts, issued_upserts, issued_deletes,
-                completed_inserts, completed_upserts, completed_deletes);
+                completed_inserts, completed_upserts, completed_deletes,
+                deadline, operation_issued);
+              if (!operation_issued) {
+                issued_writes.fetch_sub(1, std::memory_order_relaxed);
+                break;
+              }
               if (!succeeded) {
                 throw std::runtime_error(
                   "mixed mutation was rejected or timed out");
@@ -1208,12 +1278,18 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   vec<u64> maintenance_durable_sequences;
   const auto drain_storage_maintenance = [&](const char* phase) {
     if (!workload_has_writes) return 0.0;
+    if (args.skip_maintenance_drain) {
+      std::cerr << "[breakdown][" << phase
+                << "] maintenance drain skipped by request" << std::endl;
+      return 0.0;
+    }
     const auto started = std::chrono::steady_clock::now();
     vec<u64> targets;
     vec<u64> durable;
+    const size_t timeout_ms = args.maintenance_timeout_ms == 0
+      ? service.config().storage_owner_rpc_timeout_ms : args.maintenance_timeout_ms;
     const bool complete = service.wait_for_storage_maintenance(
-      std::chrono::milliseconds(
-        std::max<u32>(1000, service.config().storage_owner_rpc_timeout_ms)),
+      std::chrono::milliseconds(std::max<size_t>(1000, timeout_ms)),
       &targets, &durable);
     const double elapsed = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - started).count();
@@ -1222,6 +1298,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
               << "s complete=" << (complete ? "yes" : "no")
               << std::endl;
     if (!complete) {
+      if (delete_inserted_ids) {
+        throw std::runtime_error(
+          "steady-state workload requires fully durable Stage2 maintenance");
+      }
       // High-dimension inserts leave a Stage2 backlog that legitimately takes
       // longer than the measurement to integrate; report instead of aborting
       // so the completed client-op measurements remain usable.
@@ -1233,6 +1313,43 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     maintenance_durable_sequences = std::move(durable);
     return elapsed;
   };
+  double seed_maintenance_drain_seconds = 0.0;
+  if (delete_inserted_ids) {
+    if (next_insert_id < service.config().max_vectors) {
+      throw std::runtime_error("steady-state inserts must start above the base ID range");
+    }
+    const bool state_exists = dynamic_ids.state_file_exists();
+    if (state_exists) {
+      if (args.seed_insert_count != 0) {
+        throw std::runtime_error(
+          "refusing to seed dynamic IDs over an existing state file");
+      }
+      dynamic_ids.load(
+        service.config().vector_id_namespace_size, service.config().max_vectors);
+      loaded_dynamic_id_count = dynamic_ids.size();
+    }
+    if (args.seed_insert_count != 0) {
+      std::cerr << "[breakdown] seeding " << args.seed_insert_count
+                << " committed dynamic IDs" << std::endl;
+      seed_completed_inserts = run_insert_phase_ops(
+        "seed-insert", args.seed_insert_count, next_insert_id);
+      if (seed_completed_inserts != args.seed_insert_count) {
+        throw std::runtime_error("dynamic ID seeding was incomplete");
+      }
+      for (size_t row = 0; row < seed_completed_inserts; ++row) {
+        dynamic_ids.push(checked_insert_id(
+          static_cast<u64>(next_insert_id) + row,
+          service.config().vector_id_namespace_size));
+      }
+      next_insert_id = checked_advance_insert_id(
+        next_insert_id, seed_completed_inserts,
+        service.config().vector_id_namespace_size);
+      seed_maintenance_drain_seconds = drain_storage_maintenance("seed");
+    }
+    std::cerr << "[breakdown] dynamic ID state ready: loaded="
+              << loaded_dynamic_id_count << ", seeded=" << seed_completed_inserts
+              << ", live=" << dynamic_ids.size() << std::endl;
+  }
   std::vector<MaintenanceLogCursor> maintenance_log_cursors;
   std::vector<std::optional<gpu_search::maintenance_telemetry::Snapshot>>
     maintenance_snapshot_begin;
@@ -1386,7 +1503,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
         }
         return completed;
       };
-      if (!service.config().synchronous_exact_updates_enabled() &&
+      if (!args.skip_maintenance_drain &&
+          !service.config().synchronous_exact_updates_enabled() &&
           expected_stage2_completions != 0) {
         const auto telemetry_deadline = std::chrono::steady_clock::now() +
           std::chrono::seconds(7);
@@ -2179,6 +2297,25 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     }},
     {"observation_period_seconds_assumed", 5.0},
   };
+
+  root["meta"]["effective_next_insert_id"] = next_insert_id;
+  if (delete_inserted_ids) {
+    const u64 inserted = static_cast<u64>(loaded_dynamic_id_count) +
+      seed_completed_inserts + warmup_mixed_stats.completed_inserts +
+      measure_mixed_stats.completed_inserts;
+    const u64 deleted = static_cast<u64>(warmup_mixed_stats.completed_deletes) +
+      measure_mixed_stats.completed_deletes;
+    if (deleted > inserted || inserted - deleted != dynamic_ids.size()) {
+      throw std::runtime_error("dynamic ID accounting does not match the live queue");
+    }
+    dynamic_ids.save();
+    root["meta"]["loaded_dynamic_id_count"] = loaded_dynamic_id_count;
+    root["meta"]["seed_completed_inserts"] = seed_completed_inserts;
+    root["meta"]["seed_maintenance_drain_seconds"] = seed_maintenance_drain_seconds;
+    root["meta"]["dynamic_live_id_count"] = dynamic_ids.size();
+    std::cerr << "[breakdown] dynamic ID state saved: live=" << dynamic_ids.size()
+              << ", next_insert_id=" << next_insert_id << std::endl;
+  }
 
   FormattedReport formatted_report = format_report(root, report);
   root["bottleneck_summary"] = std::move(formatted_report.bottleneck_summary);

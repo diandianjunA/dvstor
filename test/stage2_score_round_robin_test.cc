@@ -172,6 +172,10 @@ void test_score_many_rejects_latency_dominated_sparse_waves() {
   assert(stage2_score_many_peer_eligible(128, 256));
   assert(stage2_score_many_peer_eligible(1024, 256));
   assert(!stage2_score_many_peer_eligible(1024, 0));
+  assert(!stage2_score_many_peer_eligible(31, 256, 32));
+  assert(stage2_score_many_peer_eligible(32, 256, 32));
+  assert(!stage2_score_many_peer_eligible(63, 256, 64));
+  assert(stage2_score_many_peer_eligible(64, 256, 64));
 }
 
 void test_home_rpc_wait_does_not_pin_registered_rdma_scratch() {

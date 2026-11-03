@@ -201,8 +201,11 @@ constexpr u32 stage2_score_many_min_items(u32 message_capacity) {
 }
 
 constexpr bool stage2_score_many_peer_eligible(
-    std::size_t pending_items, u32 message_capacity) {
-  const u32 minimum = stage2_score_many_min_items(message_capacity);
+    std::size_t pending_items, u32 message_capacity,
+    u32 configured_minimum = 0) {
+  const u32 minimum = configured_minimum == 0
+    ? stage2_score_many_min_items(message_capacity)
+    : configured_minimum;
   return minimum != 0 && pending_items >= minimum;
 }
 

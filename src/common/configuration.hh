@@ -116,6 +116,7 @@ public:
   // has aged this long. Zero is the production behavior.
   u32 storage_owner_stage2_initial_delay_ms{0};
   bool storage_owner_stage2_score_many{true};
+  u32 storage_owner_stage2_score_many_min_items{128};
   // Combine ready logical Stage2 home requests that share a peer and wire
   // class. False preserves the same protocol and retry semantics but sends
   // each logical request directly, which is the architecture baseline.
@@ -512,6 +513,10 @@ private:
          ->default_value(storage_owner_stage2_score_many),
        "Score remote Stage2 candidates at their physical home using a "
        "query-deduplicated exact score-many RPC.")
+      ("storage-owner-stage2-score-many-min-items",
+       po::value<u32>(&storage_owner_stage2_score_many_min_items)
+         ->default_value(storage_owner_stage2_score_many_min_items),
+       "Minimum pending candidates per peer before using score-many RPC.")
       ("storage-owner-stage2-home-rpc-combining",
        po::value<bool>(&storage_owner_stage2_home_rpc_combining)
          ->default_value(storage_owner_stage2_home_rpc_combining),
@@ -742,6 +747,9 @@ private:
         storage_owner_rpc_depth == 0 ||
         storage_owner_rpc_timeout_ms == 0 ||
         storage_owner_search_snapshot_batch == 0 ||
+        storage_owner_stage2_score_many_min_items == 0 ||
+        storage_owner_stage2_score_many_min_items >
+          storage_owner_search_snapshot_batch ||
         storage_owner_stage2_graph_issue_width == 0 ||
         storage_owner_stage2_graph_issue_width > storage_owner_batch_max ||
         storage_owner_maintenance_workers == 0 ||
@@ -876,6 +884,8 @@ public:
              << config.storage_owner_stage2_initial_delay_ms << '\n';
       output << std::setw(width) << "Stage2 exact score-many: "
              << config.storage_owner_stage2_score_many << '\n';
+      output << std::setw(width) << "Stage2 score-many min items: "
+             << config.storage_owner_stage2_score_many_min_items << '\n';
       output << std::setw(width) << "Stage2 home RPC combining: "
              << config.storage_owner_stage2_home_rpc_combining << '\n';
       output << std::setw(width) << "Stage2 graph issue width: "

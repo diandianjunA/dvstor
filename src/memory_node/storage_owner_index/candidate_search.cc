@@ -1146,7 +1146,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
       for (u32 peer = 0; peer < num_storage_nodes_; ++peer) {
         score_many_peer_eligible[peer] =
           stage2_score_many_peer_eligible(
-            score_many_pending_by_peer[peer], score_many_item_limit);
+            score_many_pending_by_peer[peer], score_many_item_limit,
+            config.storage_owner_stage2_score_many_min_items);
         state.score_many_dispatch |= score_many_peer_eligible[peer] != 0;
       }
     }

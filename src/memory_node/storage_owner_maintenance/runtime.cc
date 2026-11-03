@@ -973,6 +973,24 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     : 0.0;
   const u64 active_contexts =
     storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
+  u64 oldest_unfinished_sequence = 0;
+  u64 stage2_head_sequence = 0;
+  u64 cleanup_head_sequence = 0;
+  if (storage_owner_maintenance_completion_ring_ != nullptr) {
+    oldest_unfinished_sequence =
+      storage_owner_maintenance_completion_ring_->finalized() + 1;
+  }
+  {
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+    if (!storage_owner_stage2_tasks_.empty()) {
+      stage2_head_sequence =
+        storage_owner_stage2_tasks_.front().maintenance_sequence;
+    }
+    if (!storage_owner_cleanup_tasks_.empty()) {
+      cleanup_head_sequence =
+        storage_owner_cleanup_tasks_.front().maintenance_sequence;
+    }
+  }
   const u64 active_context_limit = stage2_context_admission_limit(
     storage_owner_maintenance_worker_states_.size(),
     storage_worker_config_ == nullptr
@@ -1519,6 +1537,12 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(reclaim_reused) +
                " dynamic_high_watermark=" +
                std::to_string(dynamic_high_watermark) +
+               " oldest_unfinished_sequence=" +
+               std::to_string(oldest_unfinished_sequence) +
+               " stage2_head_sequence=" +
+               std::to_string(stage2_head_sequence) +
+               " cleanup_head_sequence=" +
+               std::to_string(cleanup_head_sequence) +
                " stage2_remaining=" +
                std::to_string(stage2_remaining) +
                " cleanup_remaining=" +

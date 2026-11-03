@@ -491,7 +491,8 @@ PY_VALIDATE
       echo "generate it on a host that has every .dat shard, then copy it to the compute index prefix" >&2
       return 1
     fi
-    if [[ "$require_graph_extent" == true ]]; then
+    if [[ "$require_graph_extent" == true &&
+          "${DVSTOR_GRAPH_EXTENT_VALIDATED:-0}" != 1 ]]; then
       python3 - "$(graph_extent_file)" "$metadata" <<'PY_EXTENT_VALIDATE' || return 1
 import json
 import os

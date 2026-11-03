@@ -43,6 +43,11 @@ struct Args {
   double write_insert_ratio{0.5};
   double write_upsert_ratio{0.4};
   double write_delete_ratio{0.1};
+  std::string mixed_delete_mode{"base"};
+  std::string dynamic_state_file;
+  size_t seed_insert_count{0};
+  size_t maintenance_timeout_ms{0};
+  bool skip_maintenance_drain{false};
 };
 
 ConfigMap read_config(const std::string& path);
