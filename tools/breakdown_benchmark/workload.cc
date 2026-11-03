@@ -952,8 +952,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                                std::atomic<size_t>& completed_inserts,
                                std::atomic<size_t>& completed_upserts,
                                std::atomic<size_t>& completed_deletes,
-                               std::chrono::steady_clock::time_point deadline,
-                               bool& operation_issued) -> bool {
+                               std::chrono::steady_clock::time_point deadline) -> bool {
     switch (kind) {
       case WriteKind::insert: {
         issued_inserts.fetch_add(1, std::memory_order_relaxed);
@@ -1061,12 +1060,11 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
               completed_reads.fetch_add(1, std::memory_order_relaxed);
             } else {
               issued_writes.fetch_add(1, std::memory_order_relaxed);
-              bool operation_issued = true;
               if (!issue_mixed_write(
                     rng, choose_write_kind(rng), next_insert_id, next_update_version,
                     issued_inserts, issued_upserts, issued_deletes,
                     completed_inserts, completed_upserts, completed_deletes,
-                    std::chrono::steady_clock::time_point{}, operation_issued)) {
+                    std::chrono::steady_clock::time_point{})) {
                 throw std::runtime_error(
                   "mixed mutation was rejected or timed out");
               }
@@ -1184,16 +1182,11 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                 write_kind = tid - fixed_read_threads < fixed_insert_threads
                   ? WriteKind::insert : WriteKind::erase;
               }
-              bool operation_issued = true;
               succeeded = issue_mixed_write(
                 rng, write_kind, next_insert_id, next_update_version,
                 issued_inserts, issued_upserts, issued_deletes,
                 completed_inserts, completed_upserts, completed_deletes,
-                deadline, operation_issued);
-              if (!operation_issued) {
-                issued_writes.fetch_sub(1, std::memory_order_relaxed);
-                break;
-              }
+                deadline);
               if (!succeeded) {
                 throw std::runtime_error(
                   "mixed mutation was rejected or timed out");
