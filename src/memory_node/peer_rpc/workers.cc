@@ -663,21 +663,53 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
       peer_reverse_tasks_.pop_front();
       const u32 request_type = tasks.back().header.type;
       size_t coalesced_ops = tasks.back().item_count();
+      const auto lease_merge_task = [](const PeerReverseUpdateTask& task) {
+        if (task.header.type != static_cast<u32>(
+              service::storage_owner::PeerRpcType::reconcile_reverse_request)) {
+          return false;
+        }
+        return std::any_of(
+          task.reconcile_ops.begin(), task.reconcile_ops.end(),
+          [](const service::storage_owner::ReconcileReverseOp& op) {
+            return op.kind >= static_cast<u32>(
+              service::storage_owner::ReconcileReverseOpKind::
+                acquire_certificate_lease);
+          });
+      };
+      const auto lease_acquire_count = [](const PeerReverseUpdateTask& task) {
+        return static_cast<size_t>(std::count_if(
+          task.reconcile_ops.begin(), task.reconcile_ops.end(),
+          [](const service::storage_owner::ReconcileReverseOp& op) {
+            return op.kind == static_cast<u32>(
+              service::storage_owner::ReconcileReverseOpKind::
+                acquire_certificate_lease);
+          }));
+      };
+      const bool lease_merge_batch = lease_merge_task(tasks.back());
+      size_t lease_acquires = lease_merge_batch
+        ? lease_acquire_count(tasks.back()) : 0;
       const bool carries_per_op_results = request_type == static_cast<u32>(
         service::storage_owner::PeerRpcType::reconcile_reverse_request);
-      while (!carries_per_op_results && !peer_reverse_tasks_.empty() &&
+      while ((!carries_per_op_results || lease_merge_batch) &&
+             !peer_reverse_tasks_.empty() &&
              coalesced_ops < config.storage_owner_reverse_coalesce_max) {
-        if (peer_reverse_tasks_.front().header.type != request_type) {
+        if (peer_reverse_tasks_.front().header.type != request_type ||
+            (lease_merge_batch &&
+             !lease_merge_task(peer_reverse_tasks_.front()))) {
           break;
         }
         const size_t next_ops =
           peer_reverse_tasks_.front().item_count();
-        if (!tasks.empty() && coalesced_ops + next_ops > config.storage_owner_reverse_coalesce_max) {
+        const size_t next_acquires = lease_merge_batch
+          ? lease_acquire_count(peer_reverse_tasks_.front()) : 0;
+        if (coalesced_ops + next_ops > config.storage_owner_reverse_coalesce_max ||
+            lease_acquires + next_acquires > config.R) {
           break;
         }
         tasks.push_back(std::move(peer_reverse_tasks_.front()));
         peer_reverse_tasks_.pop_front();
         coalesced_ops += next_ops;
+        lease_acquires += next_acquires;
       }
     }
     peer_reverse_tasks_cv_.notify_one();
@@ -686,15 +718,28 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
     for (const PeerReverseUpdateTask& task : tasks) {
       processed_items += task.item_count();
     }
-    const bool reconcile_request = tasks.size() == 1 &&
-      tasks.front().header.type == static_cast<u32>(
-        service::storage_owner::PeerRpcType::reconcile_reverse_request);
+    const bool reconcile_request = tasks.front().header.type == static_cast<u32>(
+      service::storage_owner::PeerRpcType::reconcile_reverse_request);
     bool success = false;
     vec<service::storage_owner::ReconcileReverseResult> reconcile_results;
     if (reconcile_request) {
+      vec<service::storage_owner::ReconcileReverseOp> merged_ops;
+      merged_ops.reserve(processed_items);
+      for (const PeerReverseUpdateTask& task : tasks) {
+        merged_ops.insert(merged_ops.end(), task.reconcile_ops.begin(),
+                          task.reconcile_ops.end());
+      }
       success = reconcile_local_reverse_ops(
-        span<const service::storage_owner::ReconcileReverseOp>{
-          tasks.front().reconcile_ops}, config, reconcile_results);
+        span<const service::storage_owner::ReconcileReverseOp>{merged_ops},
+        config, reconcile_results);
+      lib_assert(reconcile_results.size() == merged_ops.size(),
+                 "cross-context lease merge lost per-operation results");
+      if (tasks.size() > 1) {
+        storage_owner_lease_merge_cross_context_batches_.fetch_add(
+          1, std::memory_order_relaxed);
+        storage_owner_lease_merge_cross_context_tasks_.fetch_add(
+          tasks.size(), std::memory_order_relaxed);
+      }
     } else {
       success = apply_peer_reverse_update_tasks(tasks, config);
     }
@@ -704,9 +749,12 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
     if (!success) {
       peer_reverse_update_failed_.fetch_add(1, std::memory_order_relaxed);
     }
+    size_t reconcile_result_offset = 0;
     for (const PeerReverseUpdateTask& task : tasks) {
       if (reconcile_request) {
-        lib_assert(reconcile_results.size() == task.reconcile_ops.size(),
+        lib_assert(reconcile_result_offset <= reconcile_results.size() &&
+                     task.reconcile_ops.size() <= reconcile_results.size() -
+                       reconcile_result_offset,
                    "reverse reconciliation lost per-operation results");
         const size_t bytes =
           service::storage_owner::reconcile_reverse_response_bytes(
@@ -718,8 +766,9 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
           task.header, success);
         std::memcpy(
           service::storage_owner::reconcile_reverse_results(response.data()),
-          reconcile_results.data(),
-          reconcile_results.size() * sizeof(reconcile_results.front()));
+          reconcile_results.data() + reconcile_result_offset,
+          task.reconcile_ops.size() * sizeof(reconcile_results.front()));
+        reconcile_result_offset += task.reconcile_ops.size();
         lib_assert(peer_request_deduplicator_->abandon(
                      task.dedup_lease, task.source_shard, task.header),
                    "reconcile completion lost its dedup lease");

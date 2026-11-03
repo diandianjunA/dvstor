@@ -1,6 +1,8 @@
+#include <array>
 #include <cassert>
 #include <cstdint>
 
+#include "memory_node/storage_owner_maintenance/item_pipeline_policy.hh"
 #include "memory_node/storage_owner_maintenance/reconcile_batch_state.hh"
 
 namespace detail = memory_node_storage_owner_maintenance_detail;
@@ -97,6 +99,9 @@ void test_barrier_subphases_release_search_lane() {
          Subphase::install_wait);
   assert(detail::stage2_reconcile_wait_subphase(Barrier::removal) ==
          Subphase::removal_wait);
+  assert(detail::stage2_reconcile_wait_subphase(Barrier::release) ==
+         Subphase::release_wait);
+  assert(!detail::stage2_finalize_subphase_needs_lane(Subphase::release_wait));
   assert(detail::stage2_finalize_subphase_needs_lane(Subphase::prepare));
   assert(detail::stage2_finalize_subphase_needs_lane(
     Subphase::placement_ready));
@@ -105,13 +110,15 @@ void test_barrier_subphases_release_search_lane() {
   assert(!detail::stage2_finalize_subphase_needs_lane(Subphase::removal_wait));
 }
 
-void test_reconcile_pipeline_has_one_install_then_removal() {
+void test_reconcile_pipeline_has_install_removal_and_release() {
   using Barrier = detail::Stage2ReconcileBarrier;
   const Barrier first = detail::stage2_reconcile_first_barrier();
   assert(first == Barrier::install);
   const Barrier second = detail::stage2_reconcile_next_barrier(first);
   assert(second == Barrier::removal);
-  assert(detail::stage2_reconcile_next_barrier(second) == Barrier::none);
+  const Barrier third = detail::stage2_reconcile_next_barrier(second);
+  assert(third == Barrier::release);
+  assert(detail::stage2_reconcile_next_barrier(third) == Barrier::none);
 }
 
 void test_barrier_packing_preserves_target_order_and_never_splits_a_target() {
@@ -149,6 +156,36 @@ void test_barrier_packing_preserves_target_order_and_never_splits_a_target() {
   assert(!detail::pack_stage2_reconcile_target_runs(install, 1).has_value());
 }
 
+void test_pending_item_does_not_block_sibling_pipeline() {
+  using Action = detail::Stage2ItemPipelineAction;
+  using Subphase = detail::Stage2FinalizeSubphase;
+  const auto now = std::chrono::steady_clock::now();
+  std::array<Subphase, 2> items{Subphase::install_wait, Subphase::prepare};
+  const auto retry = now + std::chrono::milliseconds(5);
+  assert(detail::stage2_item_pipeline_action(items[0], retry, now) ==
+         Action::wait);
+  assert(detail::stage2_item_pipeline_action(items[1], {}, now) ==
+         Action::start_install);
+  assert(!detail::stage2_context_items_complete(items));
+
+  items[1] = Subphase::removal_wait;
+  assert(detail::stage2_item_pipeline_action(items[1], {}, now) ==
+         Action::poll_reconcile);
+  items[1] = Subphase::release_wait;
+  assert(detail::stage2_item_pipeline_action(items[1], {}, now) ==
+         Action::poll_reconcile);
+  items[1] = Subphase::placement_ready;
+  assert(detail::stage2_item_pipeline_action(items[1], {}, now) ==
+         Action::finish_placement);
+  items[1] = Subphase::complete;
+  assert(!detail::stage2_context_items_complete(items));
+  assert(detail::stage2_item_pipeline_action(items[0], retry, now) ==
+         Action::wait);
+
+  items[0] = Subphase::complete;
+  assert(detail::stage2_context_items_complete(items));
+}
+
 }  // namespace
 
 int main() {
@@ -156,7 +193,8 @@ int main() {
   test_epoch_and_context_generation_fence_late_ack();
   test_empty_barrier_completes_without_transport();
   test_barrier_subphases_release_search_lane();
-  test_reconcile_pipeline_has_one_install_then_removal();
+  test_reconcile_pipeline_has_install_removal_and_release();
   test_barrier_packing_preserves_target_order_and_never_splits_a_target();
+  test_pending_item_does_not_block_sibling_pipeline();
   return 0;
 }

@@ -121,6 +121,9 @@ public:
   // class. False preserves the same protocol and retry semantics but sends
   // each logical request directly, which is the architecture baseline.
   bool storage_owner_stage2_home_rpc_combining{true};
+  // LeaseMerge is the production graph-maintenance protocol. False retains the
+  // legacy promotion and globally ordered cleanup path for ablation.
+  bool storage_owner_lease_merge{true};
   // Maximum ordered graph issue width. Width one is the exact legacy path;
   // larger values are promotion-gated and only fill spare items in an RPC
   // that an authoritative expansion already requires.
@@ -137,8 +140,8 @@ public:
   u32 storage_owner_maintenance_workers{1};
   u32 storage_owner_maintenance_queue_depth{65'536};
   // Permanent Stage2 failures are retried with the nominal 1 ms deferral for
-  // at most this long before the stuck context is terminated and its
-  // maintenance sequence completed. Zero preserves unbounded retries.
+  // at most this long before execution resources are released and the failure
+  // is reported. Unfinished cleanup never advances the durable watermark.
   u32 storage_owner_stage2_max_retry_ms{300'000};
   // Backlog-aware Stage2 continuation search budget. Both watermarks zero
   // disables the controller and preserves the unbounded production budget.
@@ -521,6 +524,11 @@ private:
        po::value<bool>(&storage_owner_stage2_home_rpc_combining)
          ->default_value(storage_owner_stage2_home_rpc_combining),
        "Combine compatible logical Stage2 home requests into one wire RPC.")
+      ("storage-owner-lease-merge",
+       po::value<bool>(&storage_owner_lease_merge)
+         ->default_value(storage_owner_lease_merge),
+       "Use cross-context certificate-lease Atomic Cuts; false runs the legacy "
+       "promotion and globally ordered cleanup ablation.")
       ("storage-owner-stage2-graph-issue-width",
        po::value<u32>(&storage_owner_stage2_graph_issue_width)
          ->default_value(storage_owner_stage2_graph_issue_width),
@@ -560,7 +568,7 @@ private:
        po::value<u32>(&storage_owner_stage2_max_retry_ms)
          ->default_value(storage_owner_stage2_max_retry_ms),
        "Maximum permanent-failure retry window for one Stage2 context before "
-       "it is terminated and its sequence completed; zero retries forever.")
+       "execution stops with an explicit failure; zero retries forever.")
       ("storage-owner-stage2-budget-backlog-low",
        po::value<u32>(&storage_owner_stage2_budget_backlog_low)
          ->default_value(storage_owner_stage2_budget_backlog_low),
@@ -888,6 +896,8 @@ public:
              << config.storage_owner_stage2_score_many_min_items << '\n';
       output << std::setw(width) << "Stage2 home RPC combining: "
              << config.storage_owner_stage2_home_rpc_combining << '\n';
+      output << std::setw(width) << "Stage2 LeaseMerge: "
+             << config.storage_owner_lease_merge << '\n';
       output << std::setw(width) << "Stage2 graph issue width: "
              << config.storage_owner_stage2_graph_issue_width << '\n';
       output << std::setw(width) << "storage peer QPs per peer: "

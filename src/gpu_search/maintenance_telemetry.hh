@@ -31,7 +31,8 @@ inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
 // Version 16 adds non-overlapping exact-insert RDMA wait intervals measured
 // at actual submission/completion boundaries. Version 17 reports Stage2
 // contexts terminated after exhausting the permanent-failure retry window.
-inline constexpr u32 kVersion = 17;
+// Version 18 reports LeaseMerge Atomic Cuts and cross-context fan-in.
+inline constexpr u32 kVersion = 18;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -159,6 +160,11 @@ struct alignas(64) Snapshot {
   // of permanent-failure retries, and the highest sequence released that way.
   u64 stage2_terminated_total{};
   u64 stage2_last_terminated_sequence{};
+  u64 lease_merge_atomic_cuts{};
+  u64 lease_merge_target_ops{};
+  u64 lease_merge_cross_context_batches{};
+  u64 lease_merge_cross_context_tasks{};
+  u64 certificate_leases_active{};
 };
 
 static_assert(kSnapshotOffset == 192);

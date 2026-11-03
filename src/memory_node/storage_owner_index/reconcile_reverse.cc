@@ -21,6 +21,7 @@ bool MemoryNode::reconcile_local_reverse_ops(
     const span<const service::storage_owner::ReconcileReverseOp> ops,
     const Configuration& config,
     vec<service::storage_owner::ReconcileReverseResult>& results) {
+  bool lease_merge = false;
   for (const auto& op : ops) {
     const RemotePtr target{op.target_raw};
     if (target.is_null() || !target.is_well_formed() ||
@@ -32,7 +33,12 @@ bool MemoryNode::reconcile_local_reverse_ops(
       }
       return false;
     }
+    lease_merge = lease_merge ||
+      op.kind >= static_cast<u32>(
+        service::storage_owner::ReconcileReverseOpKind::
+          acquire_certificate_lease);
   }
+  if (lease_merge) return reconcile_lease_merge_ops(ops, config, results);
   return reconcile_reverse_ops_one_sided(ops, config, results);
 }
 

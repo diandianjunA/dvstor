@@ -256,6 +256,18 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     .peer_reverse_remaining =
       parse_u64(fields, "peer_reverse_remaining").value_or(0),
     .failed = failed.value_or(0),
+    .stage2_terminated_total = parse_u64(
+      fields, "stage2_terminated_total").value_or(0),
+    .lease_merge_atomic_cuts = parse_u64(
+      fields, "lease_merge_atomic_cuts").value_or(0),
+    .lease_merge_target_ops = parse_u64(
+      fields, "lease_merge_target_ops").value_or(0),
+    .lease_merge_cross_context_batches = parse_u64(
+      fields, "lease_merge_cross_context_batches").value_or(0),
+    .lease_merge_cross_context_tasks = parse_u64(
+      fields, "lease_merge_cross_context_tasks").value_or(0),
+    .certificate_leases_active = parse_u64(
+      fields, "certificate_leases_active").value_or(0),
     .peer_reverse_retry_attempts = peer_reverse_failed.value_or(0),
     .admission_window = admission_window.value_or(0),
     .completion_outstanding = completion_outstanding.value_or(0),
@@ -590,6 +602,29 @@ MaintenanceLogSummary summarize_impl(
         ++summary.logs_with_failure_deltas;
         summary.failures += failed_delta;
       }
+      uint64_t terminated_delta = 0;
+      if (counter_delta(cursor.baseline.stage2_terminated_total,
+                        latest.stage2_terminated_total, &terminated_delta)) {
+        summary.stage2_terminated_total += terminated_delta;
+      }
+      uint64_t merge_delta = 0;
+      if (counter_delta(cursor.baseline.lease_merge_atomic_cuts,
+                        latest.lease_merge_atomic_cuts, &merge_delta)) {
+        summary.lease_merge_atomic_cuts += merge_delta;
+      }
+      if (counter_delta(cursor.baseline.lease_merge_target_ops,
+                        latest.lease_merge_target_ops, &merge_delta)) {
+        summary.lease_merge_target_ops += merge_delta;
+      }
+      if (counter_delta(cursor.baseline.lease_merge_cross_context_batches,
+                        latest.lease_merge_cross_context_batches, &merge_delta)) {
+        summary.lease_merge_cross_context_batches += merge_delta;
+      }
+      if (counter_delta(cursor.baseline.lease_merge_cross_context_tasks,
+                        latest.lease_merge_cross_context_tasks, &merge_delta)) {
+        summary.lease_merge_cross_context_tasks += merge_delta;
+      }
+      summary.certificate_leases_active += latest.certificate_leases_active;
     }
 
     if (!slice.rotated && cursor.baseline_available &&
@@ -986,6 +1021,29 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
       ++summary.logs_with_failure_deltas;
       summary.failures += failed;
     }
+    uint64_t terminated = 0;
+    if (counter_delta(first.stage2_terminated_total,
+                      latest.stage2_terminated_total, &terminated)) {
+      summary.stage2_terminated_total += terminated;
+    }
+    uint64_t merge_delta = 0;
+    if (counter_delta(first.lease_merge_atomic_cuts,
+                      latest.lease_merge_atomic_cuts, &merge_delta)) {
+      summary.lease_merge_atomic_cuts += merge_delta;
+    }
+    if (counter_delta(first.lease_merge_target_ops,
+                      latest.lease_merge_target_ops, &merge_delta)) {
+      summary.lease_merge_target_ops += merge_delta;
+    }
+    if (counter_delta(first.lease_merge_cross_context_batches,
+                      latest.lease_merge_cross_context_batches, &merge_delta)) {
+      summary.lease_merge_cross_context_batches += merge_delta;
+    }
+    if (counter_delta(first.lease_merge_cross_context_tasks,
+                      latest.lease_merge_cross_context_tasks, &merge_delta)) {
+      summary.lease_merge_cross_context_tasks += merge_delta;
+    }
+    summary.certificate_leases_active += latest.certificate_leases_active;
     uint64_t peer_reverse_retries = 0;
     if (counter_delta(first.peer_reverse_failed,
                       latest.peer_reverse_failed,

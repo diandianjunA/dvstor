@@ -13,11 +13,14 @@ inline constexpr bool reconcile_kind_needs_new_identity(
   using service::storage_owner::ReconcileReverseOpKind;
   switch (kind) {
     case ReconcileReverseOpKind::remove_if_present:
+    case ReconcileReverseOpKind::release_certificate_lease:
+    case ReconcileReverseOpKind::remove_provisional_if_present:
       return false;
     case ReconcileReverseOpKind::replace_or_add:
     case ReconcileReverseOpKind::add:
     case ReconcileReverseOpKind::ensure_reachable:
     case ReconcileReverseOpKind::promote_stable_bridge:
+    case ReconcileReverseOpKind::acquire_certificate_lease:
       return true;
   }
   return false;
@@ -45,10 +48,13 @@ inline bool reconcile_reverse_postcondition_holds(
   switch (static_cast<ReconcileReverseOpKind>(op.kind)) {
     case ReconcileReverseOpKind::remove_if_present:
     case ReconcileReverseOpKind::replace_or_add:
+    case ReconcileReverseOpKind::remove_provisional_if_present:
       return result.removed != 0;
     case ReconcileReverseOpKind::add:
       return true;
     case ReconcileReverseOpKind::ensure_reachable:
+    case ReconcileReverseOpKind::release_certificate_lease:
+    case ReconcileReverseOpKind::acquire_certificate_lease:
       return result.accepted != 0;
     case ReconcileReverseOpKind::promote_stable_bridge:
       return result.accepted != 0 &&
@@ -188,13 +194,17 @@ reconcile_retired_target_result(
   };
   switch (static_cast<ReconcileReverseOpKind>(op.kind)) {
     case ReconcileReverseOpKind::add:
+    case ReconcileReverseOpKind::release_certificate_lease:
+      result.accepted = 1;
       break;
     case ReconcileReverseOpKind::remove_if_present:
     case ReconcileReverseOpKind::replace_or_add:
+    case ReconcileReverseOpKind::remove_provisional_if_present:
       result.removed = 1;
       break;
     case ReconcileReverseOpKind::ensure_reachable:
     case ReconcileReverseOpKind::promote_stable_bridge:
+    case ReconcileReverseOpKind::acquire_certificate_lease:
       result.stale = 1;
       break;
   }
@@ -406,6 +416,10 @@ service::storage_owner::ReconcileReverseResult reconcile_reverse_neighbors(
       ensure_new();
       result.replaced = old_present && result.accepted ? 1 : 0;
       return result;
+    case ReconcileReverseOpKind::acquire_certificate_lease:
+    case ReconcileReverseOpKind::release_certificate_lease:
+    case ReconcileReverseOpKind::remove_provisional_if_present:
+      return stale();
   }
 
   return stale();
@@ -657,6 +671,10 @@ service::storage_owner::ReconcileReverseResult reconcile_reverse_adjacency(
       result.replaced = observed_old && result.accepted ? 1 : 0;
       return result;
     }
+    case ReconcileReverseOpKind::acquire_certificate_lease:
+    case ReconcileReverseOpKind::release_certificate_lease:
+    case ReconcileReverseOpKind::remove_provisional_if_present:
+      return stale_result();
   }
   return stale_result();
 }

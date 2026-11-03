@@ -18,6 +18,7 @@ enum class Stage2ReconcileBarrier : std::uint8_t {
   none,
   install,
   removal,
+  release,
 };
 
 // Ordinary backlinks may RobustPrune the same hot parent selected as another
@@ -25,8 +26,8 @@ enum class Stage2ReconcileBarrier : std::uint8_t {
 // mandatory promotions in one per-target transaction, with every ordinary op
 // ordered before every promotion op for that target. The receiver audits all
 // mandatory certificates against the transaction's final adjacency before it
-// ACKs. A separate removal barrier can therefore retire provisional bridges
-// without either the old cross-barrier eviction window or a third RTT.
+// ACKs. Per-item removal and release barriers then retire temporary bridges
+// and unpin certificates without rebuilding sibling item state.
 [[nodiscard]] constexpr Stage2ReconcileBarrier
 stage2_reconcile_first_barrier() noexcept {
   return Stage2ReconcileBarrier::install;
@@ -38,21 +39,24 @@ stage2_reconcile_next_barrier(Stage2ReconcileBarrier barrier) noexcept {
     case Stage2ReconcileBarrier::install:
       return Stage2ReconcileBarrier::removal;
     case Stage2ReconcileBarrier::removal:
+      return Stage2ReconcileBarrier::release;
+    case Stage2ReconcileBarrier::release:
     case Stage2ReconcileBarrier::none:
       return Stage2ReconcileBarrier::none;
   }
   return Stage2ReconcileBarrier::none;
 }
 
-// The outer Stage2 tracker deliberately remains in prune_ready while these
-// context-local transport barriers are outstanding.  Keeping this subphase in
-// the context lets the scheduler run other searches instead of turning a
-// network ACK into a worker-wide blocking wait.
+// The outer Stage2 tracker remains in prune_ready while each item has its own
+// outstanding transport barriers and placement suffix. Complete items release
+// their search lane and never wait for sibling item RPCs.
 enum class Stage2FinalizeSubphase : std::uint8_t {
   prepare,
   install_wait,
   removal_wait,
+  release_wait,
   placement_ready,
+  complete,
 };
 
 [[nodiscard]] constexpr Stage2FinalizeSubphase
@@ -62,6 +66,8 @@ stage2_reconcile_wait_subphase(Stage2ReconcileBarrier barrier) noexcept {
       return Stage2FinalizeSubphase::install_wait;
     case Stage2ReconcileBarrier::removal:
       return Stage2FinalizeSubphase::removal_wait;
+    case Stage2ReconcileBarrier::release:
+      return Stage2FinalizeSubphase::release_wait;
     case Stage2ReconcileBarrier::none:
       break;
   }
@@ -130,7 +136,7 @@ struct Stage2ReconcileChunk {
   }
 };
 
-// One context-local, bounded reconciliation barrier. The exact operation
+// One item-local, bounded reconciliation barrier. The exact operation
 // payload remains immutable from the first post through every transport retry.
 // Offsets, rather than pointers, keep chunks valid if the payload vector grows
 // while the barrier is initially assembled. A fresh epoch fences a late ACK

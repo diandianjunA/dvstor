@@ -778,6 +778,14 @@ FormattedReport format_report(const nlohmann::json& root,
            << stage2.value("backlog_slope_per_sec", 0.0) << '\n';
     output << "  failures (hard): "
            << stage2.value("failures", 0ULL) << '\n';
+    output << "  stage2_terminated_total: "
+           << stage2.value("stage2_terminated_total", 0ULL) << '\n';
+    output << "  lease_merge cuts/ops/cross_context_batches/tasks/active_leases: "
+           << stage2.value("lease_merge_atomic_cuts", 0ULL) << "/"
+           << stage2.value("lease_merge_target_ops", 0ULL) << "/"
+           << stage2.value("lease_merge_cross_context_batches", 0ULL) << "/"
+           << stage2.value("lease_merge_cross_context_tasks", 0ULL) << "/"
+           << stage2.value("certificate_leases_active", 0ULL) << '\n';
     output << "  peer_reverse_retry_attempts: ";
     if (stage2.value("peer_reverse_retry_delta_available", false)) {
       output << stage2.value("peer_reverse_retry_attempts", 0ULL) << '\n';

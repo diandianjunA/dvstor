@@ -25,6 +25,12 @@ struct MaintenanceObservation {
   uint64_t remaining{};
   uint64_t peer_reverse_remaining{};
   uint64_t failed{};
+  uint64_t stage2_terminated_total{};
+  uint64_t lease_merge_atomic_cuts{};
+  uint64_t lease_merge_target_ops{};
+  uint64_t lease_merge_cross_context_batches{};
+  uint64_t lease_merge_cross_context_tasks{};
+  uint64_t certificate_leases_active{};
   // The storage log/control-page field is historically named
   // peer_reverse_failed, but it counts retryable apply attempts. A failed
   // response is not cached by receiver deduplication and the sender retries
@@ -122,6 +128,12 @@ struct MaintenanceLogSummary {
   // reported separately and must not make a successfully drained run look
   // inconsistent.
   uint64_t failures{};
+  uint64_t stage2_terminated_total{};
+  uint64_t lease_merge_atomic_cuts{};
+  uint64_t lease_merge_target_ops{};
+  uint64_t lease_merge_cross_context_batches{};
+  uint64_t lease_merge_cross_context_tasks{};
+  uint64_t certificate_leases_active{};
   uint64_t peer_reverse_retry_attempts{};
   uint64_t admission_window{};
   uint64_t completion_outstanding{};

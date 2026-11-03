@@ -17,10 +17,10 @@ constexpr u32 kMutationCompletionMagic = 0x4d434d50;  // "MCMP"
 // replay identities.
 constexpr u32 kMutationProtocolVersion = 4;
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
-// Version 15 removes the retired speculative score-many traffic class. Peers
-// from older builds are rejected at the common header check rather than
+// Version 16 adds leased certificate and Atomic Cut reconciliation operations.
+// Peers from older builds are rejected at the common header check rather than
 // silently interpreting a now-invalid flags bit.
-constexpr u32 kPeerRpcVersion = 15;
+constexpr u32 kPeerRpcVersion = 16;
 
 enum class InsertStatus : u32 {
   ok = 0,
@@ -92,6 +92,8 @@ enum class PeerRpcType : u32 {
   // repeated query payload per candidate.
   stage2_score_many_request = 23,
   stage2_score_many_response = 24,
+  lease_merge_request = 25,
+  lease_merge_response = 26,
 };
 
 enum class Stage2HomeDisposition : u32 {
@@ -374,6 +376,11 @@ enum class ReconcileReverseOpKind : u32 {
   // lowest-priority survivor. The promoted edge is ordinary stable state and
   // may be pruned by later graph maintenance.
   promote_stable_bridge = 5,
+  // LeaseMerge operations. Acquisition pins a stable incoming edge until the
+  // matching release; provisional removal never touches the stable plane.
+  acquire_certificate_lease = 6,
+  release_certificate_lease = 7,
+  remove_provisional_if_present = 8,
 };
 
 struct ReconcileReverseOp {
@@ -391,7 +398,7 @@ inline bool reconcile_reverse_op_valid(const ReconcileReverseOp& op) {
   return op.reserved == 0 &&
     op.kind >= static_cast<u32>(ReconcileReverseOpKind::replace_or_add) &&
     op.kind <= static_cast<u32>(
-      ReconcileReverseOpKind::promote_stable_bridge);
+      ReconcileReverseOpKind::remove_provisional_if_present);
 }
 
 // These fields describe postconditions, except replaced which reports that

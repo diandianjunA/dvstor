@@ -39,6 +39,8 @@
 #include "memory_node/storage_owner_cpu_plan.hh"
 #include "memory_node/storage_owner_index/dynamic_allocation_receipt_policy.hh"
 #include "memory_node/storage_owner_index/incarnation_lock.hh"
+#include "memory_node/storage_owner_maintenance/certificate_lease.hh"
+#include "memory_node/storage_owner_maintenance/dependency_scheduler.hh"
 #include "memory_node/storage_owner_maintenance/home_rpc_outbox.hh"
 #include "memory_node/storage_owner_maintenance/ready_context_queue.hh"
 #include "memory_node/storage_owner_maintenance/reverse_outbox.hh"
@@ -261,6 +263,7 @@ class MemoryNode {
     // failures. Every retry revalidates it before any temporary bridge removal.
     bool stage2_promotion_committed{};
     RemotePtr stage2_promotion_parent;
+    bool certificate_released{};
     // Exact fixed-width Stage1 beam and every unique cross-partition pointer
     // observed while expanding it. Stage2 resumes from these structures and
     // never restarts a search from another shard's representative.
@@ -839,7 +842,9 @@ private:
   void complete_storage_owner_maintenance_sequence(u64 sequence);
   void complete_storage_owner_maintenance_sequence(u64 sequence,
                                                    u32 work_items);
-  bool storage_owner_cleanup_ready(u64 sequence) const;
+  bool storage_owner_cleanup_ready(
+    const StorageOwnerMaintenanceTask& task,
+    const Configuration& config) const;
   // Lock-free accepted-but-unfinished Stage2 sequence count. Zero when the
   // completion ring does not exist (coupled mode or runtime-less callers).
   u64 storage_owner_maintenance_incomplete() const;
@@ -1135,6 +1140,10 @@ private:
       span<const service::storage_owner::ReconcileReverseOp> ops,
       const Configuration& config,
       vec<service::storage_owner::ReconcileReverseResult>& results);
+  bool reconcile_lease_merge_ops(
+      span<const service::storage_owner::ReconcileReverseOp> ops,
+      const Configuration& config,
+      vec<service::storage_owner::ReconcileReverseResult>& results);
   bool apply_partition_local_reverse_update(RemotePtr target_ptr,
                                             const vec<RemotePtr>& candidate_ptrs,
                                             const Configuration& config,
@@ -1424,9 +1433,9 @@ private:
   memory_node_storage_owner_maintenance_detail::
     Stage2PackingController storage_owner_stage2_packing_;
   std::deque<StorageOwnerMaintenanceTask> storage_owner_stage2_tasks_;
-  // Min-heap ordered by maintenance_sequence then retry_not_before. The
-  // predecessor durability rule makes its front the only cleanup that can be
-  // runnable, eliminating admission-time scans under the global mutex.
+  // Min-heap ordered by maintenance_sequence then retry_not_before. Admission
+  // scans for independently runnable objects; only same-incarnation finalization
+  // dependencies and retry deadlines can defer cleanup.
   std::deque<StorageOwnerMaintenanceTask> storage_owner_cleanup_tasks_;
   // Arm owns a queue permit while it tries to reserve a completion batch.
   // Generic producers include these permits in their capacity check, so a
@@ -1434,6 +1443,10 @@ private:
   size_t storage_owner_maintenance_reserved_slots_{};
   std::unique_ptr<bounded::Queue<StorageOwnerMaintenanceTask>>
     storage_owner_repair_tasks_;
+  std::unique_ptr<memory_node_storage_owner_maintenance_detail::
+    CertificateLeaseTable> storage_owner_certificate_leases_;
+  memory_node_storage_owner_maintenance_detail::MaintenanceDependencyTracker
+    storage_owner_maintenance_dependencies_;
   std::unique_ptr<Stage2ReverseOutbox> storage_owner_reverse_outbox_;
   vec<std::unique_ptr<bounded::Queue<Stage2ReverseCompletion>>>
     storage_owner_reverse_completions_;
@@ -1458,6 +1471,10 @@ private:
   std::atomic<u64> storage_owner_maintenance_pressure_yields_{0};
   std::atomic<u64> storage_owner_stage2_batches_{0};
   std::atomic<u64> storage_owner_stage2_batched_items_{0};
+  std::atomic<u64> storage_owner_lease_merge_atomic_cuts_{0};
+  std::atomic<u64> storage_owner_lease_merge_target_ops_{0};
+  std::atomic<u64> storage_owner_lease_merge_cross_context_batches_{0};
+  std::atomic<u64> storage_owner_lease_merge_cross_context_tasks_{0};
   std::atomic<u64> storage_owner_stage1_search_budget_exhausted_{0};
   std::atomic<u64> storage_owner_stage2_search_budget_exhausted_{0};
   // Cumulative, attempt-level work counters make the locality mechanism

@@ -1267,11 +1267,15 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   double measure_query_client_drain_seconds = 0.0;
   double measure_write_client_drain_seconds = 0.0;
   double measure_maintenance_drain_seconds = 0.0;
+  bool measure_maintenance_complete = !workload_has_writes;
   vec<u64> maintenance_target_sequences;
   vec<u64> maintenance_durable_sequences;
   const auto drain_storage_maintenance = [&](const char* phase) {
     if (!workload_has_writes) return 0.0;
     if (args.skip_maintenance_drain) {
+      if (std::string_view{phase} == "measure") {
+        measure_maintenance_complete = false;
+      }
       std::cerr << "[breakdown][" << phase
                 << "] maintenance drain skipped by request" << std::endl;
       return 0.0;
@@ -1284,6 +1288,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     const bool complete = service.wait_for_storage_maintenance(
       std::chrono::milliseconds(std::max<size_t>(1000, timeout_ms)),
       &targets, &durable);
+    if (std::string_view{phase} == "measure") {
+      measure_maintenance_complete = complete;
+    }
     const double elapsed = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - started).count();
     std::cerr << "[breakdown][" << phase
@@ -1707,6 +1714,13 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     ? static_cast<double>(throughput_query_ops + throughput_write_ops) /
         durable_throughput_duration
     : 0.0;
+  const bool durable_metrics_valid = measure_maintenance_complete &&
+    maintenance_summary.remaining == 0 && maintenance_summary.failures == 0 &&
+    maintenance_summary.stage2_terminated_total == 0;
+  const nlohmann::json durable_write_json = durable_metrics_valid
+    ? nlohmann::json(durable_write_throughput) : nlohmann::json(nullptr);
+  const nlohmann::json durable_total_json = durable_metrics_valid
+    ? nlohmann::json(durable_total_throughput) : nlohmann::json(nullptr);
   const double mixed_write_subtype_duration = rate_limited_measurement
     ? configured_measure_duration : throughput_duration;
   root["throughput"] = {
@@ -1722,6 +1736,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"query_duration_seconds", query_throughput_duration},
     {"write_duration_seconds", write_throughput_duration},
     {"maintenance_drain_seconds", measure_maintenance_drain_seconds},
+    {"maintenance_drain_complete", measure_maintenance_complete},
+    {"durable_metrics_valid", durable_metrics_valid},
     {"durable_effective_measure_seconds", durable_throughput_duration},
     {"total_ops", throughput_query_ops + throughput_write_ops},
     {"total_ops_per_sec", total_throughput},
@@ -1731,14 +1747,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"effective_query_ops_per_sec", effective_query_throughput},
     {"write_ops", throughput_write_ops},
     {"write_ops_per_sec", write_throughput},
-    {"durable_write_ops_per_sec", durable_write_throughput},
+    {"durable_write_ops_per_sec", durable_write_json},
     {"nominal_write_ops_per_sec", write_throughput},
     {"effective_write_ops_per_sec", effective_write_throughput},
     {"insert_ops", throughput_insert_ops},
     {"insert_ops_per_sec", insert_throughput},
     {"nominal_insert_ops_per_sec", insert_throughput},
     {"effective_insert_ops_per_sec", effective_insert_throughput},
-    {"durable_total_ops_per_sec", durable_total_throughput},
+    {"durable_total_ops_per_sec", durable_total_json},
     {"scheduled_query_ops", measure_mixed_stats.scheduled_reads},
     {"scheduled_write_ops", measure_mixed_stats.scheduled_writes},
     {"query_rate_attainment_ratio", measure_mixed_stats.scheduled_reads == 0
@@ -2067,6 +2083,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
        static_cast<double>(maintenance_summary.stage2_finalize_latency_ns) /
        static_cast<double>(maintenance_summary.stage2_finalized_live) / 1e6},
     {"failures", maintenance_summary.failures},
+    {"stage2_terminated_total", maintenance_summary.stage2_terminated_total},
+    {"lease_merge_atomic_cuts", maintenance_summary.lease_merge_atomic_cuts},
+    {"lease_merge_target_ops", maintenance_summary.lease_merge_target_ops},
+    {"lease_merge_cross_context_batches",
+     maintenance_summary.lease_merge_cross_context_batches},
+    {"lease_merge_cross_context_tasks",
+     maintenance_summary.lease_merge_cross_context_tasks},
+    {"certificate_leases_active", maintenance_summary.certificate_leases_active},
     {"failure_delta_available", maintenance_summary.failure_delta_available},
     {"peer_reverse_retry_attempts",
      maintenance_summary.peer_reverse_retry_attempts},

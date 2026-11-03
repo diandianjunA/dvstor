@@ -109,13 +109,29 @@ train 在提交前因容量或兼容性原因不可用时，使用完整记录�
    邻接，因此 Stage1 ACK 后新节点可由图遍历发现。
 3. Stage2 延续保存的 beam、visited 和 remote frontier，只沿图边通过 one-sided RDMA
    补充远端候选，不重启逐分片搜索。
-4. 收敛后统一 RobustPrune；仅在严格减少跨分片边时迁移物理 placement。先将一个临时桥
-   提升为 `R` 有界的 stable 边，再协调其余反向边、清除临时边，更新 centroid membership
-   并推进维护完成水位。
+4. 收敛后统一 RobustPrune；仅在严格减少跨分片边时迁移物理 placement。LeaseMerge 在稳定
+   父节点获取 reachability certificate lease，撤销全部临时桥后释放租约，再更新 centroid
+   membership 并推进维护完成水位。
 
 临时桥使用独立 provisional 邻接区，Stage1 最多安装两个。迁移、反向边和重试按
 ID/generation 协调；迁移目标受有界 receipt 保护，避免迟到请求重复分配或命中新对象。
 Stage2 日志报告远端 frontier、展开与评分量、迁移、跨分片边变化和预算耗尽。
+
+LeaseMerge 以物理 target 为合并单元。多个 Stage2 context 的 RPC 可在接收端组成一次
+Atomic Cut：一次 incarnation lock、一次 union RobustPrune 和一次邻接发布同时处理普通边、
+certificate acquire/release 与 provisional removal。每个 active lease 都是 mandatory
+candidate，数量不超过 `R`；普通候选仍可由 RobustPrune 淘汰。结果按原 request ID 返回，
+因此共享图修改不共享 context 完成屏障。B8 只共享 continuation、freeze/prune 和快照波次；
+sealed 后每个 item 独立推进 install、provisional removal、release、placement 和 centroid，
+单个慢 RPC 不再阻塞同 context 的其他 item。
+
+插入和删除共用租约生命周期：先 acquire 稳定入边，再撤销临时保护关系，最后 release。
+删除改父不再依赖空闲 provisional slot。物理 cleanup 只等待相同 ID/generation/incarnation
+的前置 finalize/repair，不同对象可以乱序完成；连续 durable watermark 和 RCU 仍严格控制
+物理槽回收。永久清理失败不会推进 durable watermark。
+`--storage-owner-lease-merge=false` 保留旧的 promotion、provisional 改父和
+全局 cleanup 前驱栅栏，仅用于同机消融。默认启用 LeaseMerge；合并计数、跨 context fan-in
+和 active lease 数写入 Stage2 遥测与正式 JSON。
 
 ## 一致性与恢复边界
 
@@ -143,3 +159,5 @@ batch、critical/tail reads、promotion/waste 和 owner WQE 利用率。逻辑�
 重读量分别统计，`remote_batches` 不是 doorbell/CQE 数。图读取字节和 extent 回退的口径见
 [Live-Extent RDMA](live_extent_rdma.md)。性能评估同时检查 QPS、延迟、Recall、GPU 资源、
 RDMA/路由失败和 Stage2 积压，实验步骤见 [实验说明](../experiment/README.md)。
+`durable_write_ops_per_sec` 仅在未跳过 drain、维护全部完成且没有失败或强制终止时为数值；
+其他情况为 `null`，不能把 Stage1 ACK QPS 当作维护完成吞吐。

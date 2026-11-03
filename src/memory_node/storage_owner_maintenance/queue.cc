@@ -109,6 +109,10 @@ u64 MemoryNode::arm_storage_owner_maintenance_batch(
         tasks[item].maintenance_sequence =
           first_sequence + static_cast<u64>(item);
         tasks[item].queued_at = queued_at;
+        lib_assert(storage_owner_maintenance_dependencies_.register_finalize(
+                     tasks[item].maintenance_sequence, tasks[item].id,
+                     tasks[item].generation, tasks[item].target.raw_address),
+                   "duplicate physical Stage2 dependency");
         storage_owner_stage2_tasks_.push_back(std::move(tasks[item]));
       }
       storage_owner_stage2_packing_.observe_enqueue(queued_at, task_count);
@@ -322,6 +326,7 @@ void MemoryNode::complete_storage_owner_maintenance_sequence(
              "storage-owner completion ring is not initialized");
   storage_owner_maintenance_completion_ring_->complete(
     sequence, work_items);
+  (void)storage_owner_maintenance_dependencies_.complete_finalize(sequence);
   publish_storage_owner_maintenance_watermarks();
   if (current_storage_owner_maintenance_worker_) {
     notify_storage_owner_maintenance_capacity();
@@ -415,16 +420,22 @@ u64 MemoryNode::storage_owner_maintenance_incomplete() const {
         storage_owner_maintenance_completion_ring_->incomplete());
 }
 
-bool MemoryNode::storage_owner_cleanup_ready(u64 sequence) const {
-  if (sequence <= 1) {
-    return cleanup_predecessors_durable(sequence, 0);
+bool MemoryNode::storage_owner_cleanup_ready(
+    const StorageOwnerMaintenanceTask& task,
+    const Configuration& config) const {
+  if (config.storage_owner_lease_merge) {
+    return task.cleanup_repair_only ||
+      storage_owner_maintenance_dependencies_.cleanup_ready(
+        task.id, task.generation, task.target.raw_address);
   }
-  const auto* control = reinterpret_cast<const gpu_search::format::StorageControlBlock*>(
-    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
-  auto& durable_storage = const_cast<u64&>(control->durable_maintenance_sequence);
+  const auto* control = reinterpret_cast<
+    const gpu_search::format::StorageControlBlock*>(
+      index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  auto& durable_storage = const_cast<u64&>(
+    control->durable_maintenance_sequence);
   const u64 durable = std::atomic_ref<u64>(durable_storage).load(
     std::memory_order_acquire);
-  return cleanup_predecessors_durable(sequence, durable);
+  return cleanup_predecessors_durable(task.maintenance_sequence, durable);
 }
 
 bool MemoryNode::try_acquire_storage_owner_maintenance_slot(

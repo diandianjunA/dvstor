@@ -3,6 +3,7 @@
 #include "memory_node/storage_owner_maintenance/centroid_lifecycle_policy.hh"
 #include "memory_node/storage_owner_maintenance/cleanup_scheduler.hh"
 #include "memory_node/storage_owner_maintenance/cleanup_policy.hh"
+#include "memory_node/storage_owner_maintenance/item_pipeline_policy.hh"
 #include "memory_node/storage_owner_maintenance/reconcile_batch_state.hh"
 #include "memory_node/storage_owner_maintenance/search_io_state.hh"
 #include "memory_node/storage_owner_maintenance/search_lane_pool.hh"
@@ -62,12 +63,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // not to worker-wide scratch that another active context may overwrite.
     vec<vec<RemotePtr>> continued_candidates_by_task;
     // Parent liveness is revalidated immediately before reconciliation.  The
-    // resulting exact planner input must survive scheduler yields while the
-    // three ordered remote barriers are in flight.
+    // resulting exact planner input must survive scheduler yields while each
+    // item independently crosses its install/removal/placement pipeline.
     vec<vec<RemotePtr>> live_stage2_neighbors_by_task;
-    Stage2FinalizeSubphase finalize_subphase{
-      Stage2FinalizeSubphase::prepare};
-    Stage2ReconcileBatchState reconcile_batch;
+    vec<Stage2FinalizeSubphase> finalize_subphases;
+    vec<Stage2ReconcileBatchState> reconcile_batches;
+    bool item_pipeline_started{};
     vec<vec<ReverseUpdateOp>> remote_ops_by_peer;
     vec<u64> reverse_request_ids;
     // Timestamped only after all asynchronous reconciliation barriers and the
@@ -177,8 +178,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       config.storage_owner_batch_max);
     context.live_stage2_neighbors_by_task.resize(
       config.storage_owner_batch_max);
-    context.reconcile_batch.reserve(
-      reconcile_op_capacity, reconcile_chunk_capacity);
+    context.finalize_subphases.resize(
+      config.storage_owner_batch_max, Stage2FinalizeSubphase::prepare);
+    context.reconcile_batches.resize(config.storage_owner_batch_max);
+    for (auto& batch : context.reconcile_batches) {
+      batch.reserve(reconcile_op_capacity, reconcile_chunk_capacity);
+    }
     context.remote_ops_by_peer.resize(num_storage_nodes_);
     for (auto& ops : context.remote_ops_by_peer) {
       ops.reserve(static_cast<size_t>(config.R) *
@@ -307,10 +312,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     cancel_storage_owner_search_lane_waiter(
       context.search_lane_wait_registered);
     clear_all_current_storage_owner_maintenance_waiters();
-    for (const Stage2ReconcileChunk& chunk :
-         context.reconcile_batch.chunks()) {
-      if (!chunk.complete && chunk.request_id != 0) {
-        cancel_peer_rpc_response(chunk.request_id);
+    for (auto& batch : context.reconcile_batches) {
+      for (const Stage2ReconcileChunk& chunk : batch.chunks()) {
+        if (!chunk.complete && chunk.request_id != 0) {
+          cancel_peer_rpc_response(chunk.request_id);
+        }
       }
     }
     for (size_t rpc_index = 0;
@@ -338,7 +344,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       context.ready_owner = {};
     }
     context.search_io.reset();
-    context.reconcile_batch.clear();
+    for (auto& batch : context.reconcile_batches) batch.clear();
+    std::fill(context.finalize_subphases.begin(),
+              context.finalize_subphases.end(),
+              Stage2FinalizeSubphase::prepare);
     context.active = false;
     context.tasks.clear();
     context.targets.clear();
@@ -362,7 +371,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     context.search_started_ns = 0;
     context.reverse_prepare_started_ns = 0;
     context.reverse_prepare_timing_active = false;
-    context.finalize_subphase = Stage2FinalizeSubphase::prepare;
+    context.item_pipeline_started = false;
     current_storage_owner_maintenance_waiter_registrations_ =
       previous_waiter_registrations;
   };
@@ -700,6 +709,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
               candidate_snapshot.header)) {
           return false;
         }
+        if (config.storage_owner_lease_merge) {
+          return (candidate_snapshot.header &
+                  VamanaNode::HEADER_CENTROID_ACCOUNTED) != 0;
+        }
         GraphAdjacency candidate_adjacency;
         if (!read_graph_adjacency(candidate, candidate_adjacency) ||
             candidate_adjacency.deleted) {
@@ -711,10 +724,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
               VamanaNode::provisional_slots())) {
           return true;
         }
-        // A full-looking target may contain a deleted/reused tagged child;
-        // ensure_reachable will reclaim that exact stale slot atomically
-        // under the target lock. Never treat a transiently locked live child
-        // as reclaimable.
         for (const RemotePtr protected_child :
              candidate_adjacency.provisional) {
           NodeSnapshot protected_snapshot;
@@ -761,9 +770,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         }
       }
       if (replacement.is_null()) {
-        // Capacity pressure is correctness backpressure: keep the retiring
-        // parent query-visible and retry after another Stage2/delete frees a
-        // protected slot.
         return false;
       }
       reservations.push_back(ReconcileReverseOp{
@@ -773,8 +779,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         .placement_sequence = task.maintenance_sequence,
         .id = child_snapshot.id,
         .generation = child_snapshot.generation,
-        .kind = static_cast<u32>(
-          ReconcileReverseOpKind::ensure_reachable),
+        .kind = static_cast<u32>(config.storage_owner_lease_merge
+          ? ReconcileReverseOpKind::acquire_certificate_lease
+          : ReconcileReverseOpKind::ensure_reachable),
       });
     }
 
@@ -803,25 +810,49 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     promotion_ops.push_back(make_reconcile_op(
       task, plan.promotion_target,
       plan.promotion_consumes_stage1_bridge ? task.target : RemotePtr{},
-      task.final_target, ReconcileReverseOpKind::promote_stable_bridge));
+      task.final_target,
+      config.storage_owner_lease_merge
+        ? ReconcileReverseOpKind::acquire_certificate_lease
+        : ReconcileReverseOpKind::promote_stable_bridge));
 
     stable_ops.reserve(
       stable_ops.size() + plan.ordinary_stable_targets.size());
     for (const auto& target : plan.ordinary_stable_targets) {
       const bool replace = target.had_stage1_bridge &&
         task.final_target != task.target;
+      if (replace && config.storage_owner_lease_merge) {
+        stable_ops.push_back(make_reconcile_op(
+          task, target.target, task.target, RemotePtr{},
+          ReconcileReverseOpKind::remove_if_present));
+      }
       stable_ops.push_back(make_reconcile_op(
-        task, target.target, replace ? task.target : RemotePtr{},
+        task, target.target,
+        replace && !config.storage_owner_lease_merge
+          ? task.target : RemotePtr{},
         task.final_target,
-        replace ? ReconcileReverseOpKind::replace_or_add
-                : ReconcileReverseOpKind::add));
+        replace && !config.storage_owner_lease_merge
+          ? ReconcileReverseOpKind::replace_or_add
+          : ReconcileReverseOpKind::add));
     }
-    removal_ops.reserve(
-      removal_ops.size() + plan.obsolete_stage1_bridges.size());
-    for (const RemotePtr target : plan.obsolete_stage1_bridges) {
-      removal_ops.push_back(make_reconcile_op(
-        task, target, task.target, RemotePtr{},
-        ReconcileReverseOpKind::remove_if_present));
+    if (config.storage_owner_lease_merge) {
+      removal_ops.reserve(
+        removal_ops.size() + task.stage1_backlink_targets.size());
+      hashset_t<RemotePtr> removal_targets;
+      for (const RemotePtr target : task.stage1_backlink_targets) {
+        if (!target.is_null() && removal_targets.insert(target).second) {
+          removal_ops.push_back(make_reconcile_op(
+            task, target, task.target, RemotePtr{},
+            ReconcileReverseOpKind::remove_provisional_if_present));
+        }
+      }
+    } else {
+      removal_ops.reserve(
+        removal_ops.size() + plan.obsolete_stage1_bridges.size());
+      for (const RemotePtr target : plan.obsolete_stage1_bridges) {
+        removal_ops.push_back(make_reconcile_op(
+          task, target, task.target, RemotePtr{},
+          ReconcileReverseOpKind::remove_if_present));
+      }
     }
     return true;
   };
@@ -929,6 +960,20 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         span<const RemotePtr>{task.stage2_neighbors});
     }
     if (!cleaned) return false;
+
+    if (config.storage_owner_lease_merge &&
+        task.stage2_promotion_committed && !task.certificate_released &&
+        !task.stage2_promotion_parent.is_null() &&
+        !task.final_target.is_null()) {
+      const ReconcileReverseOp release = make_reconcile_op(
+        task, task.stage2_promotion_parent, RemotePtr{}, task.final_target,
+        ReconcileReverseOpKind::release_certificate_lease);
+      if (!apply_reconcile_ops(
+            span<const ReconcileReverseOp>{&release, 1})) {
+        return false;
+      }
+      task.certificate_released = true;
+    }
 
     // A timeout can occur after final membership was published but before the
     // worker observed its ACK. Withdraw that exact tagged generation while it
@@ -1400,10 +1445,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     return Stage2SearchAdvanceResult::complete;
   };
 
-  // Termination must release the durable-watermark sequence even when the
-  // best-effort cleanup cannot reach a peer: residual backlinks are fenced
-  // lazily by identity/generation checks, while a stuck context would
-  // otherwise pin the completion ring forever.
+  // Termination releases execution resources, but an incomplete cleanup is an
+  // explicit permanent failure. Its sequence and physical dependency remain
+  // unfinished so the durable watermark can never certify partial maintenance.
   const auto terminate_stuck_stage2 = [&](Stage2Context& context) {
     if (!release_rebindable_context_lane(context)) {
       const auto retry_at = std::chrono::steady_clock::now() +
@@ -1427,12 +1471,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                     << " generation=" << task.generation
                     << std::endl;
         }
-        storage_owner_maintenance_stale_.fetch_add(
+        storage_owner_maintenance_failed_.fetch_add(
           1, std::memory_order_relaxed);
-        storage_owner_maintenance_processed_.fetch_add(
-          1, std::memory_order_relaxed);
-        complete_storage_owner_maintenance_sequence(
-          task.maintenance_sequence);
       }
       storage_owner_maintenance_stage2_terminated_.fetch_add(
         1, std::memory_order_relaxed);
@@ -1483,14 +1523,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     retry,
   };
 
-  const auto cancel_context_reconcile = [&, this](Stage2Context& context) {
-    for (const Stage2ReconcileChunk& chunk :
-         context.reconcile_batch.chunks()) {
+  const auto cancel_context_reconcile = [&, this](
+      Stage2Context& context, size_t item) {
+    auto& batch = context.reconcile_batches[item];
+    for (const Stage2ReconcileChunk& chunk : batch.chunks()) {
       if (!chunk.complete && chunk.request_id != 0) {
         cancel_peer_rpc_response(chunk.request_id);
       }
     }
-    context.reconcile_batch.clear();
+    batch.clear();
   };
 
   const auto finish_reverse_prepare_timing = [&](Stage2Context& context) {
@@ -1508,28 +1549,19 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   };
 
   const auto build_reconcile_barrier_ops = [&] (
-      Stage2Context& context, Stage2ReconcileBarrier barrier,
+      Stage2Context& context, size_t item, Stage2ReconcileBarrier barrier,
       vec<ReconcileReverseOp>& selected_ops) {
     vec<ReconcileReverseOp> promotion_ops;
     vec<ReconcileReverseOp> stable_ops;
     vec<ReconcileReverseOp> removal_ops;
-    const size_t reserve_hint =
-      static_cast<size_t>(config.R) * context.tasks.size();
-    promotion_ops.reserve(context.tasks.size());
-    stable_ops.reserve(reserve_hint);
-    removal_ops.reserve(reserve_hint);
-    for (size_t item = 0; item < context.tasks.size(); ++item) {
-      StorageOwnerMaintenanceTask& task = context.tasks[item];
-      if (task.reverse_reconciled) continue;
-      lib_assert(item < context.live_stage2_neighbors_by_task.size(),
-                 "Stage2 reconcile lost its persisted planner input");
-      if (!append_stage2_reconcile_ops(
-            task,
-            span<const RemotePtr>{
-              context.live_stage2_neighbors_by_task[item]},
-            promotion_ops, stable_ops, removal_ops)) {
-        return false;
-      }
+    StorageOwnerMaintenanceTask& task = context.tasks[item];
+    lib_assert(item < context.live_stage2_neighbors_by_task.size(),
+               "Stage2 reconcile lost its persisted planner input");
+    if (!append_stage2_reconcile_ops(
+          task,
+          span<const RemotePtr>{context.live_stage2_neighbors_by_task[item]},
+          promotion_ops, stable_ops, removal_ops)) {
+      return false;
     }
     switch (barrier) {
       case Stage2ReconcileBarrier::install:
@@ -1546,6 +1578,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       case Stage2ReconcileBarrier::removal:
         selected_ops = std::move(removal_ops);
         return true;
+      case Stage2ReconcileBarrier::release:
+        if (!task.stage2_promotion_parent.is_null()) {
+          selected_ops.push_back(make_reconcile_op(
+            task, task.stage2_promotion_parent, RemotePtr{}, task.final_target,
+            ReconcileReverseOpKind::release_certificate_lease));
+        }
+        return true;
       case Stage2ReconcileBarrier::none:
         return false;
     }
@@ -1556,7 +1595,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   // remote chunk in the context.  Posting is intentionally separate so one
   // peer with no send credit cannot prevent all other peers from being posted.
   const auto begin_reconcile_barrier = [&, this](
-      Stage2Context& context, Stage2ReconcileBarrier barrier,
+      Stage2Context& context, size_t item, Stage2ReconcileBarrier barrier,
       span<const ReconcileReverseOp> ops) {
     vec<ReconcileReverseOp> local_ops;
     dense_hashmap_t<u32, vec<ReconcileReverseOp>> remote_ops;
@@ -1595,7 +1634,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       payload_bytes / sizeof(ReconcileReverseOp));
     lib_assert(wire_capacity != 0,
                "peer RPC slot cannot hold a reverse reconciliation op");
-    context.reconcile_batch.begin(context.handle, barrier);
+    context.reconcile_batches[item].begin(context.handle, barrier);
     for (const auto& [target_shard, peer_ops] : remote_ops) {
       const auto packed = pack_stage2_reconcile_target_runs(
         span<const ReconcileReverseOp>{peer_ops}, wire_capacity);
@@ -1608,14 +1647,14 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       if (!packed.has_value()) return false;
       for (const auto& chunk_ops : *packed) {
         const size_t count = chunk_ops.size();
-        const bool appended = context.reconcile_batch.append_chunk(
+        const bool appended = context.reconcile_batches[item].append_chunk(
           allocate_peer_request_id(), target_shard,
           std::span<const ReconcileReverseOp>{chunk_ops.data(), count});
         lib_assert(appended,
                    "bounded Stage2 reconcile chunk could not be persisted");
       }
     }
-    context.finalize_subphase = stage2_reconcile_wait_subphase(barrier);
+    context.finalize_subphases[item] = stage2_reconcile_wait_subphase(barrier);
     return true;
   };
 
@@ -1623,15 +1662,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   // request_id and the exact byte payload.  An ACK is accepted only when both
   // the context generation/barrier epoch and every per-op postcondition match.
   const auto poll_reconcile_barrier = [&, this](
-      Stage2Context& context) -> ReconcilePollResult {
-    if (!context.reconcile_batch.active() ||
-        context.reconcile_batch.context() != context.handle) {
+      Stage2Context& context, size_t item) -> ReconcilePollResult {
+    if (!context.reconcile_batches[item].active() ||
+        context.reconcile_batches[item].context() != context.handle) {
       return ReconcilePollResult::retry;
     }
     constexpr u32 kTransportAttempts = 3;
-    const u32 epoch = context.reconcile_batch.epoch();
+    const u32 epoch = context.reconcile_batches[item].epoch();
     vec<Stage2ReconcileChunk>& chunks =
-      context.reconcile_batch.chunks();
+      context.reconcile_batches[item].chunks();
     for (size_t chunk_index = 0; chunk_index < chunks.size();
          ++chunk_index) {
       Stage2ReconcileChunk& chunk = chunks[chunk_index];
@@ -1652,7 +1691,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
 
       const std::span<const ReconcileReverseOp> payload =
-        context.reconcile_batch.payload(chunk);
+        context.reconcile_batches[item].payload(chunk);
       if (payload.size() != chunk.item_count) {
         return ReconcilePollResult::retry;
       }
@@ -1724,7 +1763,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       if (valid) {
         lib_assert(acknowledge_peer_rpc_response(response_lease),
                    "validated async reconcile response lost its lease");
-        lib_assert(context.reconcile_batch.mark_complete(
+        lib_assert(context.reconcile_batches[item].mark_complete(
                      chunk_index, context.handle, epoch),
                    "late reconcile ACK crossed a context/barrier fence");
       } else {
@@ -1736,33 +1775,54 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         chunk.posted = false;
       }
     }
-    return context.reconcile_batch.complete()
+    return context.reconcile_batches[item].complete()
       ? ReconcilePollResult::complete
       : ReconcilePollResult::waiting;
   };
 
-  // Placement authority and centroid membership remain synchronous in this
-  // patch.  They execute only after both reconciliation barriers have
-  // completed, and may safely reacquire any idle search lane for their local
-  // snapshot/control scratch.
+  const auto defer_stage2_item_retry = [&, this](
+      Stage2Context& context, size_t item, bool permanent = false) {
+    StorageOwnerMaintenanceTask& task = context.tasks[item];
+    const auto now = std::chrono::steady_clock::now();
+    if (permanent) {
+      if (task.stage2_first_permanent_defer_at ==
+          std::chrono::steady_clock::time_point{}) {
+        task.stage2_first_permanent_defer_at = now;
+      }
+      if (config.storage_owner_stage2_max_retry_ms != 0 &&
+          now - task.stage2_first_permanent_defer_at >
+            std::chrono::milliseconds(config.storage_owner_stage2_max_retry_ms)) {
+        if (!complete_stale_stage2(task)) {
+          storage_owner_maintenance_failed_.fetch_add(
+            1, std::memory_order_relaxed);
+        }
+        storage_owner_maintenance_stage2_terminated_.fetch_add(
+          1, std::memory_order_relaxed);
+        atomic_utils::update_max_relaxed(
+          storage_owner_maintenance_stage2_last_terminated_sequence_,
+          task.maintenance_sequence);
+        task.maintenance_sequence = 0;
+        return;
+      }
+    }
+    task.retry_not_before = now + std::chrono::milliseconds(1);
+  };
+
+  // Placement authority and centroid membership complete independently for
+  // each sealed item after its own reconciliation barriers have ACKed.
   const auto finish_stage2_after_reconcile = [&, this](
-      Stage2Context& context) {
+      Stage2Context& context, size_t item) -> bool {
+    StorageOwnerMaintenanceTask& task = context.tasks[item];
+    if (task.maintenance_sequence == 0) return true;
+    lib_assert(!config.storage_owner_lease_merge || task.certificate_released,
+               "Stage2 placement started before certificate release ACK");
+    task.certificate_released = true;
+
     Stage2PhaseAttemptTimer placement_timer(
       storage_owner_stage2_phase_timing_[static_cast<size_t>(
-        StorageOwnerStage2TimingPhase::placement_authority)],
-      context.tasks.size());
-    vec<u32> placement_authorities;
-    vec<protocol::AuthorityPlacementItem> placements;
-    vec<size_t> placement_task_indices;
-    placement_authorities.reserve(context.tasks.size());
-    placements.reserve(context.tasks.size());
-    placement_task_indices.reserve(context.tasks.size());
-    for (size_t item = 0; item < context.tasks.size(); ++item) {
-      const StorageOwnerMaintenanceTask& task = context.tasks[item];
-      if (task.placement_committed) continue;
-      placement_authorities.push_back(task.authority_shard);
-      placement_task_indices.push_back(item);
-      placements.push_back(protocol::AuthorityPlacementItem{
+        StorageOwnerStage2TimingPhase::placement_authority)], 1);
+    if (!task.placement_committed) {
+      const protocol::AuthorityPlacementItem placement{
         .token = {
           .source_client = task.source_client,
           .item_index = task.operation_item_index,
@@ -1773,89 +1833,56 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         .expected_raw = task.target.raw_address,
         .desired_raw = task.final_target.raw_address,
         .expected_placement_version = task.initial_placement_version,
-      });
-    }
-    vec<protocol::AuthorityPlacementResult> placement_results;
-    if (!placements.empty() && !relocate_batch_via_authority(
-          span<const u32>{placement_authorities},
-          span<const protocol::AuthorityPlacementItem>{placements},
-          placement_results, config)) {
-      storage_owner_maintenance_pressure_yields_.fetch_add(
-        1, std::memory_order_relaxed);
-      defer_stage2_retry(context, /*permanent=*/true);
-      return false;
-    }
-    lib_assert(placement_results.size() == placement_task_indices.size(),
-               "batched Stage2 placement lost a task result");
-    for (size_t slot = 0; slot < placement_task_indices.size(); ++slot) {
-      StorageOwnerMaintenanceTask& task =
-        context.tasks[placement_task_indices[slot]];
-      const protocol::AuthorityPlacementResult& result =
-        placement_results[slot];
+      };
+      protocol::AuthorityPlacementResult result;
+      if (!relocate_via_authority(
+            task.authority_shard, placement, result, config)) {
+        storage_owner_maintenance_pressure_yields_.fetch_add(
+          1, std::memory_order_relaxed);
+        defer_stage2_item_retry(context, item, /*permanent=*/true);
+        return false;
+      }
       const auto status = static_cast<protocol::AuthorityPlacementStatus>(
         result.status);
       if (status == protocol::AuthorityPlacementStatus::busy) {
         storage_owner_maintenance_pressure_yields_.fetch_add(
           1, std::memory_order_relaxed);
-        defer_stage2_retry(context);
+        defer_stage2_item_retry(context, item);
         return false;
       }
       if (status == protocol::AuthorityPlacementStatus::stale) {
-        if (!complete_stale_stage2(task)) return false;
+        if (!complete_stale_stage2(task)) {
+          defer_stage2_item_retry(context, item, /*permanent=*/true);
+          return false;
+        }
         task.maintenance_sequence = 0;
-        continue;
+        return true;
       }
       lib_assert(
         status == protocol::AuthorityPlacementStatus::committed ||
           status == protocol::AuthorityPlacementStatus::replay,
         "authority rejected a structurally valid Stage2 placement token");
-      const u64 expected_resulting_version =
-        task.final_target == task.target
-          ? task.initial_placement_version
-          : task.initial_placement_version + 1;
-      lib_assert(result.resulting_placement_version ==
-                   expected_resulting_version,
+      const u64 expected_version = task.final_target == task.target
+        ? task.initial_placement_version : task.initial_placement_version + 1;
+      lib_assert(result.resulting_placement_version == expected_version,
                  "authority placement returned an unexpected version");
       task.placement_committed = true;
     }
 
-    size_t ready = 0;
-    for (size_t item = 0; item < context.tasks.size(); ++item) {
-      if (context.tasks[item].maintenance_sequence == 0) continue;
-      if (ready != item) {
-        context.tasks[ready] = std::move(context.tasks[item]);
-        context.targets[ready] = std::move(context.targets[item]);
+    if (!task.centroid_committed) {
+      const CentroidMembershipOp add = make_centroid_membership_op(
+        task, task.final_target, CentroidMembershipKind::add);
+      if (!apply_centroid_membership_fanout_and_wait(
+            span<const CentroidMembershipOp>{&add, 1}, config)) {
+        storage_owner_maintenance_pressure_yields_.fetch_add(
+          1, std::memory_order_relaxed);
+        defer_stage2_item_retry(context, item, /*permanent=*/true);
+        return false;
       }
-      ++ready;
-    }
-    context.tasks.resize(ready);
-    context.targets.resize(ready);
-
-    vec<CentroidMembershipOp> centroid_adds;
-    centroid_adds.reserve(context.tasks.size());
-    for (const StorageOwnerMaintenanceTask& task : context.tasks) {
-      if (!task.centroid_committed) {
-        centroid_adds.push_back(make_centroid_membership_op(
-          task, task.final_target, CentroidMembershipKind::add));
-      }
-    }
-    if (!centroid_adds.empty() &&
-        !apply_centroid_membership_fanout_and_wait(
-          span<const CentroidMembershipOp>{centroid_adds}, config)) {
-      storage_owner_maintenance_pressure_yields_.fetch_add(
-        1, std::memory_order_relaxed);
-      defer_stage2_retry(context, /*permanent=*/true);
-      return false;
-    }
-    for (StorageOwnerMaintenanceTask& task : context.tasks) {
       task.centroid_committed = true;
     }
 
-    // Publish final membership before retiring a migrated Stage1 source.
-    for (StorageOwnerMaintenanceTask& task : context.tasks) {
-      if (task.final_target == task.target || task.allocation_settled) {
-        continue;
-      }
+    if (task.final_target != task.target && !task.allocation_settled) {
       lib_assert(migrated_source_tombstone_allowed(
                    task.placement_committed, task.centroid_committed),
                  "migrated source tombstoned before final centroid publication");
@@ -1866,107 +1893,135 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       if (!settle_dynamic_allocation(task)) {
         storage_owner_maintenance_pressure_yields_.fetch_add(
           1, std::memory_order_relaxed);
-        defer_stage2_retry(context, /*permanent=*/true);
+        defer_stage2_item_retry(context, item, /*permanent=*/true);
         return false;
       }
       task.allocation_settled = true;
     }
-
-    context.completion_handoff_started_ns = steady_now_ns();
-    context.finalize_subphase = Stage2FinalizeSubphase::prepare;
-    constexpr u64 expected_mask = 0;
-    const Stage2EventResult transition =
-      states.begin_reverse(context.handle, expected_mask);
-    lib_assert(transition == Stage2EventResult::phase_advanced ||
-                 transition == Stage2EventResult::ready_to_finalize,
-               "Stage2 finalization failed to enter reverse_pending");
     return true;
   };
 
-  const auto reset_reconcile_for_semantic_retry = [&](Stage2Context& context) {
-    cancel_context_reconcile(context);
-    context.finalize_subphase = Stage2FinalizeSubphase::prepare;
+  const auto reset_reconcile_for_semantic_retry = [&](
+      Stage2Context& context, size_t item) {
+    cancel_context_reconcile(context, item);
+    context.finalize_subphases[item] = Stage2FinalizeSubphase::prepare;
     storage_owner_stage2_reconcile_retries_.fetch_add(
       1, std::memory_order_relaxed);
     storage_owner_maintenance_pressure_yields_.fetch_add(
       1, std::memory_order_relaxed);
-    defer_stage2_retry(context, /*permanent=*/true);
+    defer_stage2_item_retry(context, item, /*permanent=*/true);
   };
 
   const auto start_reconcile_barrier = [&] (
-      Stage2Context& context, Stage2ReconcileBarrier barrier) {
+      Stage2Context& context, size_t item, Stage2ReconcileBarrier barrier) {
     vec<ReconcileReverseOp> ops;
-    if (!build_reconcile_barrier_ops(context, barrier, ops) ||
+    if (!build_reconcile_barrier_ops(context, item, barrier, ops) ||
         !begin_reconcile_barrier(
-          context, barrier, span<const ReconcileReverseOp>{ops})) {
-      reset_reconcile_for_semantic_retry(context);
+          context, item, barrier, span<const ReconcileReverseOp>{ops})) {
+      reset_reconcile_for_semantic_retry(context, item);
       return false;
     }
     return true;
   };
 
-  // Drives as many zero-remote barriers as possible, but never waits. The
-  // install barrier is one receiver-side per-target transaction: ordinary
-  // stable additions run first, mandatory promotions run last, and the final
-  // adjacency is audited before ACK. Only then may obsolete Stage1 bridges be
-  // removed by the second barrier.
-  const auto advance_reconcile_pipeline = [&] (Stage2Context& context) {
+  // Each item crosses install and removal independently. A pending peer only
+  // leaves this item in its current subphase; sibling items keep advancing.
+  const auto advance_reconcile_pipeline = [&] (
+      Stage2Context& context, size_t item) {
     for (;;) {
-      const ReconcilePollResult poll = poll_reconcile_barrier(context);
+      const ReconcilePollResult poll = poll_reconcile_barrier(context, item);
       if (poll == ReconcilePollResult::waiting) return false;
       if (poll == ReconcilePollResult::retry) {
-        reset_reconcile_for_semantic_retry(context);
+        reset_reconcile_for_semantic_retry(context, item);
         return false;
       }
 
       const Stage2ReconcileBarrier completed =
-        context.reconcile_batch.barrier();
-      cancel_context_reconcile(context);
+        context.reconcile_batches[item].barrier();
+      cancel_context_reconcile(context, item);
       switch (completed) {
         case Stage2ReconcileBarrier::install:
-          for (StorageOwnerMaintenanceTask& task : context.tasks) {
-            if (!task.reverse_reconciled) {
-              task.stage2_promotion_committed = true;
-            }
-          }
+          context.tasks[item].stage2_promotion_committed = true;
           if (!start_reconcile_barrier(
-                context, Stage2ReconcileBarrier::removal)) {
+                context, item, Stage2ReconcileBarrier::removal)) {
             return false;
           }
           break;
         case Stage2ReconcileBarrier::removal: {
-          for (StorageOwnerMaintenanceTask& task : context.tasks) {
-            task.reverse_reconciled = true;
+          auto& task = context.tasks[item];
+          task.reverse_reconciled = true;
+          if (config.storage_owner_lease_merge &&
+              !task.certificate_released) {
+            if (!start_reconcile_barrier(
+                  context, item, Stage2ReconcileBarrier::release)) {
+              return false;
+            }
+            break;
           }
-          context.finalize_subphase =
+          context.finalize_subphases[item] =
             Stage2FinalizeSubphase::placement_ready;
-          finish_reverse_prepare_timing(context);
           return true;
         }
+        case Stage2ReconcileBarrier::release:
+          context.tasks[item].certificate_released = true;
+          context.finalize_subphases[item] =
+            Stage2FinalizeSubphase::placement_ready;
+          return true;
         case Stage2ReconcileBarrier::none:
-          reset_reconcile_for_semantic_retry(context);
+          reset_reconcile_for_semantic_retry(context, item);
           return false;
       }
     }
   };
 
   const auto prepare_stage2_reverse = [&](Stage2Context& context) {
-    if (context.finalize_subphase ==
-        Stage2FinalizeSubphase::placement_ready) {
-      return finish_stage2_after_reconcile(context);
-    }
-    if (context.finalize_subphase != Stage2FinalizeSubphase::prepare) {
-      const Stage2FinalizeSubphase expected =
-        stage2_reconcile_wait_subphase(context.reconcile_batch.barrier());
-      if (expected != context.finalize_subphase) {
-        reset_reconcile_for_semantic_retry(context);
-        return false;
+    if (context.item_pipeline_started) {
+      for (size_t item = 0; item < context.tasks.size(); ++item) {
+        if (context.tasks[item].maintenance_sequence == 0) {
+          context.finalize_subphases[item] = Stage2FinalizeSubphase::complete;
+          continue;
+        }
+        const auto subphase = context.finalize_subphases[item];
+        const auto action = stage2_item_pipeline_action(
+          subphase, context.tasks[item].retry_not_before,
+          std::chrono::steady_clock::now());
+        if (action == Stage2ItemPipelineAction::complete ||
+            action == Stage2ItemPipelineAction::wait) {
+          continue;
+        }
+        if (action == Stage2ItemPipelineAction::finish_placement) {
+          if (finish_stage2_after_reconcile(context, item)) {
+            context.finalize_subphases[item] = Stage2FinalizeSubphase::complete;
+          }
+          continue;
+        }
+        if (action == Stage2ItemPipelineAction::start_install) {
+          (void)start_reconcile_barrier(
+            context, item, stage2_reconcile_first_barrier());
+          continue;
+        }
+        const Stage2FinalizeSubphase expected =
+          stage2_reconcile_wait_subphase(
+            context.reconcile_batches[item].barrier());
+        if (expected != subphase) {
+          reset_reconcile_for_semantic_retry(context, item);
+          continue;
+        }
+        (void)advance_reconcile_pipeline(context, item);
       }
-      (void)advance_reconcile_pipeline(context);
-      // Even when the removal ACK arrived in this pass, yield at the semantic
-      // boundary.  The scheduler releases the lane; placement reacquires one
-      // on the next pass without monopolizing search scratch during ACK waits.
-      return false;
+      const bool all_complete = stage2_context_items_complete(
+        span<const Stage2FinalizeSubphase>{
+          context.finalize_subphases.data(), context.tasks.size()});
+      if (!all_complete) return false;
+      finish_reverse_prepare_timing(context);
+      context.completion_handoff_started_ns = steady_now_ns();
+      constexpr u64 expected_mask = 0;
+      const Stage2EventResult transition =
+        states.begin_reverse(context.handle, expected_mask);
+      lib_assert(transition == Stage2EventResult::phase_advanced ||
+                   transition == Stage2EventResult::ready_to_finalize,
+                 "Stage2 finalization failed to enter reverse_pending");
+      return true;
     }
     Stage2PhaseAttemptTimer phase_timer(
       storage_owner_stage2_phase_timing_[static_cast<size_t>(
@@ -2767,11 +2822,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       context.live_stage2_neighbors_by_task[item] =
         live_stage2_neighbors_by_task[item];
     }
-    if (!start_reconcile_barrier(
-          context, stage2_reconcile_first_barrier())) {
-      return false;
-    }
-    (void)advance_reconcile_pipeline(context);
+    context.item_pipeline_started = true;
     return false;
   };
 
@@ -3049,7 +3100,37 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     return true;
   };
 
-  const auto finalize_context = [&](Stage2Context& context) {
+  const auto finalize_context = [&](Stage2Context& context) -> bool {
+    if (config.storage_owner_lease_merge &&
+        context.kind == StorageOwnerMaintenanceKind::cleanup_deleted_node) {
+      vec<ReconcileReverseOp> releases;
+      for (const StorageOwnerMaintenanceTask& task : context.tasks) {
+        if (task.cleanup_repair_only) continue;
+        lib_assert(task.cleanup_protected_children.size() ==
+                     task.cleanup_replacement_parents.size(),
+                   "cleanup lease release lost child/parent correlation");
+        for (size_t index = 0; index < task.cleanup_protected_children.size();
+             ++index) {
+          const RemotePtr parent = task.cleanup_replacement_parents[index];
+          const RemotePtr child = task.cleanup_protected_children[index];
+          if (parent.is_null() || child.is_null()) continue;
+          releases.push_back(make_reconcile_op(
+            task, parent, RemotePtr{}, child,
+            ReconcileReverseOpKind::release_certificate_lease));
+        }
+      }
+      if (!releases.empty() &&
+          !apply_reconcile_ops(span<const ReconcileReverseOp>{releases})) {
+        const auto retry_at = std::chrono::steady_clock::now() +
+          std::chrono::milliseconds(1);
+        for (StorageOwnerMaintenanceTask& task : context.tasks) {
+          task.retry_not_before = retry_at;
+        }
+        storage_owner_maintenance_pressure_yields_.fetch_add(
+          1, std::memory_order_relaxed);
+        return false;
+      }
+    }
     const Stage2EventResult transition = states.finalize(context.handle);
     lib_assert(transition == Stage2EventResult::phase_advanced,
                "stage2 finalized before all reverse ACKs");
@@ -3073,6 +3154,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           StorageOwnerStage2TimingPhase::finalize)],
         context.tasks.size());
       for (StorageOwnerMaintenanceTask& task : context.tasks) {
+        if (task.maintenance_sequence == 0) continue;
         lib_assert(task.outgoing_committed && task.reverse_reconciled &&
                      task.placement_committed && task.centroid_committed &&
                      (task.final_target == task.target ||
@@ -3137,12 +3219,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     storage_owner_maintenance_active_workers_.fetch_sub(
       1, std::memory_order_acq_rel);
     notify_storage_owner_maintenance_capacity();
+    return true;
   };
 
   const auto defer_cleanup_context = [&](Stage2Context& context) {
     lib_assert(context.kind ==
                  StorageOwnerMaintenanceKind::cleanup_deleted_node,
-               "only cleanup work can use protected-capacity deferral");
+               "only cleanup work can use dependency-aware deferral");
     const auto retry_at = std::chrono::steady_clock::now() +
       std::chrono::milliseconds(1);
     {
@@ -3169,28 +3252,27 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     for (;;) {
       const auto snapshot = states.snapshot(context.handle);
       lib_assert(snapshot.has_value(), "active stage2 context became stale");
-      if (context.kind == StorageOwnerMaintenanceKind::finalize_insert) {
-        const auto now = std::chrono::steady_clock::now();
-        const bool deferred = std::any_of(
-          context.tasks.begin(), context.tasks.end(),
-          [&](const StorageOwnerMaintenanceTask& task) {
-            return task.retry_not_before > now;
-          });
-        if (deferred) {
-          // A prune retry persists all semantic progress in the context/task.
-          // Do not let its bounded backoff monopolize this worker's scarce
-          // registered scratch lane.  The dual readiness predicate prevents
-          // an active continuation or an in-flight CQE from being discarded.
-          if (snapshot->phase == Stage2Phase::prune_ready) {
-            (void)release_rebindable_context_lane(context);
-          }
-          return progressed;
+      const auto now = std::chrono::steady_clock::now();
+      const bool deferred = std::any_of(
+        context.tasks.begin(), context.tasks.end(),
+        [&](const StorageOwnerMaintenanceTask& task) {
+          return task.retry_not_before > now;
+        });
+      if (deferred && !context.item_pipeline_started) {
+        if (snapshot->phase == Stage2Phase::prune_ready) {
+          (void)release_rebindable_context_lane(context);
         }
+        return progressed;
       }
       const bool prune_needs_lane =
         snapshot->phase == Stage2Phase::prune_ready &&
         (context.kind == StorageOwnerMaintenanceKind::cleanup_deleted_node ||
-         stage2_finalize_subphase_needs_lane(context.finalize_subphase));
+         std::any_of(
+           context.finalize_subphases.begin(),
+           context.finalize_subphases.begin() + context.tasks.size(),
+           [](Stage2FinalizeSubphase subphase) {
+             return stage2_finalize_subphase_needs_lane(subphase);
+           }));
       if (snapshot->phase == Stage2Phase::local_ready ||
           snapshot->phase == Stage2Phase::remote_search_pending ||
           prune_needs_lane) {
@@ -3247,7 +3329,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                 states.snapshot(context.handle)->expected_reverse_mask) {
             return progressed;
           }
-          finalize_context(context);
+          if (!finalize_context(context)) return progressed;
           return true;
         case Stage2Phase::finalized:
           lib_failure("stage2 context remained active after finalization");
@@ -3364,14 +3446,14 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     if (storage_owner_repair_tasks_ != nullptr) {
       StorageOwnerMaintenanceTask repair;
       if (storage_owner_repair_tasks_->try_pop(repair)) {
-        if (storage_owner_cleanup_ready(repair.maintenance_sequence)) {
+        if (storage_owner_cleanup_ready(repair, config)) {
           Stage2Context& context = *acquire_context();
           context.kind = StorageOwnerMaintenanceKind::cleanup_deleted_node;
           context.tasks.push_back(std::move(repair));
           repair = StorageOwnerMaintenanceTask{};
           while (context.tasks.size() < batch_limit &&
                  storage_owner_repair_tasks_->try_pop(repair)) {
-            if (!storage_owner_cleanup_ready(repair.maintenance_sequence)) {
+            if (!storage_owner_cleanup_ready(repair, config)) {
               lib_assert(storage_owner_repair_tasks_->try_push(
                            std::move(repair)),
                          "failed to return a not-yet-ready repair descriptor");
@@ -3390,11 +3472,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
 
     std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
     const auto admission_now = std::chrono::steady_clock::now();
-    const bool cleanup_ready = !storage_owner_cleanup_tasks_.empty() &&
-      storage_owner_cleanup_ready(
-        storage_owner_cleanup_tasks_.front().maintenance_sequence) &&
-      admission_now >=
-        storage_owner_cleanup_tasks_.front().retry_not_before;
+    const bool cleanup_ready = std::any_of(
+      storage_owner_cleanup_tasks_.begin(), storage_owner_cleanup_tasks_.end(),
+      [&](const StorageOwnerMaintenanceTask& task) {
+        return storage_owner_cleanup_ready(task, config) &&
+          admission_now >= task.retry_not_before;
+      });
     const auto packing_parameters =
       storage_owner_stage2_packing_.parameters();
     Stage2PackingDecision packing_decision;
@@ -3466,16 +3549,20 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       context.kind = StorageOwnerMaintenanceKind::cleanup_deleted_node;
       storage_owner_stage2_packing_.observe_admission(
         Stage2PackingFlushReason::cleanup, 0, 0, 0);
+      vec<StorageOwnerMaintenanceTask> blocked;
       while (!storage_owner_cleanup_tasks_.empty() &&
              context.tasks.size() < batch_limit) {
-        const StorageOwnerMaintenanceTask& next =
-          storage_owner_cleanup_tasks_.front();
-        if (!storage_owner_cleanup_ready(next.maintenance_sequence) ||
-            std::chrono::steady_clock::now() < next.retry_not_before) {
-          break;
+        StorageOwnerMaintenanceTask next =
+          cleanup_schedule_pop(storage_owner_cleanup_tasks_);
+        if (storage_owner_cleanup_ready(next, config) &&
+            std::chrono::steady_clock::now() >= next.retry_not_before) {
+          context.tasks.push_back(std::move(next));
+        } else {
+          blocked.push_back(std::move(next));
         }
-        context.tasks.push_back(
-          cleanup_schedule_pop(storage_owner_cleanup_tasks_));
+      }
+      for (StorageOwnerMaintenanceTask& task : blocked) {
+        cleanup_schedule_push(storage_owner_cleanup_tasks_, std::move(task));
       }
     }
     lib_assert(admitted_context != nullptr,
@@ -3571,7 +3658,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         current_storage_owner_maintenance_waiter_registrations_ =
           &context.waiter_registrations;
         finish_reverse_prepare_timing(context);
-        cancel_context_reconcile(context);
+        for (size_t item = 0; item < context.tasks.size(); ++item) {
+          cancel_context_reconcile(context, item);
+        }
         cancel_storage_owner_search_lane_waiter(
           context.search_lane_wait_registered);
         clear_all_current_storage_owner_maintenance_waiters();

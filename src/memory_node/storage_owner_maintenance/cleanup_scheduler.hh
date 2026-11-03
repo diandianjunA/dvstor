@@ -8,11 +8,9 @@
 
 namespace memory_node_storage_owner_maintenance_detail {
 
-// Cleanup publication is predecessor-fenced: a sequence can run only after
-// every earlier maintenance sequence is durable. Consequently the smallest
-// queued sequence is the only cleanup item that can possibly be runnable.
-// retry_not_before orders duplicate/same-sequence continuations without ever
-// bypassing that durable-order fence.
+// The heap retains deterministic sequence/retry ordering. Runtime readiness is
+// evaluated independently for each task's physical dependency; the contiguous
+// durable prefix is a reclaim fence, not a global cleanup-execution fence.
 template <class Task>
 struct CleanupScheduleLater {
   bool operator()(const Task& lhs, const Task& rhs) const {

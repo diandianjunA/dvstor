@@ -281,6 +281,10 @@ int main() {
   assert(default_config.storage_owner_reverse_retry_backoff_max_us ==
          100'000);
   assert(default_config.storage_owner_exact_max_attempts == 0);
+  assert(default_config.storage_owner_lease_merge);
+  const auto legacy_merge = make_config_with_extra({
+    "--storage-owner-lease-merge", "false"});
+  assert(!legacy_merge.storage_owner_lease_merge);
 
   const auto stability_bounds = make_config_with_extra({
     "--storage-owner-stage2-max-retry-ms", "60000",

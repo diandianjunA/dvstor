@@ -74,6 +74,10 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   }
   lib_assert(storage_owner_maintenance_enabled(config),
              "the two-stage update protocol requires a Stage2 executor");
+  storage_owner_certificate_leases_ = std::make_unique<
+    memory_node_storage_owner_maintenance_detail::CertificateLeaseTable>(
+      config.R);
+  storage_owner_maintenance_dependencies_.clear();
   const u32 rpc_parallelism = std::max<u32>(
     1, static_cast<u32>(num_clients_) *
        std::max<u32>(1, config.storage_owner_rpc_depth));
@@ -213,6 +217,12 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_stage2_batches_.store(0, std::memory_order_relaxed);
   storage_owner_stage2_batched_items_.store(0, std::memory_order_relaxed);
+  storage_owner_lease_merge_atomic_cuts_.store(0, std::memory_order_relaxed);
+  storage_owner_lease_merge_target_ops_.store(0, std::memory_order_relaxed);
+  storage_owner_lease_merge_cross_context_batches_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_lease_merge_cross_context_tasks_.store(
+    0, std::memory_order_relaxed);
   storage_owner_stage2_home_rpc_batches_.store(0, std::memory_order_relaxed);
   storage_owner_stage2_home_rpc_items_.store(0, std::memory_order_relaxed);
   storage_owner_stage2_home_score_rpc_batches_.store(
@@ -1118,6 +1128,19 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   telemetry_snapshot.stage2_last_terminated_sequence =
     storage_owner_maintenance_stage2_last_terminated_sequence_.load(
       std::memory_order_relaxed);
+  telemetry_snapshot.lease_merge_atomic_cuts =
+    storage_owner_lease_merge_atomic_cuts_.load(std::memory_order_relaxed);
+  telemetry_snapshot.lease_merge_target_ops =
+    storage_owner_lease_merge_target_ops_.load(std::memory_order_relaxed);
+  telemetry_snapshot.lease_merge_cross_context_batches =
+    storage_owner_lease_merge_cross_context_batches_.load(
+      std::memory_order_relaxed);
+  telemetry_snapshot.lease_merge_cross_context_tasks =
+    storage_owner_lease_merge_cross_context_tasks_.load(
+      std::memory_order_relaxed);
+  telemetry_snapshot.certificate_leases_active =
+    storage_owner_certificate_leases_ == nullptr ? 0 :
+      storage_owner_certificate_leases_->size();
   telemetry_snapshot.packing_target_batch = stage2_packing.target_batch;
   telemetry_snapshot.packing_arrival_interval_us =
     stage2_packing.estimated_arrival_interval_us;
@@ -1531,6 +1554,21 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(peer_reverse_update_failed_.load(std::memory_order_relaxed)) +
                " peer_reverse_max_queue=" +
                std::to_string(peer_reverse_update_max_queue_.load(std::memory_order_relaxed)) +
+               " lease_merge_atomic_cuts=" +
+               std::to_string(storage_owner_lease_merge_atomic_cuts_.load(
+                 std::memory_order_relaxed)) +
+               " lease_merge_target_ops=" +
+               std::to_string(storage_owner_lease_merge_target_ops_.load(
+                 std::memory_order_relaxed)) +
+               " lease_merge_cross_context_batches=" +
+               std::to_string(storage_owner_lease_merge_cross_context_batches_.load(
+                 std::memory_order_relaxed)) +
+               " lease_merge_cross_context_tasks=" +
+               std::to_string(storage_owner_lease_merge_cross_context_tasks_.load(
+                 std::memory_order_relaxed)) +
+               " certificate_leases_active=" +
+               std::to_string(storage_owner_certificate_leases_ == nullptr ? 0 :
+                 storage_owner_certificate_leases_->size()) +
                " reclaim_pending=" +
                std::to_string(reclaim_pending) +
                " reclaim_reused=" +

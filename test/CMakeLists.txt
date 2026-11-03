@@ -136,6 +136,9 @@ dvstor_target_common_includes(maintenance_fence_test)
 dvstor_add_test(maintenance_telemetry_test)
 dvstor_target_common_includes(maintenance_telemetry_test)
 
+dvstor_add_test(lease_merge_policy_test)
+dvstor_target_common_includes(lease_merge_policy_test)
+
 if (TARGET dvstor_gpu_kernels)
     add_executable(host_distance_kernel_test host_distance_kernel_test.cu)
     target_link_libraries(host_distance_kernel_test
